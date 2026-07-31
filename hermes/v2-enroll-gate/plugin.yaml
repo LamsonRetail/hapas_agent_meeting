@@ -1,0 +1,11 @@
+name: v2-enroll-gate
+version: 1.0.0
+description: >
+  Cửa vào cho bot biên bản họp (meetingxlark V2). Người chưa cấp quyền OAuth thì
+  bot gửi link để họ tự bấm Đồng ý, và tin nhắn KHÔNG đi tới agent (không tốn
+  token, không lộ dữ liệu họp). Người đã cấp quyền thì đi tiếp bình thường.
+  Bản ghi ai đã cấp quyền nằm trong state.db của V2, không nằm ở Hermes.
+author: meetingxlark V2
+kind: standalone
+hooks:
+  - pre_gateway_dispatch

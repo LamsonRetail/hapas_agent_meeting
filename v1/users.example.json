@@ -1,0 +1,21 @@
+{
+  "_note": "Danh sach nhan su da enroll cho central multi-user poller. Sao chep file nay thanh users.json (them users.json vao .gitignore). Moi nguoi = 1 profile lark-cli tren MAY ADMIN. Enroll bang: python enroll_user.py <profile>.",
+  "_fields": {
+    "profile": "ten profile lark-cli (khong dau, khong khoang trang). VD: quythien",
+    "display_name": "ten hien thi de doc log",
+    "open_id": "ou_... cua nguoi do (app cli_a9bd0ff8d6619ed1). Dung lam fallback gui cho chinh chu khi khong tra duoc nguoi du.",
+    "union_id": "on_... (tuy chon, cho path app rieng)",
+    "active": "true = poller quet nguoi nay; false = tam dung khong xoa",
+    "enrolled_at": "ngay enroll"
+  },
+  "users": [
+    {
+      "profile": "tham",
+      "display_name": "Nguyen Tien Tham - AI Automation Intern",
+      "open_id": "ou_1bc55b6d5b20ee06cbee1326d5b72715",
+      "union_id": "on_1f34d05d9ce11997c545cf1ec136bc41",
+      "active": true,
+      "enrolled_at": "2026-07-29"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "v2-oauth-mailbox",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Hộp thư OAuth callback + dashboard trạng thái cho orchestrator V2.",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@vercel/blob": "^2.0.0"
+  }
+}

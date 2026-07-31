@@ -1,0 +1,5 @@
+# V2 orchestrator — Python 3.11+
+httpx>=0.27
+cryptography>=42
+lark-oapi>=1.4          # persistent WebSocket: event + card action
+# websockets đi kèm lark-oapi; liệt kê để rõ ràng

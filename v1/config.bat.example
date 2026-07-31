@@ -1,0 +1,32 @@
+@echo off
+REM ============================================================
+REM  CAU HINH RIENG - file nay KHONG bi ghi de khi cap nhat code
+REM
+REM  Dien cac gia tri ben duoi. Luu y:
+REM    - KHONG co dau cach quanh dau bang
+REM    - KHONG dat dau nhay quanh gia tri
+REM    - Dung:  set OPENAI_API_KEY=sk-abc123
+REM    - Sai:   set OPENAI_API_KEY = "sk-abc123"
+REM
+REM  THEM FILE NAY VAO .gitignore
+REM
+REM  Day la BAN MAU. Copy thanh config.bat roi dien. config.bat da nam
+REM  trong .gitignore - dung commit no. (Repo ca nhan truoc day tung
+REM  commit nham file that kem secret tran; repo nay khoi tao sach.)
+REM ============================================================
+
+REM --- Key OpenAI de sinh recap
+set OPENAI_API_KEY=
+
+REM --- Thu muc chua run-server.bat cua Whisper (de trong neu tu bat tay)
+set WHISPER_DIR=
+
+REM --- App "Agent meeting" - dung cho CA event listener LAN gui tin nhan.
+REM     Dien ca hai dong duoi thi he thong se gui bang app cua minh
+REM     thay vi muon app cua anh Thien qua lark-cli.
+REM     De TRONG ca hai -> tu dong quay ve dung lark-cli nhu cu.
+set EVENT_APP_SECRET=
+
+set SENDER_APP_ID=cli_aae288361ef89eed
+set SENDER_APP_SECRET=
+set LARK_PROFILE=mine
