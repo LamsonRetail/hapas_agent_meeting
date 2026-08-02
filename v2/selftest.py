@@ -253,6 +253,7 @@ def _main() -> int:
     keep4 = pipeline.run_transcription
     for label, boom in (
             ("MediaDenied", pipeline.MediaDenied("không ai được tải")),
+            ("EmptyTranscript", pipeline.EmptyTranscript("0 từ")),
             ("TranscribeUnavailable", transcribe.TranscribeUnavailable("whisper tắt")),
             ("lỗi lạ", RuntimeError("mạng hỏng"))):
         wipe_jobs()
@@ -266,6 +267,11 @@ def _main() -> int:
     part("5. Chạy THẬT: mỗi loại lỗi vào đúng trạng thái")
     for label, boom, st, att in (
             ("MediaDenied -> failed ngay", pipeline.MediaDenied("x"), "failed", 3),
+            # Cùng họ "không tự khỏi": chạy lại whisper trên cùng audio cho ra
+            # đúng 0 từ đó. Trước 02/08/2026 nó KHÔNG được bắt riêng nên job đi
+            # thẳng tới `delivered` và không ai được báo.
+            ("EmptyTranscript -> failed ngay", pipeline.EmptyTranscript("x"),
+             "failed", 3),
             ("TranscribeUnavailable -> trả lại lần thử",
              transcribe.TranscribeUnavailable("x"), "queued", 2),
             ("lỗi lạ -> tiêu một lần thử", RuntimeError("x"), "queued", 3)):
@@ -1200,6 +1206,92 @@ def _main() -> int:
           line["HetHan"])
     with db.tx() as c:
         c.execute("DELETE FROM tokens")
+
+    # =================================================================
+    part("30. Transcript RỖNG không được đi tiếp như thành công")
+    # =================================================================
+    # Đo thật 02/08/2026, job `test` (obsg22ct6md6ogbe3hi1i782): whisper trả 1
+    # segment `text: ""` cho 61,7s audio. Không có phép kiểm nào chặn, nên:
+    # file .txt 0 byte -> `im_upload` 234010 -> `base_media_upload` 1061002 ->
+    # NHƯNG job vẫn `delivered`, `error=NULL`, Base vẫn có record, và
+    # `deliveries` chỉ có dòng `recap`. Mọi bảng trạng thái đều nói "xong".
+    # `word_count` lúc đó chỉ được dùng để IN ra log, không ai kiểm nó.
+    keep30 = (pipeline.download_recording, transcribe.transcribe)
+
+    def _fake_dl(m):
+        return Path(str(config.WORK_DIR / f"{m.minute_token}.wav")), "ou_owner"
+
+    empty_tr = Transcript(minute_token="obsgEMPTY00000000000001", lang="vi",
+                          duration=61.7, engine="faster-whisper/small",
+                          segments=[Segment(0, 61.7, "")])
+    check("bản ghi im lặng -> word_count = 0", empty_tr.word_count == 0)
+
+    wipe_jobs()
+    mk_job("obsgEMPTY00000000000001", attempts=0)
+    config.TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    pipeline.download_recording = _fake_dl
+    transcribe.transcribe = lambda a, mt, meeting_title="": empty_tr
+    try:
+        pipeline.run_transcription(meta(minute_token="obsgEMPTY00000000000001"))
+        out30 = "KHÔNG NÉM"
+    except pipeline.EmptyTranscript:
+        out30 = "EmptyTranscript"
+    except Exception as exc:                              # noqa: BLE001
+        out30 = f"lỗi khác: {exc}"
+    check("phiên âm ra 0 từ -> ném EmptyTranscript", out30 == "EmptyTranscript",
+          out30)
+    # Không lưu đường dẫn = `_reuse` không nạp lại bản rỗng rồi phát mãi.
+    check("transcript RỖNG KHÔNG được lưu transcript_path",
+          not (jobstore.get("obsgEMPTY00000000000001") or {}).get("transcript_path"))
+    check("vẫn ghi .json ra đĩa làm bằng chứng chẩn lỗi",
+          any(p.name.endswith("obsgEMPTY00000000000001.json")
+              for p in config.TRANSCRIPT_DIR.glob("*.json")))
+    pipeline.download_recording, transcribe.transcribe = keep30
+
+    # File 0 byte: đừng gọi Lark để nhận đúng câu 234010, và PHẢI để lại dấu
+    # vết. `deliveries` là thứ duy nhất trả lời được "ai đã nhận gì".
+    keep30b = (pipeline.write_txt, lark_api.im_upload_file, lark_api.im_send_card)
+    empty_txt = config.TRANSCRIPT_DIR / "rong.txt"
+    empty_txt.write_text("", encoding="utf-8")
+    called = []
+    pipeline.write_txt = lambda t, m: empty_txt
+    lark_api.im_upload_file = lambda *a, **k: called.append("upload")
+    lark_api.im_send_card = lambda *a, **k: None
+    wipe_jobs()
+    mk_job("obsgEMPTY00000000000002", attempts=0)
+    sent30, failed30 = pipeline.deliver(
+        meta(minute_token="obsgEMPTY00000000000002"), Recap(summary="x"),
+        empty_tr, ["on_A"], dry_run=False)
+    rows30 = list(db.conn().execute(
+        "SELECT kind, ok, error FROM deliveries WHERE minute_token=?",
+        ("obsgEMPTY00000000000002",)))
+    kinds30 = {r["kind"]: r for r in rows30}
+    check("file 0 byte -> KHÔNG gọi im_upload_file", not called, str(called))
+    check("vẫn gửi được thẻ tóm tắt", sent30 == ["on_A"] and not failed30)
+    check("có dòng deliveries 'full' ok=0 — không im lặng bỏ qua",
+          "full" in kinds30 and kinds30["full"]["ok"] == 0,
+          f"deliveries thực tế: {[dict(r) for r in rows30]}")
+    check("dòng đó nói RÕ vì sao",
+          "rỗng" in (kinds30.get("full", {})["error"] or "")
+          if "full" in kinds30 else False)
+    pipeline.write_txt, lark_api.im_upload_file, lark_api.im_send_card = keep30b
+
+    # =================================================================
+    part("31. `.bat` chạy nền: `timeout` KHÔNG thay được `ping`")
+    # =================================================================
+    # `timeout` tự chết ngay khi stdin không phải console — đúng cảnh .bat chạy
+    # từ Task Scheduler/Startup. Đo 02/08/2026: `timeout /t 5` mất 0,098s và in
+    # "ERROR: Input redirection is not supported"; `ping -n 6` mất 5,14s.
+    # Hậu quả đã xảy ra thật: run-v2-auto bật lại orchestrator 17 lần trong
+    # 0,93 giây lúc máy logoff, tức cái trễ 120s chưa bao giờ tồn tại.
+    _root = Path(__file__).resolve().parent.parent
+    for _b in ("run-v2-auto.bat", "hermes-watchdog.bat"):
+        _p = _root / _b
+        _live = [ln for ln in _p.read_text(encoding="ascii",
+                                           errors="replace").splitlines()
+                 if "timeout /t" in ln and not ln.strip().upper().startswith("REM")]
+        check(f"{_b}: không còn `timeout /t` nào chạy thật",
+              not _live, "; ".join(_live))
 
     # =================================================================
     print("\n" + "=" * 66)

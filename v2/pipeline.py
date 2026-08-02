@@ -72,6 +72,27 @@ def extract_audio(video: Path) -> Path:
 _CODE_MEDIA_DENY = 2091005
 
 
+class EmptyTranscript(PipelineError):
+    """Phiên âm chạy xong nhưng KHÔNG ra chữ nào.
+
+    VĨNH VIỄN với đúng đoạn audio đó, cùng họ với `MediaDenied`: chạy lại whisper
+    trên cùng file cho ra đúng kết quả đó, nên không được đốt `MAX_ATTEMPTS`
+    rồi báo một câu vô nghĩa.
+
+    Vì sao phải ném thay vì cứ phát (đo 02/08/2026, job `test`
+    obsg22ct6md6ogbe3hi1i782): whisper trả 1 segment `text: ""` cho 61,7s audio
+    -> `write_txt` ghi file 0 byte -> `im_upload` lỗi 234010 "File's size can't
+    be 0" -> `base_media_upload` lỗi 1061002. Nhưng job vẫn `delivered`,
+    `error=NULL`, `recap_fails=0`, Base vẫn có record, và `deliveries` chỉ có
+    dòng `recap` — KHÔNG có dòng nào ghi lại việc transcript không gửi được.
+    Tức mọi chỗ đọc trạng thái đều nói "xong", không ai được báo, và cách duy
+    nhất biết là đọc log bằng mắt.
+
+    KHÔNG lưu `transcript_path` cho ca này: để `_reuse` không nạp lại bản rỗng
+    và phát nó mãi. File .json vẫn ghi ra đĩa làm bằng chứng chẩn lỗi.
+    """
+
+
 class MediaDenied(PipelineError):
     """Không một ai đã enroll được phép tải bản ghi này.
 
@@ -237,6 +258,17 @@ def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Path]:
     print(f"       transcript {t.word_count} từ, {t.duration:.0f}s audio "
           f"-> {tpath.name}")
 
+    # Ghi .json xong mới kiểm, và kiểm TRƯỚC khi lưu `transcript_path`:
+    # xem docstring `EmptyTranscript`.
+    if t.word_count == 0:
+        raise EmptyTranscript(
+            f"whisper chạy xong nhưng KHÔNG ra chữ nào ({t.duration:.0f}s audio, "
+            f"engine {t.engine}). Bản ghi im lặng thật, hoặc whisper đang hỏng "
+            f"(sai model/VAD nuốt hết). Bằng chứng: {tpath.name}. "
+            f"Nghe thử bản ghi: im lặng thật thì bỏ job này; whisper sai thì sửa "
+            f"rồi trả job về `queued` — sẽ phiên âm LẠI từ đầu, không dùng lại "
+            f"bản rỗng.")
+
     # Lưu transcript_path TRƯỚC khi recap: recap hỏng thì vòng sau còn nạp lại
     # được từ đây (orchestrator._reuse) thay vì phiên âm lại từ đầu.
     jobstore.set_status(meta.minute_token, "recapping",
@@ -318,12 +350,21 @@ def deliver(meta: MeetingMeta, recap: Recap, t: Transcript,
     # Upload transcript MỘT lần rồi dùng lại file_key cho mọi người: upload lặp
     # theo từng người là n lần tải file lên cho cùng một nội dung.
     file_key = None
-    try:
-        ftype = {".mp4": "mp4", ".pdf": "pdf", ".opus": "opus"}.get(
-            txt.suffix.lower(), "stream")
-        file_key = lark_api.im_upload_file(txt, ftype)
-    except lark_api.LarkError as exc:
-        print(f"[deliver] upload transcript hỏng, chỉ gửi tóm tắt: {exc}")
+    no_file_why = ""
+    if txt.stat().st_size == 0:
+        # Lark từ chối file 0 byte (234010) — đừng gọi API để nhận đúng câu đó.
+        # Với job mới thì `EmptyTranscript` đã chặn từ trước; nhánh này là cho
+        # job CŨ đang được phát lại từ một transcript rỗng đã lưu.
+        no_file_why = "transcript rỗng (0 byte) — không có gì để gửi"
+        print(f"[deliver] {no_file_why}, chỉ gửi tóm tắt")
+    else:
+        try:
+            ftype = {".mp4": "mp4", ".pdf": "pdf", ".opus": "opus"}.get(
+                txt.suffix.lower(), "stream")
+            file_key = lark_api.im_upload_file(txt, ftype)
+        except lark_api.LarkError as exc:
+            no_file_why = f"upload transcript hỏng: {exc}"
+            print(f"[deliver] {no_file_why}, chỉ gửi tóm tắt")
 
     for rid in recipients:
         try:
@@ -341,6 +382,11 @@ def deliver(meta: MeetingMeta, recap: Recap, t: Transcript,
             continue                      # tóm tắt hỏng thì khỏi gửi transcript
 
         if not file_key:
+            # GHI LẠI việc không gửi được transcript. Trước 02/08/2026 nhánh này
+            # `continue` lặng lẽ, nên `deliveries` chỉ có dòng `recap` và bảng
+            # đó — thứ duy nhất trả lời được "ai đã nhận gì" — nói rằng mọi
+            # thứ đều ổn. Đã xảy ra thật với job `test` (234010).
+            jobstore.record_delivery(token, rid, "full", False, no_file_why)
             continue
         try:
             lark_api.im_send_file(rid, txt, id_type="union_id",

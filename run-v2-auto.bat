@@ -69,7 +69,10 @@ if %tries% geq 120 (
     call :log "[!] cho whisper qua 6 phut - van chay orchestrator (job se thu lai)"
     goto ready
 )
-timeout /t 3 >nul
+REM `ping` chu khong `timeout` - xem ly do o vong chinh ben duoi. Voi cho nay
+REM hau qua rieng: `timeout` chet ngay nghia la 120 lan lap chay het trong vai
+REM giay, tuc "cho toi 6 phut cho whisper nap model" thuc te la khong cho.
+ping -n 4 127.0.0.1 >nul
 goto waitloop
 
 :ready
@@ -77,11 +80,20 @@ call :log "[+] whisper san sang"
 
 REM --- Vong chinh: chet thi bat lai -----------------------------
 REM Tre 120s giua hai lan de khong quay vong dot khi cau hinh sai.
+REM
+REM PHAI dung `ping`, KHONG dung `timeout` (do 02/08/2026): `timeout` tu chet
+REM ngay khi stdin khong phai console - dung canh file .bat nay chay tu Task
+REM Scheduler / Startup. Do that: `timeout /t 5` mat 0,098s va in
+REM "ERROR: Input redirection is not supported"; `ping -n 6` mat 5,14s.
+REM Hau qua that trong log 13:36:55 hom do: may dang logoff (ma thoat
+REM -1073741205 = STATUS_DLL_INIT_FAILED_LOGOFF) va vong nay bat lai 17 lan
+REM trong 0,93 giay - tuc cai tre 120s ghi o tren CHUA BAO GIO ton tai, va lop
+REM chong "quay vong dot khi cau hinh sai" cung vay.
 :loop
 call :log "[*] python -m v2 run --send"
 python -m v2 run --send >> "%LOG%" 2>&1
 call :log "[!] orchestrator thoat (ma %errorlevel%) - bat lai sau 120s"
-timeout /t 120 >nul
+ping -n 121 127.0.0.1 >nul
 goto loop
 
 :log

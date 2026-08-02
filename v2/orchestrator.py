@@ -208,6 +208,22 @@ def _process_queue(dry_run: bool | None = None) -> None:
                 print(f"[queue] {token} KHÔNG tải được bản ghi (quyền) — "
                       f"đánh failed NGAY, không thử lại: {exc}")
                 continue
+            except pipeline.EmptyTranscript as exc:
+                # Cùng lý lẽ với MediaDenied ngay trên: KHÔNG tự khỏi, nên dừng
+                # NGAY thay vì đốt 5 lần thử rồi báo "quá 5 lần thử". Khác chỗ
+                # quan trọng nhất so với hành vi cũ: trước 02/08/2026 nhánh này
+                # không tồn tại và job đi tiếp thành `delivered` — người dự nhận
+                # một thẻ tóm tắt "Bản ghi trống" mà không có transcript, còn
+                # mọi bảng trạng thái đều báo thành công.
+                # `failed` là thứ `alerts._check_failed_jobs` nhìn thấy -> có DM.
+                if dry_run:
+                    print(f"[queue] {token} (dry-run) transcript RỖNG — lần chạy "
+                          f"THẬT sẽ đánh failed ngay: {exc}")
+                    continue
+                jobstore.set_status(token, "failed", error=str(exc))
+                print(f"[queue] {token} transcript RỖNG — đánh failed NGAY, "
+                      f"không thử lại: {exc}")
+                continue
             except transcribe.TranscribeUnavailable as exc:
                 # HẠ TẦNG hỏng (whisper tắt/treo), không phải lỗi cuộc họp này.
                 # Trả lại lần thử, nếu không thì vòng `run` 5 phút/lần sẽ đốt hết

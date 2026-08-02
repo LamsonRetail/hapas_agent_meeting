@@ -76,7 +76,8 @@ if errorlevel 1 (
         call :log "[*] bat lai gateway lan !restarts!: hermes gateway restart"
         "%HERMES%" gateway restart >> "%LOG%" 2>&1
         call :log "[*] da goi restart, cho 45s roi do lai"
-        timeout /t 45 >nul
+        REM `ping` chu khong `timeout`: xem ghi chu o cuoi vong lap.
+        ping -n 46 127.0.0.1 >nul
         set /a bad=0
         REM Bat lai nhieu lan ma khong bao gio len = van de khac, khong phai
         REM gateway do. Hay gap nhat: api_server tat vi thieu API_SERVER_KEY
@@ -94,7 +95,17 @@ if errorlevel 1 (
     set /a restarts=0
     set "WAIT=%INTERVAL%"
 )
-timeout /t !WAIT! >nul
+REM PHAI dung `ping`, KHONG dung `timeout` (do 02/08/2026): `timeout` tu chet
+REM ngay khi stdin khong phai console - dung canh watchdog chay nen. Do that:
+REM `timeout /t 5` mat 0,098s va in "ERROR: Input redirection is not
+REM supported"; `ping -n 6` mat 5,14s.
+REM O DAY hau qua nang hon o run-v2-auto: mat cai tre nay thi ca vong lap chay
+REM nhanh het muc curl cho phep, tuc cu 3 lan do hong la goi
+REM `hermes gateway restart` MOT lan - bat lai gateway lien tuc thay vi
+REM 45s/lan, va lop cham-lai-600s sau 5 lan cung vo tac dung.
+REM ping can N+1 goi de cho N giay, nen cong 1 truoc.
+set /a WAITP=!WAIT!+1
+ping -n !WAITP! 127.0.0.1 >nul
 goto loop
 
 :log
