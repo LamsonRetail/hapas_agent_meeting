@@ -114,6 +114,31 @@ def unbump_attempts(minute_token: str) -> None:
                   "WHERE minute_token=?", (minute_token,))
 
 
+def bump_recap_fails(minute_token: str) -> int:
+    """Cộng số lần gọi LLM hỏng LIÊN TIẾP của một job. Trả số mới.
+
+    Đếm RIÊNG khỏi `attempts` có chủ ý: LLM hỏng là lỗi hạ tầng nên không được
+    tiêu quota `MAX_ATTEMPTS` (job sẽ `failed` oan), nhưng cũng không được hoãn
+    vô hạn — hết `RECAP_MAX_TRIES` thì phát bản không có recap, vì transcript
+    vẫn đáng gửi hơn là im lặng mãi.
+    """
+    with db.tx() as c:
+        c.execute("UPDATE jobs SET recap_fails=COALESCE(recap_fails,0)+1 "
+                  "WHERE minute_token=?", (minute_token,))
+    row = db.conn().execute(
+        "SELECT recap_fails FROM jobs WHERE minute_token=?", (minute_token,)
+    ).fetchone()
+    return (row["recap_fails"] or 0) if row else 0
+
+
+def reset_recap_fails(minute_token: str) -> None:
+    """Recap thành công -> xoá bộ đếm. LIÊN TIẾP nghĩa là phải đặt lại, không
+    thì một job phát lại nhiều lần sẽ cộng dồn lỗi của những lần cách xa nhau."""
+    with db.tx() as c:
+        c.execute("UPDATE jobs SET recap_fails=0 WHERE minute_token=?",
+                  (minute_token,))
+
+
 def all_jobs() -> list[dict]:
     """Mọi job, mới nhất trước. Dùng cho việc quét lại toàn bộ (vd base-sync)."""
     rows = db.conn().execute(

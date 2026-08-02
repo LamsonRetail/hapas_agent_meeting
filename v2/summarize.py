@@ -8,8 +8,18 @@ ra ngoài. Pipeline chỉ đưa Transcript + MeetingMeta vào, nhận Recap ra �
 không truyền messages/tools/model từ pipeline. Đổi OpenAI -> Hermes -> thứ
 khác chỉ là viết một implementation khác của hàm này.
 
-Không có API key -> trả Recap rỗng (chỉ gửi transcript, không recap), không
-làm gãy pipeline.
+HAI kiểu "không có recap", và chúng KHÁC NHAU (sửa 31/07/2026):
+
+  - Không có `LLM_API_KEY`: đây là TRẠNG THÁI CẤU HÌNH, thử lại bao nhiêu lần
+    cũng vậy -> trả Recap giữ chỗ, pipeline phát transcript trần. Như cũ.
+  - Gọi LLM thất bại (timeout, 429, 5xx, provider từ chối): đây là lỗi HẠ TẦNG
+    TẠM THỜI -> ném `RecapUnavailable` để caller hoãn và thử lại.
+
+Trước 31/07/2026 cả hai cùng trả Recap giữ chỗ, nên một cú 429 lẻ là cuộc họp
+đó VĨNH VIỄN không có tóm tắt: thẻ "Chưa sinh được recap" phát cho tất cả, job
+thành `delivered`, không gì chạy lại. Bước phiên âm được bảo vệ rất kỹ
+(`TranscribeUnavailable`) trong khi bước rẻ nhất để thử lại thì không có lưới —
+đó là chỗ bất đối xứng cần vá.
 """
 
 from __future__ import annotations
@@ -21,6 +31,15 @@ import httpx
 
 from . import config
 from .models import ActionItem, MeetingMeta, Recap, Transcript
+
+
+class RecapUnavailable(RuntimeError):
+    """Gọi LLM thất bại — lỗi hạ tầng tạm thời, KHÔNG phải lỗi của cuộc họp.
+
+    Song song với `transcribe.TranscribeUnavailable` và caller xử y như vậy:
+    không tiêu quota `MAX_ATTEMPTS`, giữ job ở `queued`, vòng sau dùng lại
+    transcript đã lưu nên chỉ làm lại phần recap.
+    """
 
 # Thuật ngữ hay bị phiên âm sai (tiếng Việt xen tiếng Anh) -> nhắc LLM viết đúng.
 GLOSSARY = [
@@ -59,7 +78,10 @@ def _post(body: dict) -> str:
 
 
 def _call_llm(transcript_text: str, title: str) -> str | None:
-    """Gọi LLM, trả về text JSON thô. None nếu không có key hoặc lỗi.
+    """Gọi LLM, trả về text JSON thô. None nếu KHÔNG có key.
+
+    Ném `RecapUnavailable` khi có key mà gọi thất bại — xem docstring module:
+    thiếu key và gọi-hỏng là hai chuyện khác nhau và phải xử khác nhau.
 
     Provider-neutral: chỉ dùng base_url + wire format OpenAI. Đổi GPT->Hermes
     chỉ là đổi LLM_BASE_URL (Hermes phơi endpoint OpenAI-compatible).
@@ -95,13 +117,10 @@ def _call_llm(transcript_text: str, title: str) -> str | None:
             try:
                 return _post(body)
             except (httpx.HTTPError, KeyError, json.JSONDecodeError) as exc2:
-                print(f"[summarize] LLM hỏng, gửi không kèm recap: {exc2}")
-                return None
-        print(f"[summarize] LLM hỏng, gửi không kèm recap: {exc}")
-        return None
+                raise RecapUnavailable(str(exc2)) from exc2
+        raise RecapUnavailable(str(exc)) from exc
     except (httpx.HTTPError, KeyError, json.JSONDecodeError) as exc:
-        print(f"[summarize] LLM hỏng, gửi không kèm recap: {exc}")
-        return None
+        raise RecapUnavailable(str(exc)) from exc
 
 
 def _json_block(raw: str) -> str | None:
@@ -152,16 +171,41 @@ def _parse(raw: str) -> Recap:
     )
 
 
+# Câu mở đầu của mọi recap GIỮ CHỖ. Là hằng số vì nó không chỉ để người đọc:
+# `orchestrator._backfill_recaps` dùng đúng chuỗi này để tìm lại những cuộc họp
+# đã phát với tóm tắt rỗng và làm lại chúng khi LLM sống lại. Đổi câu chữ ở đây
+# mà quên chỗ kia là những cuộc họp đó im lặng không bao giờ được vá.
+PLACEHOLDER_PREFIX = "Chưa sinh được recap"
+
+
+def placeholder(why: str) -> Recap:
+    """Recap giữ chỗ khi chắc chắn không có tóm tắt. Nói RÕ nguyên nhân nào —
+    đừng bắt người đọc thẻ đoán vì sao thẻ trống."""
+    return Recap(summary=f"{PLACEHOLDER_PREFIX} — {why}. "
+                         "Bản ghi đầy đủ ở file đính kèm.")
+
+
+def is_placeholder(recap: Recap | None) -> bool:
+    """Recap này là bản giữ chỗ (chưa có tóm tắt thật) hay không.
+
+    Coi recap RỖNG cũng là giữ chỗ: job cũ trước 31/07/2026 lưu summary trống
+    thay vì câu giữ chỗ, và chúng cần được vá y hệt.
+    """
+    if recap is None:
+        return True
+    if (recap.summary or "").strip().startswith(PLACEHOLDER_PREFIX):
+        return True
+    return not ((recap.summary or "").strip() or recap.decisions
+                or recap.action_items)
+
+
 def summarize(transcript: Transcript, meta: MeetingMeta) -> Recap:
-    """Sinh recap cấu trúc từ transcript. Provider-neutral."""
+    """Sinh recap cấu trúc từ transcript. Provider-neutral.
+
+    Ném `RecapUnavailable` nếu gọi LLM thất bại (caller hoãn rồi thử lại).
+    Thiếu `LLM_API_KEY` thì KHÔNG ném: đó là cấu hình, thử lại không đổi gì.
+    """
     raw = _call_llm(transcript.text, meta.title)
     if raw is None:
-        # Nói RÕ nguyên nhân nào, đừng bắt người đọc thẻ đoán.
-        why = ("chưa đặt LLM_API_KEY trong v2/.env"
-               if not config.LLM_API_KEY
-               else "gọi LLM thất bại (xem dòng [summarize] trong log)")
-        return Recap(
-            summary=f"Chưa sinh được recap — {why}. "
-                    "Bản ghi đầy đủ ở file đính kèm.",
-        )
+        return placeholder("chưa đặt LLM_API_KEY trong v2/.env")
     return _parse(raw)

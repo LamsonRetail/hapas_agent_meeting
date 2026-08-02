@@ -1,20 +1,19 @@
 # ============================================================
-#  V1 nam trong v1/, V2 trong v2/.
+#  Sau khi don 31/07/2026: V1 nam trong v1/, V2 trong v2/.
 #
-#  BAY DA GAP (o repo ca nhan truoc day): git KHONG ap dung ignore cho file DA
-#  tracked. Vi vay jobs/ out/ minutes/ poller_state.json tuy co trong file nay
-#  van bi commit suot (~30MB, gom ca file ghi hinh cuoc hop THAT), va
-#  v1/config.bat bi commit kem secret tran.
-#
-#  Repo NAY khoi tao SACH, khong mang history do sang: khong co secret, khong
-#  co ban ghi hop. Dung de tai dien — kiem `git status` truoc moi commit, va
-#  nho: them vao .gitignore KHONG go tracking cho file da lo commit.
+#  BAY DA GAP: git KHONG ap dung ignore cho file DA tracked. Vi vay
+#  jobs/ out/ minutes/ poller_state.json tuy co trong file nay van bi commit
+#  suot (~30MB, gom ca file ghi hinh cuoc hop THAT). Da `git rm --cached`
+#  nen tu nay khong bi commit nua, NHUNG chung van con trong HISTORY.
+#  Muon xoa khoi history phai rewrite (git filter-repo) + force push — CHUA LAM.
 # ============================================================
 
 # --- Secret ---------------------------------------------------
-# KHONG BAO GIO commit config.bat that. Ban mau: v1/config.bat.example
+# v1/config.bat DANG BI TRACKED CO Y THUC (commit 985573f, repo private): trong
+# do co OPENAI_API_KEY + SENDER_APP_SECRET dang tran. Ai duoc them vao repo la
+# doc duoc, va no nam trong history vinh vien. Dong duoi KHONG go tracking —
+# no chi giup nguoi clone ve khoi commit ban rieng cua ho.
 v1/config.bat
-config.bat
 v1/users.json
 v2/.env
 
@@ -26,9 +25,20 @@ v1/minutes/
 v1/meeting_downloads/
 v2/data/
 
+# Ban sao state.db + khoa Fernet (v2/backup.py). `v2/data/` o tren da phu cho
+# duong dan mac dinh; ba dong nay de phong V2_BACKUP_DIR / V2_KEY_BACKUP_PATH
+# bi tro vao mot cho KHAC trong repo. Mot ban state.db lot vao git la lo token
+# cua ca cong ty (da ma hoa, nhung khoa nam ngay trong v2/.env cua may do).
+backups/
+state-*.db
+fernet-key.txt
+
 # --- Python ---------------------------------------------------
 __pycache__/
 *.pyc
 
 # Rac do go "> nul" trong bash (Windows: nul la device, bash tao thanh file that)
 nul
+
+# File link enroll sinh tam (co nonce) - dung commit
+enroll-links.html

@@ -1,0 +1,976 @@
+"""
+Tự kiểm V2 — chạy được MỌI LÚC, không cần mạng, không đụng `state.db` thật.
+
+    python -m v2 selftest
+
+Vì sao có file này (02/08/2026): repo tới hôm đó **không có phép kiểm tự động
+nào**. Mọi lỗi trong lịch sử — `MAX_ATTEMPTS` đếm sai loại lỗi, LLM hỏng thành
+"phát xong", ghi Base hỏng không có đường vá, hỏi đáp không lọc theo người —
+đều được tìm bằng tay SAU KHI đã hỏng trên dữ liệu thật, và nhiều cái sống qua
+vài phiên. Sổ tay ghi lại từng cái rất kỹ, nhưng văn bản không chặn được ai đó
+làm lại. Bốn lỗi tìm ra trong ngày viết file này đều do chạy đúng những phép
+kiểm dưới đây, không phải do đọc code.
+
+`doctor` KHÔNG thay thế được cái này: nó soi TRẠNG THÁI hệ thống đang chạy
+(whisper sống chưa, token còn mấy ngày), còn đây soi HÀNH VI của code trên các
+nhánh hiếm — cái mà chỉ khi hỏng thật mới thấy.
+
+Ba luật của file này, giữ nguyên nếu thêm phép kiểm mới:
+
+ 1. **Không đụng dữ liệu thật.** DB tạm trong thư mục tạm, xoá lúc xong. Biến
+    môi trường đặt TRƯỚC khi import `v2.*` (config đọc `.env` một lần lúc
+    import) — đó là lý do file này tự chạy lại mình trong một tiến trình con.
+ 2. **Không gọi mạng.** Mọi lời gọi Lark/LLM đều bị thay bằng hàm giả. Một phép
+    kiểm cần mạng là một phép kiểm sẽ bị bỏ qua khi mạng chập.
+ 3. **Kiểm nhánh HIẾM, không kiểm đường sướng.** Đường sướng đã chạy hằng ngày
+    rồi. Giá trị nằm ở: dry-run có ghi bậy không, lỗi vĩnh viễn có bị xử như lỗi
+    tạm thời không, `who=None` có rò dữ liệu không, hai cuộc họp có dùng chung
+    một file không.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+# =====================================================================
+#  Điểm vào từ CLI: chạy lại chính file này trong tiến trình CON
+# =====================================================================
+
+
+def run() -> int:
+    """`python -m v2 selftest` gọi vào đây. Trả mã thoát.
+
+    Phải là tiến trình CON: `config.py` đọc `v2/.env` một lần lúc import, nên
+    khi CLI đã nạp xong config thật thì không còn cách nào trỏ `V2_DB_PATH` sang
+    DB tạm nữa. Chạy lại file này với env đã đặt sẵn là cách duy nhất chắc chắn
+    không chạm vào `state.db` thật.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="v2-selftest-"))
+    env = dict(os.environ)
+    env.update({
+        "V2_DATA_DIR": str(tmp),
+        "V2_DB_PATH": str(tmp / "t.db"),
+        "V2_BACKUP_DIR": str(tmp / "bk"),
+        "V2_KEY_BACKUP_PATH": str(tmp / "key" / "k.txt"),
+        "V2_BACKUP_EVERY_HOURS": "0",
+        # Khóa VỨT ĐI, sinh riêng cho file này, KHÔNG phải khóa của `v2/.env`.
+        # Bản đầu tôi dán thẳng khóa thật vào đây và suýt commit lên GitHub —
+        # đó là khóa giải mã user token của MỌI người đã enroll. `state.db` được
+        # gitignore, nhưng khóa lọt vào git là mất luôn ý nghĩa của việc mã hóa
+        # (và git giữ nó trong history vĩnh viễn, xem đầu `.gitignore`).
+        # Đừng bao giờ đặt giá trị thật từ `.env` vào file được commit.
+        "V2_FERNET_KEY": "Osre32wbqm2eXpEmo1u_YCsdKrZfrcPYh8Uck_qhMFA=",
+        "BITABLE_APP_TOKEN": "", "BITABLE_TABLE_ID": "",
+        "ALERT_UNION_IDS": "on_ADMIN", "QA_ADMIN_UNION_IDS": "on_ADMIN",
+        "STATUS_PUSH_URL": "", "OAUTH_PULL_URL": "", "LLM_API_KEY": "",
+        "PYTHONIOENCODING": "utf-8",
+    })
+    try:
+        return subprocess.call([sys.executable, str(Path(__file__).resolve())],
+                               env=env, cwd=str(Path(__file__).resolve().parent.parent))
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# =====================================================================
+#  Thân bài — chỉ chạy khi là tiến trình con (env đã đặt sẵn)
+# =====================================================================
+
+
+def _main() -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import time
+    from v2 import (alerts, askers, backup, cards, config, db, gate, jobstore,
+                    lark_api, meetings, oauth, oauth_callback, orchestrator,
+                    pipeline, qa, summarize, tasks, tokenstore, transcribe)
+    from v2.models import Attendee, MeetingMeta, Recap, Segment, Transcript
+
+    config.ensure_dirs()
+    db.init()
+    ok: list[str] = []
+    bad: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        (ok if cond else bad).append(name)
+        mark = "  OK  " if cond else "  FAIL"
+        print(f"{mark} {name}" + (f"   <- {detail}" if detail and not cond else ""))
+
+    def part(title: str) -> None:
+        print(f"\n--- {title}")
+
+    def meta(**kw) -> MeetingMeta:
+        d = dict(minute_token="obsgTEST00000000000001", title="Hop thu",
+                 start=1785000000.0, duration_sec=600,
+                 owner_open_id="ou_owner", owner_name="Chu Ban Ghi",
+                 app_link="https://x/minutes/abc")
+        d.update(kw)
+        return MeetingMeta(**d)
+
+    def wipe_jobs() -> None:
+        with db.tx() as c:
+            c.execute("DELETE FROM jobs")
+
+    def add_user(oid, uid, name, status="active") -> None:
+        far = 9_999_999_999_000
+        with db.tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO tokens(open_id,union_id,name,access_enc,"
+                "refresh_enc,access_exp,refresh_exp,scopes,status,enrolled_at,"
+                "updated_at,last_used) VALUES (?,?,?,'','',?,?,'',?,0,0,0)",
+                (oid, uid, name, far, far, status))
+
+    # =================================================================
+    part("1. deliver cho NHIỀU người — dùng lại file_key, hỏng một người "
+         "không gãy cả job")
+    # =================================================================
+    # Đây là đường tốn tiền nhất nếu sai và là đường CHƯA TỪNG chạy thật với
+    # ≥2 người nhận (V2_HANDOFF §3): trước 02/08 mọi lần phát đều chỉ 1 người.
+    seen = {"upload": 0, "card": [], "file": [], "uuid": []}
+
+    def f_upload(path, ftype="stream"):
+        seen["upload"] += 1
+        return "FILEKEY_1"
+
+    def f_card(rid, card, *, id_type="union_id", uuid_key=None):
+        seen["card"].append(rid)
+        seen["uuid"].append(uuid_key)
+        if rid == "on_BAD":
+            raise lark_api.LarkError(230013, "chua phat hanh", "im_send")
+        return "om_" + rid
+
+    def f_file(rid, path, *, id_type="union_id", uuid_key=None, file_key=None):
+        seen["file"].append((rid, file_key))
+        seen["uuid"].append(uuid_key)
+        return "om_f"
+
+    class _NullJobstore:
+        record_delivery = staticmethod(lambda *a, **k: None)
+        set_status = staticmethod(lambda *a, **k: None)
+
+    keep = (lark_api.im_upload_file, lark_api.im_send_card,
+            lark_api.im_send_file, pipeline.jobstore)
+    lark_api.im_upload_file, lark_api.im_send_card, lark_api.im_send_file = \
+        f_upload, f_card, f_file
+    pipeline.jobstore = _NullJobstore
+
+    tr = Transcript(minute_token="x", lang="vi", duration=60, engine="t",
+                    segments=[Segment(0, 60, "noi dung")])
+    sent, failed = pipeline.deliver(meta(), Recap(summary="tom tat"), tr,
+                                    ["on_A", "on_BAD", "on_C"])
+    check("upload transcript đúng 1 lần cho 3 người", seen["upload"] == 1,
+          f"gọi {seen['upload']} lần")
+    check("gửi thẻ hỏng cho một người thì KHÔNG gửi file cho người đó",
+          [r for r, _ in seen["file"]] == ["on_A", "on_C"])
+    check("mọi người dùng CHUNG một file_key",
+          {k for _, k in seen["file"]} == {"FILEKEY_1"})
+    check("sent/failed đúng", sent == ["on_A", "on_C"] and failed == ["on_BAD"])
+    check("uuid_key khác nhau từng người (Lark khử trùng theo uuid)",
+          len(set(seen["uuid"])) == len(seen["uuid"]))
+    check("uuid_key <= 50 ký tự (Lark cắt ở 50 -> dài quá là đụng nhau)",
+          all(len(u) <= 50 for u in seen["uuid"]))
+
+    lark_api.im_upload_file, lark_api.im_send_card, lark_api.im_send_file, \
+        pipeline.jobstore = keep
+
+    # =================================================================
+    part("2. txt_path — hai cuộc họp KHÔNG được dùng chung một file")
+    # =================================================================
+    # `bitable._tracking_fields` dựng lại đúng đường dẫn này để đính kèm vào
+    # Base. Đụng tên = record của cuộc A nhận transcript của cuộc B.
+    a = pipeline.txt_path(meta(title="Hop tuan", start=None, minute_token="obsgAAA"))
+    b = pipeline.txt_path(meta(title="Hop tuan", start=None, minute_token="obsgBBB"))
+    check("không có giờ họp: hai cuộc trùng tên vẫn ra hai file", a != b,
+          f"cả hai đều là {a.name}")
+    c1 = pipeline.txt_path(meta(title="H", start=1785000000.0, minute_token="obsgAAA"))
+    check("có giờ họp: tên file giữ nguyên định dạng cũ (không phá file đã có)",
+          "obsgAAA" not in c1.name)
+
+    # =================================================================
+    part("3. download_recording — lỗi VĨNH VIỄN vs lỗi TẠM THỜI")
+    # =================================================================
+    def scenario(deny=(), other=(), notoken=()):
+        def gat(oid):
+            if oid in notoken:
+                raise tokenstore.TokenError(f"{oid} chưa enroll")
+            return "tok_" + oid
+
+        def murl(tok, mt):
+            who = tok[4:]
+            if who in deny:
+                raise lark_api.LarkError(2091005, "permission deny", "minutes_media")
+            if who in other:
+                raise lark_api.LarkError(500, "server lỗi", "minutes_media")
+            return "https://dl/" + mt
+
+        keep2 = (tokenstore.get_access_token, lark_api.minutes_media_url)
+        tokenstore.get_access_token, lark_api.minutes_media_url = gat, murl
+        try:
+            pipeline.download_recording(meta())
+            out = "TẢI ĐƯỢC"
+        except pipeline.MediaDenied:
+            out = "MediaDenied"
+        except pipeline.PipelineError:
+            out = "PipelineError"
+        tokenstore.get_access_token, lark_api.minutes_media_url = keep2
+        return out
+
+    keep3 = pipeline._reader_candidates
+    pipeline._reader_candidates = lambda m: ["ou_owner", "ou_2", "ou_3"]
+    check("tất cả bị từ chối quyền -> MediaDenied (failed ngay, khỏi thử lại)",
+          scenario(deny=("ou_owner", "ou_2", "ou_3")) == "MediaDenied")
+    check("lẫn MỘT lỗi 5xx -> PipelineError (vẫn thử lại, đừng kết luận vội)",
+          scenario(deny=("ou_owner", "ou_2"), other=("ou_3",)) == "PipelineError")
+    check("chủ bị từ chối + người khác chưa enroll -> vẫn MediaDenied",
+          scenario(deny=("ou_owner",), notoken=("ou_2", "ou_3")) == "MediaDenied")
+    check("chỉ toàn người chưa enroll -> PipelineError (chờ họ enroll)",
+          scenario(notoken=("ou_owner", "ou_2", "ou_3")) == "PipelineError")
+    pipeline._reader_candidates = keep3
+
+    # =================================================================
+    part("4. BẤT BIẾN: `process` dry-run KHÔNG được ghi gì vào DB")
+    # =================================================================
+    # `process` (không --send) là lệnh CHẨN ĐOÁN, người ta chạy nó vài lần.
+    # Đã mất một job thật vì nó cộng `attempts` như lần chạy thật (31/07/2026).
+    import json as _json
+
+    def snap() -> str:
+        return _json.dumps([dict(r) for r in db.conn().execute(
+            "SELECT * FROM jobs ORDER BY minute_token")],
+            sort_keys=True, default=str)
+
+    def mk_job(tok, attempts=2):
+        jobstore.create(meta(minute_token=tok, title="Hop " + tok), status="queued")
+        with db.tx() as c:
+            c.execute("UPDATE jobs SET attempts=? WHERE minute_token=?",
+                      (attempts, tok))
+
+    keep4 = pipeline.run_transcription
+    for label, boom in (
+            ("MediaDenied", pipeline.MediaDenied("không ai được tải")),
+            ("TranscribeUnavailable", transcribe.TranscribeUnavailable("whisper tắt")),
+            ("lỗi lạ", RuntimeError("mạng hỏng"))):
+        wipe_jobs()
+        mk_job("obsgDRY0000000000000001")
+        before = snap()
+        pipeline.run_transcription = (lambda b: (lambda m: (_ for _ in ()).throw(b)))(boom)
+        orchestrator.process_queue(dry_run=True)
+        check(f"dry-run + {label}: DB không đổi một byte", snap() == before,
+              "DB ĐÃ BỊ GHI trong dry-run")
+
+    part("5. Chạy THẬT: mỗi loại lỗi vào đúng trạng thái")
+    for label, boom, st, att in (
+            ("MediaDenied -> failed ngay", pipeline.MediaDenied("x"), "failed", 3),
+            ("TranscribeUnavailable -> trả lại lần thử",
+             transcribe.TranscribeUnavailable("x"), "queued", 2),
+            ("lỗi lạ -> tiêu một lần thử", RuntimeError("x"), "queued", 3)):
+        wipe_jobs()
+        mk_job("obsgREAL000000000000001")
+        pipeline.run_transcription = (lambda b: (lambda m: (_ for _ in ()).throw(b)))(boom)
+        orchestrator.process_queue(dry_run=False)
+        r = jobstore.get("obsgREAL000000000000001")
+        check(f"{label} (status={st}, attempts={att})",
+              r["status"] == st and r["attempts"] == att,
+              f"thực tế status={r['status']} attempts={r['attempts']}")
+
+    wipe_jobs()
+    mk_job("obsgERR0000000000000001", attempts=0)
+    pipeline.run_transcription = lambda m: (_ for _ in ()).throw(
+        pipeline.MediaDenied("chủ bản ghi là Nguyen Ngoc Phuc, chưa cấp quyền"))
+    orchestrator.process_queue(dry_run=False)
+    check("MediaDenied giữ NGUYÊN NHÂN, không bị ghi đè bằng 'quá N lần thử'",
+          "Nguyen Ngoc Phuc" in (jobstore.get("obsgERR0000000000000001")["error"] or ""))
+    pipeline.run_transcription = keep4
+
+    # =================================================================
+    part("6. _recipients — chỉ người ĐÃ ENROLL, hợp hai nguồn, khử trùng")
+    # =================================================================
+    add_user("ou_A", "on_A", "An")
+    add_user("ou_B", "on_B", "Binh")
+    add_user("ou_ADMIN", "on_ADMIN", "Admin")
+    add_user("ou_X", "on_X", "Da thu hoi", status="revoked")
+    m = meta(minute_token="obsgREC0000000000000001", owner_open_id="ou_A",
+             attendees=[Attendee(open_id="ou_A", union_id="on_A"),
+                        Attendee(union_id="on_A"),              # trùng
+                        Attendee(union_id="on_X"),              # đã thu hồi
+                        Attendee(union_id="on_NGOAI"),          # chưa enroll
+                        Attendee(open_id="ou_KHONG_CO_UNION")])
+    db.note_viewer("obsgREC0000000000000001", "ou_B", "on_B", "Binh")
+    db.note_viewer("obsgREC0000000000000001", "ou_A", "on_A", "An")   # trùng nguồn 1
+    db.note_viewer("obsgREC0000000000000001", "ou_Z", "on_Z", "Z")    # chưa enroll
+    rec, skipped = orchestrator._recipients(m)
+    check("chỉ on_A + on_B, mỗi người đúng một lần", rec == ["on_A", "on_B"], str(rec))
+    check("đếm đúng số người dự chưa cấp quyền", skipped == 2, f"skipped={skipped}")
+
+    db.note_viewer("obsgV", "ou_A", "on_A", "An")
+    first = db.viewers_of("obsgV")[0]["seen_at"]
+    time.sleep(0.01)
+    db.note_viewer("obsgV", "ou_A", "on_A", "An")
+    check("note_viewer idempotent, giữ mốc LẦN ĐẦU",
+          len(db.viewers_of("obsgV")) == 1
+          and db.viewers_of("obsgV")[0]["seen_at"] == first)
+
+    # =================================================================
+    part("7. Phân quyền hỏi đáp — fail-closed")
+    # =================================================================
+    wipe_jobs()
+    for tok, atts, owner in (
+            ("mtA", [Attendee(open_id="ou_A", union_id="on_A")], "ou_A"),
+            ("mtB", [Attendee(open_id="ou_B", union_id="on_B")], "ou_B"),
+            ("mtC", [], "ou_NGOAI")):
+        jobstore.create(meta(minute_token=tok, title="Hop " + tok,
+                             owner_open_id=owner, attendees=atts),
+                        status="delivered")
+    db.note_viewer("mtC", "ou_B", "on_B", "Binh")   # chuỗi tra lịch SÓT, Lark thì biết
+    idx = qa.viewers_index()
+    wA = askers.who("on_A", "ou_A", "An")
+    wB = askers.who("on_B", "ou_B", "Binh")
+    wAd = askers.who("on_ADMIN", "ou_ADMIN", "Admin")
+    check("A xem được cuộc của A", qa._may_see("mtA", wA, idx))
+    check("A KHÔNG xem được cuộc của B", not qa._may_see("mtB", wA, idx))
+    check("B xem được mtC nhờ minute_viewers (tra lịch sót vẫn không mất quyền)",
+          qa._may_see("mtC", wB, idx))
+    check("admin xem được hết",
+          all(qa._may_see(t, wAd, idx) for t in ("mtA", "mtB", "mtC")))
+    check("who=None -> không xem được gì",
+          not any(qa._may_see(t, None, idx) for t in ("mtA", "mtB", "mtC")))
+    check("record không có job -> không ai xem được", not qa._may_see("mtZZ", wA, idx))
+    check("who=None -> ba tool MCP đều từ chối",
+          qa.list_meetings(None) == qa.NO_ASKER
+          and qa.get_meeting(None, "Hop") == qa.NO_ASKER
+          and qa.search_meetings(None, "x") == qa.NO_ASKER)
+    check("who=None -> context rỗng (đường `v2 ask` cũng phải kín)",
+          qa.context(None) == "")
+    check("who=None -> hàng đợi không lộ cả CON SỐ", qa.pending_split(None) == ([], 0))
+    pend, hidden = qa.pending_split(wB)
+    check("B thấy đúng mtB + mtC trong hàng đợi",
+          {p["minute_token"] for p in pend} == {"mtB", "mtC"})
+    check("B được báo có 1 cuộc bị ẩn (biết mà đi hỏi, không tưởng là hết)",
+          hidden == 1)
+
+    # =================================================================
+    part("8. Vé phiên")
+    # =================================================================
+    t1 = askers.issue("on_A", "ou_A", "An")
+    check("nhắn lại -> dùng lại vé cũ", t1 == askers.issue("on_A", "ou_A", "An"))
+    check("giải vé ra đúng người",
+          (askers.resolve(t1) or {}).get("union_id") == "on_A")
+    check("vé bịa -> None (KHÔNG phải 'cho xem hết')", askers.resolve("bia") is None)
+    check("vé rỗng -> None", askers.resolve("") is None)
+    t3 = askers.issue("on_B", "ou_B", "Binh")
+    check("vé của B không giải ra A",
+          t1 != t3 and (askers.resolve(t3) or {}).get("union_id") == "on_B")
+    with db.tx() as c:
+        c.execute("UPDATE qa_sessions SET expires_at=1 WHERE token=?", (t1,))
+    check("vé hết hạn -> None", askers.resolve(t1) is None)
+    check("union_id rỗng KHÔNG thành admin", askers.who("")["admin"] is False)
+    check("admin nhận diện đúng", askers.who("on_ADMIN")["admin"] is True)
+
+    # =================================================================
+    part("9. Cảnh báo — chống spam, nhưng KHÔNG im vĩnh viễn")
+    # =================================================================
+    box: list[str] = []
+    # Tắt MỌI phép kiểm khác của check_all: nhóm này đếm số DM, nên một mục
+    # khác lỡ kêu là con số sai và phép kiểm nói dối. Hôm nay `_check_llm` và
+    # `_check_run_stale` tự im trong môi trường selftest (không LLM_API_KEY,
+    # không heartbeat) — nhưng dựa vào điều đó là dựa vào một thứ ở xa.
+    keep5 = (alerts._send, alerts._check_whisper, alerts._check_tokens,
+             alerts._check_llm, alerts._check_run_stale)
+    alerts._send = lambda text: (box.append(text), True)[1]
+    alerts._check_whisper = lambda out: None
+    alerts._check_tokens = lambda out: None
+    alerts._check_llm = lambda out: None
+    alerts._check_run_stale = lambda out: None
+    with db.tx() as c:
+        c.execute("DELETE FROM alert_state")
+        c.execute("UPDATE jobs SET status='failed', attempts=3, error='lý do X' "
+                  "WHERE minute_token='mtA'")
+    check("job failed -> báo lần đầu", len(alerts.check_all()) == 1)
+    check("gọi lại -> im (chống spam)", len(alerts.check_all()) == 0)
+    check("nội dung DM có lý do thật", "lý do X" in box[0])
+    with db.tx() as c:
+        c.execute("UPDATE jobs SET attempts=4 WHERE minute_token='mtA'")
+    check("attempts đổi = tình trạng đổi -> báo lại", len(alerts.check_all()) == 1)
+    with db.tx() as c:
+        c.execute("UPDATE jobs SET status='queued' WHERE minute_token='mtA'")
+    alerts.check_all()
+    with db.tx() as c:
+        c.execute("UPDATE jobs SET status='failed' WHERE minute_token='mtA'")
+    check("được cứu rồi hỏng LẠI -> báo lại", len(alerts.check_all()) == 1)
+    alerts._send = lambda text: False
+    with db.tx() as c:
+        c.execute("DELETE FROM alert_state")
+        c.execute("UPDATE jobs SET attempts=9 WHERE minute_token='mtA'")
+    check("gửi hỏng -> KHÔNG ghi mốc (không nuốt mất cảnh báo)",
+          len(alerts.check_all()) == 0)
+    alerts._send = lambda text: (box.append(text), True)[1]
+    check("vòng sau gửi lại được", len(alerts.check_all()) == 1)
+    (alerts._send, alerts._check_whisper, alerts._check_tokens,
+     alerts._check_llm, alerts._check_run_stale) = keep5
+
+    # =================================================================
+    part("10. Lọc người dự / người vào họp")
+    # =================================================================
+    keep6, dropped = meetings._attendee_ids([
+        {"type": "user", "user_id": "u1", "rsvp_status": "accept"},
+        {"type": "user", "user_id": "u2", "rsvp_status": "decline"},
+        {"type": "user", "user_id": "u3", "rsvp_status": "needs_action"},
+        {"type": "user", "user_id": "u4", "rsvp_status": "DECLINE"},
+        {"type": "user", "user_id": "u5"},
+        {"type": "resource", "user_id": "phong-hop", "rsvp_status": "accept"},
+        {"type": "chat", "user_id": "oc_group", "rsvp_status": "accept"},
+        {"type": "user", "user_id": "", "rsvp_status": "accept"},
+    ])
+    check("giữ accept/needs_action/thiếu-trường, bỏ decline (cả HOA lẫn thường)",
+          keep6 == ["u1", "u3", "u5"] and dropped == 2,
+          f"keep={keep6} dropped={dropped}")
+    check("bỏ phòng họp (resource) và group chat (chat)",
+          "phong-hop" not in keep6 and "oc_group" not in keep6)
+
+    keep7 = lark_api.vc_meeting_participants
+    lark_api.vc_meeting_participants = lambda tok, mid, id_type="union_id": [
+        {"id": "on_1", "user_type": 1, "is_external": False},
+        {"id": "on_1", "user_type": 1, "is_external": False},    # vào 2 lần
+        {"id": "on_room", "user_type": 2, "is_external": False},
+        {"id": "on_pstn", "user_type": 3, "is_external": False},
+        {"id": "on_ngoai", "user_type": 1, "is_external": True},
+        {"id": "on_2", "user_type": "1", "is_external": False},  # kiểu chuỗi
+        {"id": "", "user_type": 1},
+    ]
+    check("người vào họp: bỏ Rooms/PSTN/ngoài tenant, khử trùng, nhận user_type chuỗi",
+          meetings._vc_joiners("tok", "mid") == ["on_1", "on_2"])
+    lark_api.vc_meeting_participants = keep7
+
+    for src, must in (
+            ("calendar[verified]:Hop tuan +vc29 -decline2", ("29", "2", "Hop tuan")),
+            ("calendar[near6m]:Hop A", ("6m", "Hop A")),
+            ("no_match -> fallback:owner", ("chỉ gửi cho chủ minute",)),
+            ("", ("không rõ",))):
+        out = meetings.explain_source(src)
+        check(f"explain_source đọc được: {src[:36] or '(rỗng)'}",
+              all(x in out for x in must), out)
+
+    # =================================================================
+    part("11. Bóc JSON của LLM (đường Hermes trả kèm văn xuôi)")
+    # =================================================================
+    for label, raw in (
+            ("JSON thuần", '{"summary":"S","decisions":["d1"],"action_items":[]}'),
+            ("bọc ```json", 'Kết quả:\n```json\n{"summary":"S","decisions":["d1"],'
+                            '"action_items":[]}\n```\nXong.'),
+            ("bọc ``` trần", '```\n{"summary":"S","decisions":["d1"],'
+                             '"action_items":[]}\n```'),
+            ("văn xuôi hai đầu", 'Tôi đã đọc. {"summary":"S","decisions":["d1"],'
+                                 '"action_items":[]} Xong nhé.')):
+        r = summarize._parse(raw)
+        check(f"lấy được decisions từ: {label}",
+              r.summary == "S" and r.decisions == ["d1"],
+              f"summary={r.summary!r} decisions={r.decisions}")
+    check("không phải JSON -> giữ nguyên văn, KHÔNG mất dữ liệu",
+          summarize._parse("Khong phai JSON").summary == "Khong phai JSON")
+    r = summarize._parse('{"summary":"S","action_items":["việc dạng chuỗi"]}')
+    check("action_items dạng chuỗi vẫn nhận", len(r.action_items) == 1)
+    check("field null -> không nổ",
+          summarize._parse('{"summary":null,"decisions":null}').decisions == [])
+
+    # =================================================================
+    part("12. Bóc mốc thời gian của whisper")
+    # =================================================================
+    s = transcribe._parse_segments(
+        "[00:00:00 -> 00:00:05] a\n[00:00:05 -> 00:00:09] b", 9)
+    check("có cả start lẫn end", len(s) == 2 and s[0].end == 5.0)
+    s = transcribe._parse_segments("[00:00:00] a\n[00:00:07] b", 12)
+    check("định dạng CŨ (không end) -> suy từ đoạn kế",
+          len(s) == 2 and s[0].end == 7.0 and s[1].end == 12.0)
+    s = transcribe._parse_segments("[00:00:00] a\ndòng nối tiếp", 5)
+    check("dòng không có mốc -> gộp vào đoạn trước",
+          len(s) == 1 and "nối tiếp" in s[0].text)
+    check("không có mốc nào -> một đoạn phủ hết",
+          transcribe._parse_segments("khong co moc", 30)[0].end == 30)
+    check("chuỗi rỗng -> không nổ", len(transcribe._parse_segments("", 0)) == 1)
+
+    # =================================================================
+    part("13. Hạn task — bẫy lùi một ngày")
+    # =================================================================
+    from datetime import datetime, timezone
+    ms = tasks._parse_due("2026-08-15")
+    check("hạn neo nửa đêm UTC, KHÔNG phải nửa đêm +07",
+          datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
+          == "2026-08-15 00:00")
+    check("định dạng sai -> None", tasks._parse_due("15/08/2026") is None)
+    check("ngày không tồn tại -> None", tasks._parse_due("2026-02-30") is None)
+    check("rỗng -> None", tasks._parse_due("") is None)
+
+    # =================================================================
+    part("14. Thẻ Lark — nội dung dài không làm vỡ giới hạn")
+    # =================================================================
+    card = cards.recap_card(meta(title="X" * 300), Recap(summary="Y" * 9000))
+    check("tiêu đề thẻ <= 100 ký tự",
+          len(card["header"]["title"]["content"]) <= 100)
+    check("thân thẻ bị cắt, không để tràn",
+          all(len(e.get("text", {}).get("content", "")) <= 4000
+              for e in card["elements"]))
+
+    # =================================================================
+    part("15. Sao lưu — xoay vòng + phát hiện ĐỔI khóa Fernet")
+    # =================================================================
+    config.BACKUP_KEEP = 3
+    for _ in range(5):
+        backup.run_backup()
+        time.sleep(1.05)                     # tên file theo giây
+    check(f"giữ đúng {config.BACKUP_KEEP} bản mới nhất",
+          len(backup.snapshots()) == 3, str(len(backup.snapshots())))
+    import sqlite3
+    con = sqlite3.connect("file:" + str(backup.snapshots()[0]) + "?mode=ro", uri=True)
+    check("bản sao đọc được và toàn vẹn",
+          con.execute("pragma integrity_check").fetchone()[0] == "ok")
+    con.close()
+    old_fp = backup.key_fingerprint()
+    config.FERNET_KEY = "AAAA3U9PKWv2JOi8JCfWL5TCrXS71QxBxzLbIp6hXGA="
+    backup.run_backup()
+    prevs = list(config.KEY_BACKUP_PATH.parent.glob("*.prev-*"))
+    check("đổi V2_FERNET_KEY -> GIỮ khóa cũ lại, không ghi đè",
+          len(prevs) == 1 and old_fp in prevs[0].name,
+          str([p.name for p in prevs]))
+
+    # =================================================================
+    part("16. Enroll — lưới kiểm scope phải chạy ở CẢ BA đường")
+    # =================================================================
+    # §22 lấy chính lưới này làm lý do dám cắt OAUTH_SCOPES 124 -> 18. Trước
+    # 02/08/2026 nó chỉ chạy ở đường hộp thư Vercel, còn `v2 complete` (đường mà
+    # V2_HANDOFF §4.2 bảo người vận hành dùng) thì không.
+    checked: list[str] = []
+    keep8 = (lark_api.exchange_code, lark_api.user_info,
+             oauth._warn_if_missing_scopes, lark_api.im_send_text)
+    lark_api.exchange_code = lambda code: {
+        "access_token": "at", "refresh_token": "rt", "expires_in": 7200,
+        "refresh_token_expires_in": 2592000, "scope": "a b"}
+    lark_api.user_info = lambda at: {"open_id": "ou_NEW", "union_id": "on_NEW",
+                                     "name": "Nguoi Moi"}
+    oauth._warn_if_missing_scopes = lambda info: checked.append(info["open_id"])
+    lark_api.im_send_text = lambda *a, **k: "om"
+
+    try:
+        oauth.complete("code", "nonce-bia")
+        check("nonce bịa bị từ chối", False, "KHÔNG ném lỗi")
+    except RuntimeError:
+        check("nonce bịa bị từ chối", True)
+    _, nx = oauth.start("ou_NEW")
+    with db.tx() as c:
+        c.execute("UPDATE oauth_nonce SET expires_at=1 WHERE nonce=?", (nx,))
+    try:
+        oauth.complete("code", nx)
+        check("nonce hết hạn bị từ chối", False, "KHÔNG ném lỗi")
+    except RuntimeError:
+        check("nonce hết hạn bị từ chối", True)
+
+    checked.clear()
+    _, n1 = oauth.start("ou_NEW")
+    oauth.complete("code", n1)
+    check("đường `v2 complete` (dán tay) CÓ kiểm scope", checked == ["ou_NEW"])
+    check("nonce tiêu sau khi dùng (dùng-một-lần)",
+          db.conn().execute("SELECT 1 FROM oauth_nonce WHERE nonce=?",
+                            (n1,)).fetchone() is None)
+    checked.clear()
+    _, n2 = oauth.start("ou_NEW")
+    oauth_callback.oauth.complete("code", n2)
+    check("đường `v2 enroll` (callback cục bộ) CÓ kiểm scope", checked == ["ou_NEW"])
+
+    checked.clear()
+    _, n3 = oauth.start("ou_NEW")
+    import httpx
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"pending": [{"code": "c", "state": n3}]}
+
+    keep9 = httpx.get
+    httpx.get = lambda *a, **k: _Resp()
+    config.OAUTH_PULL_URL, config.STATUS_PUSH_SECRET = "http://x", "s"
+    done = oauth.poll_pending()
+    httpx.get = keep9
+    check("đường hộp thư Vercel CÓ kiểm scope", checked == ["ou_NEW"])
+    check("KHÔNG kiểm hai lần (không còn lời gọi thừa ở poll_pending)",
+          len(checked) == 1 and len(done) == 1)
+
+    with db.tx() as c:
+        c.execute("INSERT OR REPLACE INTO enroll_invites"
+                  "(union_id,user_id,name,nonce,sent_at,times) "
+                  "VALUES ('on_NEW','u','Nguoi Moi','nc',1,1)")
+    _, n4 = oauth.start("ou_NEW")
+    oauth.complete("code", n4)
+    check("mọi đường enroll đều xoá lời mời cũ",
+          db.conn().execute("SELECT 1 FROM enroll_invites WHERE union_id='on_NEW'"
+                            ).fetchone() is None)
+    lark_api.exchange_code, lark_api.user_info, \
+        oauth._warn_if_missing_scopes, lark_api.im_send_text = keep8
+
+    # =================================================================
+    part("17. Cửa vào bot hỏi đáp (gate)")
+    # =================================================================
+    box2: list[tuple[str, str]] = []
+    keep10 = (lark_api.im_send_text, oauth.short_link)
+    lark_api.im_send_text = lambda uid, text, **k: (box2.append((uid, text)), "om")[1]
+    oauth.short_link = lambda u: ""
+    check("thiếu union_id -> KHÔNG cho vào",
+          gate.check("", name="Vo Danh")["decision"] == "wait")
+    d = gate.check("on_A", name="An")
+    check("đã enroll -> allow, kèm vé phiên",
+          d["decision"] == "allow" and bool(d.get("asker_token")))
+    check("vé từ gate giải ra đúng người",
+          (askers.resolve(d["asker_token"]) or {}).get("union_id") == "on_A")
+    box2.clear()
+    d = gate.check("on_LA", name="Nguoi La")
+    check("chưa enroll -> invite + gửi link, KHÔNG kèm vé",
+          d["decision"] == "invite" and len(box2) == 1 and not d.get("asker_token"))
+    d = gate.check("on_LA", name="Nguoi La")
+    check("nhắn lại ngay -> wait, không gửi link thứ hai",
+          d["decision"] == "wait" and not d.get("asker_token"))
+    with db.tx() as c:
+        c.execute("DELETE FROM enroll_invites")
+
+    def _boom(uid, text, **k):
+        raise lark_api.LarkError(230013, "chua phat hanh", "im_send")
+
+    lark_api.im_send_text = _boom
+    d = gate.check("on_HONG", name="X")
+    check("gửi link HỎNG -> không ghi invite, vòng sau còn thử lại",
+          d["decision"] == "wait" and db.conn().execute(
+              "SELECT 1 FROM enroll_invites WHERE union_id='on_HONG'").fetchone() is None)
+    lark_api.im_send_text, oauth.short_link = keep10
+
+    # =================================================================
+    part("18. Dashboard công khai — KHÔNG được lộ đường dẫn máy")
+    # =================================================================
+    # `…/api/status?json=1` đọc được bằng GET **không cần xác thực** (đo
+    # 02/08/2026, HTTP 200). Mà `build_snapshot` nhét nguyên `doctor.collect()`
+    # vào — và doctor in đường dẫn đầy đủ vì nó viết cho người ngồi trước máy.
+    from v2 import status_push
+    for raw, must_go in (
+            (f"khóa ở {config.KEY_BACKUP_PATH}", str(config.KEY_BACKUP_PATH)),
+            (f"đích: {config.BACKUP_DIR}", str(config.BACKUP_DIR)),
+            ("bật E:\\whisper\\run-server.bat + đúng cổng", "E:\\whisper"),
+            (f"db {config.DB_PATH}", str(config.DB_PATH))):
+        out = status_push.scrub(raw)
+        check(f"scrub xoá được: {must_go[:38]}", must_go not in out, out)
+    check("scrub xoá cả tên người dùng Windows",
+          str(Path.home()) not in status_push.scrub(f"x {Path.home()}\\y"))
+    check("scrub xoá vân tay khóa Fernet (vô dụng với người xem từ xa)",
+          backup.key_fingerprint() not in
+          status_push.scrub(f"vân tay {backup.key_fingerprint()}"))
+    check("scrub KHÔNG phá URL bình thường",
+          status_push.scrub("http://localhost:8000") == "http://localhost:8000")
+    check("scrub giữ nguyên chuỗi không có đường dẫn",
+          status_push.scrub("hàng đợi: delivered=3") == "hàng đợi: delivered=3")
+
+    snap = status_push.build_snapshot()
+    import re as _re
+    check("snapshot thật KHÔNG chứa tên người dùng Windows",
+          str(Path.home()) not in _json.dumps(snap, ensure_ascii=False))
+    leaks = [c for c in snap["checks"]
+             if _re.search(r"[A-Za-z]:\\", f"{c['label']}{c['detail']}")]
+    check("snapshot thật không còn đường dẫn ổ đĩa nào", not leaks, str(leaks))
+
+    # =================================================================
+    part("19. Mượn token đúng người (chủ bản ghi trước)")
+    # =================================================================
+    # Từ khi `build_meta` tra ra CHỦ THẬT, `owner_open_id` không còn luôn là
+    # người đã enroll — nên thứ tự ứng viên mới là thứ giữ cho hai đường
+    # (tải bản ghi, upload file vào Base) không rơi vào "người bất kỳ".
+    m2 = meta(minute_token="obsgCAND00000000000001", owner_open_id="ou_CHU",
+              attendees=[Attendee(open_id="ou_DU1"), Attendee(union_id="on_x")])
+    db.note_viewer("obsgCAND00000000000001", "ou_VIEWER", "on_v", "V")
+    cands = pipeline._reader_candidates(m2)
+    check("thứ tự: chủ bản ghi -> người dự -> người Lark báo có dự",
+          cands == ["ou_CHU", "ou_DU1", "ou_VIEWER"], str(cands))
+    check("bỏ qua người dự không có open_id", "on_x" not in cands)
+    m3 = meta(minute_token="obsgCAND00000000000001", owner_open_id="ou_CHU",
+              attendees=[Attendee(open_id="ou_CHU")])
+    check("không lặp lại cùng một người",
+          pipeline._reader_candidates(m3).count("ou_CHU") == 1)
+
+    # =================================================================
+    part("20. Không có hai lượt xử lý hàng đợi chồng nhau")
+    # =================================================================
+    # `ws_listener` gọi `process_queue()` từ thread nền. Chồng lượt = phát cùng
+    # một biên bản HAI LẦN cho tất cả người dự.
+    wipe_jobs()
+    mk_job("obsgLOCK000000000000001", attempts=0)
+    trace: list[str] = []
+    barrier = threading.Event()
+
+    def _slow(m):
+        trace.append("vào")
+        barrier.wait(3.0)
+        trace.append("ra")
+        raise transcribe.TranscribeUnavailable("dừng ở đây cho gọn")
+
+    pipeline.run_transcription = _slow
+    th = threading.Thread(
+        target=lambda: orchestrator.process_queue(dry_run=True), daemon=True)
+    th.start()
+    while "vào" not in trace:                  # chờ lượt 1 vào hẳn bên trong
+        time.sleep(0.01)
+    orchestrator.process_queue(dry_run=True)   # lượt 2, phải bị bỏ NGAY
+    check("lượt thứ hai bị bỏ, không chạy song song", trace.count("vào") == 1,
+          str(trace))
+    barrier.set()
+    th.join(5)
+    orchestrator.process_queue(dry_run=True)
+    check("lượt 1 xong thì khoá được nhả, lượt sau chạy bình thường",
+          trace.count("vào") == 2, str(trace))
+    pipeline.run_transcription = keep4
+
+    # =================================================================
+    part("21. Đọc .env chịu được BOM (Windows hay chèn)")
+    # =================================================================
+    import importlib
+    import os as _os
+    tmpdir = Path(config.DATA_DIR) / "envtest"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    fake_env = tmpdir / ".env"
+    for label, prefix in (("có BOM", "﻿"), ("không BOM", "")):
+        fake_env.write_text(prefix + "DONG_DAU_LA_CAU_HINH=xin_chao\n"
+                                     "PAUSED=1\n", encoding="utf-8")
+        got = {}
+        for line in fake_env.read_text(encoding="utf-8-sig").splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                k, _, v = line.partition("=")
+                got[k.strip()] = v.strip()
+        check(f"{label}: cấu hình ở DÒNG ĐẦU vẫn đọc được",
+              got.get("DONG_DAU_LA_CAU_HINH") == "xin_chao", str(list(got)))
+        check(f"{label}: công tắc PAUSED vẫn đọc được", got.get("PAUSED") == "1")
+    # File .env THẬT của máy này: chỉ cần không mất key nào vì BOM.
+    real_env = Path(config.__file__).resolve().parent / ".env"
+    if real_env.exists():
+        keys = [ln.partition("=")[0].strip()
+                for ln in real_env.read_text(encoding="utf-8-sig").splitlines()
+                if "=" in ln and not ln.strip().startswith("#")]
+        check("v2/.env thật: không key nào dính ký tự lạ",
+              all(k.isascii() and k.replace("_", "").isalnum() for k in keys),
+              str([k for k in keys
+                   if not (k.isascii() and k.replace("_", "").isalnum())]))
+
+    # =================================================================
+    part("22. Ai đọc được Base — cửa THỨ HAI vào cùng dữ liệu")
+    # =================================================================
+    # Mọi phân quyền của V2 nằm ở code (`qa._may_see`, `_recipients`), nhưng
+    # cùng nội dung đó — kèm attachment NGUYÊN VĂN transcript — nằm trên Base,
+    # và ACL của Base là thiết lập Lark thủ công ngoài repo. Bảng ánh xạ dưới
+    # đây là thứ quyết định doctor báo xanh hay đỏ; sai một giá trị enum là báo
+    # an toàn cho một Base đang mở toang. Đo thật 02/08/2026: Base của hệ thống
+    # này đang ở `tenant_readable` + `external_access_entity=open`.
+    from v2 import doctor as _doc
+
+    def judge(ent, ext="closed"):
+        rows = _doc.judge_base_access(
+            [{"member_id": "ou_x", "member_type": "openid", "perm": "full_access"}],
+            {"link_share_entity": ent, "external_access_entity": ext})
+        return rows[-1]                       # dòng nói về chia sẻ bằng link
+
+    check("link đóng -> OK", judge("closed")[0] == _doc.OK)
+    check("tenant_readable -> WARN (cả công ty đọc được)",
+          judge("tenant_readable")[0] == _doc.WARN)
+    check("anyone_readable -> FAIL (ngoài công ty cũng đọc được)",
+          judge("anyone_readable")[0] == _doc.FAIL)
+    check("anyone_editable -> FAIL", judge("anyone_editable")[0] == _doc.FAIL)
+    # Giá trị lạ KHÔNG được rơi về OK: Lark thêm enum mới thì mặc định phải là
+    # "chưa biết, cảnh báo đi", không phải "im lặng coi như an toàn".
+    check("giá trị enum LẠ -> WARN, không phải OK",
+          judge("mot_gia_tri_moi_cua_lark")[0] == _doc.WARN)
+    check("cảnh báo nói rõ transcript nguyên văn bị phơi",
+          "NGUYÊN VĂN" in judge("tenant_readable")[2])
+    check("có nói link chuyển được ra ngoài công ty",
+          "RA NGOÀI" in judge("tenant_readable", ext="open")[2]
+          and "RA NGOÀI" not in judge("tenant_readable", ext="closed")[2])
+    rows = _doc.judge_base_access([], {"link_share_entity": "closed"})
+    check("không ai được thêm vào -> vẫn có dòng liệt kê",
+          rows[0][0] == _doc.OK and "0 người" in rows[0][1])
+
+    # =================================================================
+    part("23. Vòng `run` chết thì PHẢI có người báo")
+    # =================================================================
+    # Cái bẫy mà mục này chặn: `alerts.check_all()` được gọi TỪ TRONG vòng
+    # `run`, nên `run` chết là mọi cảnh báo chết theo — đúng tính chất mà
+    # `alerts` sinh ra để chữa. Phép kiểm này là mục DUY NHẤT chỉ có nghĩa khi
+    # chạy từ ngoài (Task Scheduler -> `python -m v2 alerts`).
+    box2: list[str] = []
+    keep6 = (alerts._send, alerts._check_whisper, alerts._check_tokens,
+             alerts._check_failed_jobs, alerts._check_llm)
+    alerts._send = lambda text: (box2.append(text), True)[1]
+    alerts._check_whisper = lambda out: None
+    alerts._check_tokens = lambda out: None
+    alerts._check_failed_jobs = lambda out: None
+    alerts._check_llm = lambda out: None
+    with db.tx() as c:
+        c.execute("DELETE FROM alert_state")
+
+    check("CHƯA từng chạy `run` -> im (không có gì để gọi là chết)",
+          len(alerts.check_all()) == 0)
+
+    alerts.note_run_alive()
+    check("vừa có nhịp sống -> im", len(alerts.check_all()) == 0)
+
+    old_beat = str(alerts._now_ms() - (config.ALERT_RUN_STALE_MIN + 5) * 60_000)
+    alerts._mark_set(alerts._RUN_BEAT, old_beat)
+    check("im quá ngưỡng -> BÁO", len(alerts.check_all()) == 1)
+    check("nội dung nói rõ hậu quả token 7 ngày",
+          "7 NGÀY" in box2[-1] or "7 ngày" in box2[-1])
+    check("báo rồi -> im (chống spam)", len(alerts.check_all()) == 0)
+
+    # `run` sống lại rồi chết LẦN NỮA thì phải báo lại — không thì mỗi cái DB
+    # chỉ báo được đúng một lần trong cả đời nó.
+    alerts.note_run_alive()
+    alerts.check_all()
+    alerts._mark_set(alerts._RUN_BEAT,
+                     str(alerts._now_ms() - (config.ALERT_RUN_STALE_MIN + 5) * 60_000))
+    check("sống lại rồi chết lần nữa -> báo lại", len(alerts.check_all()) == 1)
+
+    keep_stale = config.ALERT_RUN_STALE_MIN
+    config.ALERT_RUN_STALE_MIN = 0
+    with db.tx() as c:
+        c.execute("DELETE FROM alert_state")
+    alerts._mark_set(alerts._RUN_BEAT, old_beat)
+    check("ALERT_RUN_STALE_MIN=0 -> tắt hẳn", len(alerts.check_all()) == 0)
+    config.ALERT_RUN_STALE_MIN = keep_stale
+
+    (alerts._send, alerts._check_whisper, alerts._check_tokens,
+     alerts._check_failed_jobs, alerts._check_llm) = keep6
+
+    # =================================================================
+    part("24. LLM recap chết — khác whisper, và phải báo riêng")
+    # =================================================================
+    # Whisper chết: job nằm chờ, không mất gì. LLM chết: mỗi job chỉ hoãn
+    # RECAP_MAX_TRIES vòng rồi PHÁT ĐI với tóm tắt rỗng. Hai hậu quả khác nhau
+    # nên hai cảnh báo khác nhau.
+    box3: list[str] = []
+    keep7 = (alerts._send, alerts._check_whisper, alerts._check_tokens,
+             alerts._check_failed_jobs, alerts._check_run_stale, alerts._llm_alive)
+    alerts._send = lambda text: (box3.append(text), True)[1]
+    for fn in ("_check_whisper", "_check_tokens", "_check_failed_jobs",
+               "_check_run_stale"):
+        setattr(alerts, fn, lambda out: None)
+    with db.tx() as c:
+        c.execute("DELETE FROM alert_state")
+
+    alerts._llm_alive = lambda: None
+    check("provider ở XA / chưa cấu hình -> KHÔNG kết luận, không báo",
+          len(alerts.check_all()) == 0)
+
+    alerts._llm_alive = lambda: False
+    alerts.check_all()                        # lần đầu: mới ghi mốc, chưa đủ giờ
+    check("mới chết -> chưa báo ngay (chống báo động giả)", len(box3) == 0)
+    alerts._mark_set(
+        alerts._LLM_SINCE,
+        str(alerts._now_ms() - (config.ALERT_LLM_AFTER_MIN + 5) * 60_000))
+    check("chết đủ lâu -> BÁO", len(alerts.check_all()) == 1)
+    check("nội dung phân biệt rõ với whisper (nói job vẫn bị PHÁT ĐI)",
+          "PHÁT ĐI" in box3[-1])
+    check("báo rồi -> im", len(alerts.check_all()) == 0)
+    alerts._llm_alive = lambda: True
+    alerts.check_all()
+    check("LLM sống lại -> xoá mốc", alerts._mark_get(alerts._LLM_SINCE) is None)
+
+    (alerts._send, alerts._check_whisper, alerts._check_tokens,
+     alerts._check_failed_jobs, alerts._check_run_stale, alerts._llm_alive) = keep7
+
+    # =================================================================
+    part("25. Tóm tắt lỡ phát rỗng PHẢI vá lại được")
+    # =================================================================
+    # Trước 02/08/2026: `_recap_step` chịu phát bản trần sau RECAP_MAX_TRIES
+    # lần, rồi job thành `delivered` và KHÔNG vòng nào nhặt lại. Tức LLM chết
+    # ~15 phút (3 vòng x 5 phút) là cuộc họp đó vĩnh viễn không có tóm tắt, và
+    # bot trả lời "không có tóm tắt" mãi mãi dù transcript vẫn nằm trên đĩa.
+    check("nhận ra recap giữ chỗ", summarize.is_placeholder(
+        summarize.placeholder("LLM chết")))
+    check("recap RỖNG cũng tính là giữ chỗ (job cũ trước 31/07)",
+          summarize.is_placeholder(Recap(summary="  ")))
+    check("recap thật thì KHÔNG bị coi là giữ chỗ",
+          not summarize.is_placeholder(Recap(summary="Chốt ngân sách Q4")))
+
+    import json as _json
+    tr2 = Transcript(minute_token="obsgFIX0000000000000001", lang="vi",
+                     duration=60, engine="t",
+                     segments=[Segment(start=0, end=5, text="noi dung that")])
+    tpath = Path(config.TRANSCRIPT_DIR) / "fix.json"
+    tpath.parent.mkdir(parents=True, exist_ok=True)
+    tpath.write_text(_json.dumps(tr2.to_json()), encoding="utf-8")
+
+    def mk_delivered(tok, recap_summary):
+        jobstore.create(meta(minute_token=tok, title="Hop " + tok),
+                        status="queued")
+        jobstore.set_status(
+            tok, "delivered", transcript_path=str(tpath), recap_fails=3,
+            delivered_at=123456,
+            recap_json=_json.dumps({"summary": recap_summary, "decisions": [],
+                                    "action_items": []}, ensure_ascii=False))
+
+    keep8 = (summarize.summarize, __import__("v2.bitable", fromlist=["x"]).update_recap)
+    from v2 import bitable as _bt
+    hits: list[str] = []
+    _bt.update_recap = lambda tok, rc: (hits.append(tok), True)[1]
+
+    # (a) LLM vẫn chết -> KHÔNG được đổi gì cả
+    wipe_jobs()
+    mk_delivered("obsgFIX0000000000000001", "Chưa sinh được recap — LLM chết")
+    summarize.summarize = lambda t, m: (_ for _ in ()).throw(
+        summarize.RecapUnavailable("vẫn chết"))
+    orchestrator._backfill_recaps()
+    r = jobstore.get("obsgFIX0000000000000001")
+    check("LLM còn chết -> job giữ nguyên delivered, Base không bị đụng",
+          r["status"] == "delivered" and not hits)
+
+    # (b) LLM sống lại -> vá recap, và TUYỆT ĐỐI không phát lại
+    summarize.summarize = lambda t, m: Recap(summary="Tom tat that",
+                                             decisions=["chot A"])
+    orchestrator._backfill_recaps()
+    r = jobstore.get("obsgFIX0000000000000001")
+    check("vá xong: recap trong DB là bản THẬT",
+          "Tom tat that" in (r["recap_json"] or ""))
+    # Đây là phép kiểm QUAN TRỌNG NHẤT của nhóm: `pipeline.run_recap` đặt
+    # status='recapping', mà `process_queue` nhặt đúng status đó. Quên trả về
+    # `delivered` là vòng sau PHÁT LẠI biên bản cho toàn bộ người dự.
+    check("job vẫn `delivered` -> KHÔNG bị phát lại cho người dự",
+          r["status"] == "delivered")
+    check("giữ nguyên mốc delivered_at cũ", r["delivered_at"] == 123456)
+    check("recap_fails được đặt lại", (r["recap_fails"] or 0) == 0)
+    check("Base được cập nhật đúng một lần", hits == ["obsgFIX0000000000000001"])
+
+    # (c) recap đã thật thì đừng đụng vào nữa (không đốt lời gọi LLM mỗi vòng)
+    hits.clear()
+    calls: list[int] = []
+    summarize.summarize = lambda t, m: (calls.append(1),
+                                        Recap(summary="lai nua"))[1]
+    orchestrator._backfill_recaps()
+    check("recap đã thật -> không gọi LLM lại, không ghi Base lại",
+          not calls and not hits)
+
+    # (d) trần mỗi vòng: không nuốt cả vòng sau một đợt LLM chết dài
+    wipe_jobs()
+    for i in range(orchestrator.BACKFILL_RECAPS_PER_ROUND + 2):
+        mk_delivered(f"obsgFIX000000000000000{i}", "Chưa sinh được recap — x")
+    calls.clear()
+    summarize.summarize = lambda t, m: (calls.append(1),
+                                        Recap(summary="ok that"))[1]
+    orchestrator._backfill_recaps()
+    check(f"tối đa {orchestrator.BACKFILL_RECAPS_PER_ROUND} recap mỗi vòng",
+          len(calls) == orchestrator.BACKFILL_RECAPS_PER_ROUND, str(len(calls)))
+
+    summarize.summarize, _bt.update_recap = keep8
+
+    # =================================================================
+    print("\n" + "=" * 66)
+    print(f"selftest: PASS {len(ok)}   FAIL {len(bad)}")
+    for f in bad:
+        print("   FAIL:", f)
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

@@ -66,8 +66,8 @@ tự động phát hiện và phân phối**.
 | ------------------------------------ | ------------------------------------- |
 | open_id của Thẩm                     | `ou_1bc55b6d5b20ee06cbee1326d5b72715` |
 | union_id của Thẩm                    | `on_1f34d05d9ce11997c545cf1ec136bc41` |
-| union_id của anh Thiện               | `<union_id dong nghiep - da che>` |
-| App "Agent meeting" (của Thẩm)       | `cli_aae288361ef89eed`                |
+| union_id của anh Thiện               | `on_a505446a2f87c04350b07d91ef1475f2` |
+| App "Meeting Agent CĐS" (của Thẩm)       | `cli_aae288361ef89eed`                |
 | App "AI Agent Assistant" (anh Thiện) | `cli_a9bd0ff8d6619ed1`                |
 
 ---

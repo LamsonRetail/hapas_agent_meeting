@@ -49,7 +49,7 @@ chính là bạn, OAuth callback qua **hộp thư Vercel dùng domain mặc đ�
 ## Phần 1 — Cấu hình Lark Developer Console (🌐)
 
 Đây là phần nặng nhất và **không có việc gì code thay được**. Mở app tại
-<https://open.larksuite.com/app> → chọn app (mặc định "Agent meeting"
+<https://open.larksuite.com/app> → chọn app (mặc định "Meeting Agent CĐS"
 `cli_aae288361ef89eed`, hoặc tạo app mới nếu muốn tách khỏi V1).
 
 ### 1.1 Bật Bot (để gửi tin)

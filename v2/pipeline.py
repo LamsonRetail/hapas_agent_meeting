@@ -67,46 +67,158 @@ def extract_audio(video: Path) -> Path:
 # ------------------------------------------------------- tải bản ghi
 
 
-def _reader_token(meta: MeetingMeta) -> tuple[str, str]:
-    """Chọn một người có dự đã enroll để mượn token đọc. Trả (open_id, token).
+# Lark trả mã này khi token hợp lệ, có scope `minutes:minutes.media:export`,
+# nhưng NGƯỜI đó không được phép tải bản ghi CỤ THỂ này.
+_CODE_MEDIA_DENY = 2091005
 
-    Ưu tiên chủ minute, rồi tới người dự đầu tiên còn token sống.
+
+class MediaDenied(PipelineError):
+    """Không một ai đã enroll được phép tải bản ghi này.
+
+    VĨNH VIỄN, không phải lỗi tạm thời: thử lại 5 lần trong 25 phút cũng ra đúng
+    kết quả đó. Cùng họ với `TranscribeUnavailable` / `RecapUnavailable` nhưng
+    ngược chiều — hai cái kia KHÔNG được tiêu quota vì sẽ tự khỏi, cái này phải
+    dừng NGAY vì sẽ không tự khỏi. `orchestrator` bắt riêng và đánh `failed`
+    luôn, kèm câu nói rõ phải nhờ ai làm gì.
     """
-    candidates = []
-    if meta.owner_open_id:
-        candidates.append(meta.owner_open_id)
-    candidates += [a.open_id for a in meta.attendees if a.open_id]
-    seen = set()
-    for oid in candidates:
-        if oid in seen:
-            continue
-        seen.add(oid)
+
+
+def _reader_candidates(meta: MeetingMeta) -> list[str]:
+    """Mọi open_id đã enroll đáng thử mượn token, CHỦ BẢN GHI đứng trước.
+
+    Vì sao phải là danh sách chứ không phải một người (đo 02/08/2026): quyền tải
+    bản ghi KHÔNG suy ra được từ việc có dự hay có scope — nó gắn với từng bản
+    ghi. Ma trận đo thật trên 5 minute x 3 người (tất cả đều có scope
+    `minutes:minutes.media:export`):
+
+        chủ bản ghi                  -> luôn OK
+        người dự khác                -> hầu hết 2091005, NHƯNG Chi tải được bản
+                                        ghi của Thiện (obsg47j9) trong khi Thẩm
+                                        thì không
+
+    Tức không đoán trước được ai tải được; phải THỬ. Bản cũ chọn đúng một người
+    rồi bỏ cuộc, nên một cuộc họp mà người-được-chọn không có quyền là hỏng cả
+    job dù người bên cạnh tải được.
+
+    Ba nguồn ứng viên, theo thứ tự khả năng thành công giảm dần:
+      1. `meta.owner_open_id` — chủ bản ghi, luôn tải được (nếu họ đã enroll).
+      2. `meta.attendees` — người dự tra được từ lịch.
+      3. `db.viewers_of()` — người đã enroll mà Lark báo có dự. Bắt được cả
+         người mà chuỗi tra lịch sót.
+    """
+    from . import db
+    out: list[str] = []
+
+    def add(oid: str) -> None:
+        if oid and oid not in out:
+            out.append(oid)
+
+    add(meta.owner_open_id)
+    for a in meta.attendees:
+        add(a.open_id)
+    for v in db.viewers_of(meta.minute_token):
+        add(v.get("open_id") or "")
+    return out
+
+
+def download_recording(meta: MeetingMeta) -> tuple[Path, str]:
+    """Tải bản ghi, thử TỪNG người đã enroll tới khi có ai lấy được URL.
+
+    Trả (đường dẫn file, open_id của người đã mượn token).
+
+    Ném `MediaDenied` khi MỌI ứng viên đều bị từ chối quyền — và chỉ khi đó.
+    Lẫn một lỗi khác (mạng, 5xx) là ném `PipelineError` thường để còn thử lại:
+    kết luận "vĩnh viễn" mà sai thì mất biên bản của một cuộc họp có thật.
+    """
+    denied: list[str] = []          # 2091005 — không được phép, VĨNH VIỄN
+    no_token: list[str] = []        # chưa enroll / token hết hạn
+    other: list[str] = []           # mạng, 5xx, URL rỗng — có thể TỰ KHỎI
+    cands = _reader_candidates(meta)
+
+    for oid in cands:
         try:
-            return oid, tokenstore.get_access_token(oid)
+            token = tokenstore.get_access_token(oid)
         except tokenstore.TokenError:
+            # KHÔNG xếp vào `other`: "người này chưa enroll" không phải bằng
+            # chứng của một lỗi tạm thời, mà chính là tình huống ta muốn kết
+            # luận. Gộp vào `other` thì chủ bản ghi chưa enroll — đúng ca phổ
+            # biến nhất — làm điều kiện `denied and not other` không bao giờ
+            # đúng, và job lại quay về đốt 5 lần thử rồi báo lỗi vô nghĩa.
+            no_token.append(oid)
             continue
-    raise PipelineError("không có người dự nào đã enroll để đọc bản ghi")
+        try:
+            url = lark_api.minutes_media_url(token, meta.minute_token)
+        except lark_api.LarkError as exc:
+            if exc.code == _CODE_MEDIA_DENY:
+                denied.append(oid)
+            else:
+                other.append(f"{oid[:12]}: {exc}")
+            continue
+        if not url:
+            other.append(f"{oid[:12]}: Lark trả URL rỗng")
+            continue
 
+        dest = config.WORK_DIR / f"{meta.minute_token}.mp4"
+        size = lark_api.download_to(url, dest, token)
+        print(f"       tải bản ghi: {size / 1_048_576:.1f} MB -> {dest.name} "
+              f"(mượn quyền của {oid[:12]}…)")
+        return dest, oid
 
-def download_recording(meta: MeetingMeta, access_token: str) -> Path:
-    url = lark_api.minutes_media_url(access_token, meta.minute_token)
-    if not url:
-        raise PipelineError(f"không lấy được URL bản ghi {meta.minute_token}")
-    dest = config.WORK_DIR / f"{meta.minute_token}.mp4"
-    size = lark_api.download_to(url, dest, access_token)
-    print(f"       tải bản ghi: {size / 1_048_576:.1f} MB -> {dest.name}")
-    return dest
+    if not cands or (no_token and not denied and not other):
+        # Chưa ai đủ điều kiện thử. Để lỗi THƯỜNG (còn thử lại): người dự enroll
+        # về sau là vòng sau chạy được ngay, không cần ai can thiệp.
+        raise PipelineError(
+            f"không có người dự nào đã enroll để đọc bản ghi "
+            f"({len(no_token)} người chưa cấp quyền / token hết hạn)")
+    if denied and not other:
+        who = meta.owner_name or "(không rõ tên)"
+        raise MediaDenied(
+            f"không ai được phép tải bản ghi này ({len(denied)} người đã cấp "
+            f"quyền đều bị Lark từ chối {_CODE_MEDIA_DENY}"
+            + (f", {len(no_token)} người chưa cấp quyền" if no_token else "")
+            + f"). Quyền tải gắn với CHỦ bản ghi — ở đây là {who}. "
+            f"Cách sửa: nhờ {who} cấp quyền cho hệ thống (nhắn bot để lấy link), "
+            f"rồi trả job về hàng đợi. Thử lại mà không làm gì thì vẫn y vậy.")
+    raise PipelineError(
+        f"không lấy được URL bản ghi {meta.minute_token} "
+        f"({len(denied)} bị từ chối quyền, {len(no_token)} chưa enroll; "
+        f"lỗi khác: {'; '.join(other)})")
 
 
 # ------------------------------------------------------- xử lý transcription
 
 
-def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Recap, Path]:
-    """Tải -> ffmpeg -> transcribe -> recap. Trả (transcript, recap, path)."""
-    jobstore.set_status(meta.minute_token, "transcribing")
-    _, token = _reader_token(meta)
+def save_recap(meta: MeetingMeta, recap: Recap) -> Recap:
+    """Lưu recap vào job rồi trả lại nó (để gọi được dạng `return save_recap(...)`)."""
+    import json as _json
+    jobstore.set_status(meta.minute_token, "recapping",
+                        recap_json=_json.dumps({
+                            "summary": recap.summary,
+                            "decisions": recap.decisions,
+                            "action_items": [a.__dict__ for a in recap.action_items],
+                        }, ensure_ascii=False))
+    return recap
 
-    video = download_recording(meta, token)
+
+def run_recap(meta: MeetingMeta, t: Transcript) -> Recap:
+    """Recap cho một transcript đã có. Ném `summarize.RecapUnavailable` nếu
+    gọi LLM thất bại.
+
+    TÁCH khỏi `run_transcription` (31/07/2026) để làm lại recap mà KHÔNG phiên
+    âm lại: transcript đã nằm trên đĩa và `transcript_path` đã lưu trong job,
+    nên bước đắt nhất không phải chạy hai lần chỉ vì LLM chớp tắt.
+    """
+    return save_recap(meta, summarize.summarize(t, meta))
+
+
+def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Path]:
+    """Tải -> ffmpeg -> transcribe. Trả (transcript, path).
+
+    KHÔNG còn làm recap: caller gọi `run_recap` riêng, vì hai bước có cách xử
+    lỗi khác nhau (xem docstring `summarize`).
+    """
+    jobstore.set_status(meta.minute_token, "transcribing")
+    video, _reader = download_recording(meta)
     audio = video
     if video.suffix.lower() in (".mp4", ".mkv", ".mov", ".webm"):
         audio = extract_audio(video)
@@ -125,19 +237,12 @@ def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Recap, Path]:
     print(f"       transcript {t.word_count} từ, {t.duration:.0f}s audio "
           f"-> {tpath.name}")
 
+    # Lưu transcript_path TRƯỚC khi recap: recap hỏng thì vòng sau còn nạp lại
+    # được từ đây (orchestrator._reuse) thay vì phiên âm lại từ đầu.
     jobstore.set_status(meta.minute_token, "recapping",
                         transcript_path=str(tpath),
                         audio_seconds=t.duration, whisper_seconds=whisper_sec)
-
-    recap = summarize.summarize(t, meta)
-    import json as _json
-    jobstore.set_status(meta.minute_token, "recapping",
-                        recap_json=_json.dumps({
-                            "summary": recap.summary,
-                            "decisions": recap.decisions,
-                            "action_items": [a.__dict__ for a in recap.action_items],
-                        }, ensure_ascii=False))
-    return t, recap, tpath
+    return t, tpath
 
 
 # ------------------------------------------------------------ transcript .txt
@@ -148,12 +253,32 @@ def txt_path(meta: MeetingMeta) -> Path:
 
     Tách khỏi `write_txt` để chỗ khác (bitable.py, khi đính kèm file vào Base)
     dựng lại đúng đường dẫn thay vì glob mò theo tên.
+
+    ⚠️ Tên file PHẢI phân biệt được hai cuộc họp khác nhau, và lý do nghiêm
+    trọng hơn "thư mục lộn xộn" (sửa 02/08/2026):
+    `bitable._tracking_fields` gọi chính hàm này để lấy file đính kèm vào Base.
+    Nếu cuộc B ghi đè file của cuộc A thì record Base của A nhận NGUYÊN VĂN
+    transcript của B — nội dung chéo cuộc họp, chảy vào đúng thứ mà bot đọc và
+    người dự A mở được. Cửa sổ gây hại là các đường ghi Base MUỘN
+    (`sync_tracking`, `retry_missing_records`), chạy sau khi file đã bị đè.
+
+    Không có `meta.start` thì trước đây tên file chỉ còn tiêu đề, nên hai cuộc
+    trùng tên là dùng chung một file. Đã xảy ra thật: `Bien ban - Hop tuan.txt`
+    (17 byte) nằm trong `data\\transcripts`. Nay thêm `minute_token` cho đúng ca
+    đó.
+
+    CÒN LẠI, chấp nhận có ý thức: hai cuộc CÙNG tiêu đề (sau khi `_safe_name`
+    cắt 60 ký tự) và CÙNG PHÚT bắt đầu vẫn đụng nhau. Hẹp hơn nhiều, và không
+    thêm token vào mọi tên để giữ nguyên tên các file đã có — đổi hết thì
+    `_tracking_fields` không thấy file cũ nữa và tụt xuống đính kèm bản .json.
     """
     from datetime import datetime, timezone, timedelta
     tz = timezone(timedelta(hours=7))
-    stamp = ""
     if meta.start:
         stamp = " " + datetime.fromtimestamp(meta.start, tz).strftime("%d-%m-%Y %Hh%M")
+    else:
+        # Không có giờ -> token là thứ DUY NHẤT còn phân biệt được hai cuộc họp.
+        stamp = f" {meta.minute_token[:12]}"
     return config.TRANSCRIPT_DIR / f"Bien ban - {_safe_name(meta.title)}{stamp}.txt"
 
 

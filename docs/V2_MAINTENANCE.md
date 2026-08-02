@@ -78,6 +78,7 @@ python -m v2 gate --union-id <on_...> --no-send   # thử cửa vào bot (§14)
 python -m v2 push-status     # đẩy snapshot lên dashboard Vercel (§9)
 python -m v2 push-status --print   # xem JSON sắp gửi, KHÔNG gửi
 python -m v2 users           # ai đã enroll, kể cả đã thu hồi (§18)
+python -m v2 scopes          # từng người có ĐỦ quyền V2 cần chưa (§10)
 python -m v2 revoke --open-id ou_XXXX --yes    # thu hồi quyền một người (§18)
 python -m v2 revoke --union-id on_XXXX --yes   # tra bằng union_id (gate in ra)
 python -m v2 base-init       # in lệnh tạo Base "nội dung đã chốt" + tự kiểm (§11)
@@ -141,7 +142,9 @@ enroll lại. `doctor` cảnh báo `[!]` khi còn ≤3 ngày.
 | `doctor` báo Base cấu hình sai | token trong `.env` lệch, hoặc app chưa là collaborator | `python -m v2 base-init` (tự kiểm + in lại lệnh); §11 |
 | Ghi Base lỗi `FieldNameNotFound` | ai đó đổi tên cột trên UI Base | `base/v3` ghi theo TÊN field — đổi lại tên cũ, hoặc sửa hằng `F_*` trong `v2\bitable.py` (§11) |
 | Base có 2 record cho cùng 1 cuộc họp | lỗi cũ: ghi được nhưng không lưu `record_id` | đã vá (tra theo `minute_token` trước khi tạo); record trùng cũ phải xóa tay |
-| Biên bản đã phát mà Base không có record | `BITABLE_*` để trống, hoặc ghi Base hỏng | log in `[base] ghi record hỏng …`; phát biên bản KHÔNG phụ thuộc Base nên job vẫn `delivered` |
+| Biên bản đã phát mà Base không có record | `BITABLE_*` để trống, hoặc ghi Base hỏng | log in `[base] ghi record hỏng …`; phát biên bản KHÔNG phụ thuộc Base nên job vẫn `delivered`. **Từ 31/07/2026 tự vá**: mỗi vòng `process_queue` thật gọi `bitable.retry_missing_records()`; muốn ngay thì `python -m v2 base-sync` (§19) |
+| Thẻ recap nói "Chưa sinh được recap" | LLM (Hermes/OpenAI) gọi không được, hoặc thiếu `LLM_API_KEY` | **Từ 31/07/2026 KHÔNG phát ngay nữa**: hoãn `RECAP_MAX_TRIES` vòng rồi mới chịu phát bản trần. Thấy thẻ này = đã hỏng liên tiếp 3 vòng, hoặc thiếu key. Log: `[queue] … LLM KHÔNG gọi được (n/3 lần)` (§19) |
+| Bot nói "CHƯA CÓ BIÊN BẢN — delivered" | lỗi cũ của `qa.fmt_pending` | đã sửa 31/07/2026: nay nói `CHƯA LÊN BASE — ĐÃ phát cho người dự…` (§19) |
 
 Xem `v2\lark_api.py` các chỗ đánh dấu `[VERIFY]` — endpoint chưa chắc đúng với
 mọi tenant. Đã kiểm chứng bằng dữ liệu thật (30/07): `minutes_search`, `minutes_get`,
@@ -153,15 +156,86 @@ mock; chạy `process --send` một lần trên cuộc họp thật để chốt
 
 ---
 
-## 6. Sao lưu (quan trọng — mất là enroll lại cả công ty)
+## 6. Sao lưu — TỰ ĐỘNG từ 02/08/2026 (`v2\backup.py`)
 
 Hai thứ phải backup cùng nhau nhưng **để tách chỗ**:
 - `v2\data\state.db` — token đã mã hóa + trạng thái job.
 - `V2_FERNET_KEY` (trong `v2\.env`) — khóa giải mã.
 
-DB không có key = vô dụng; key không có DB = vô dụng. Copy `state.db` đi đâu cũng
-an toàn miễn key giữ riêng. **Đừng đổi `V2_FERNET_KEY`** khi đã có người enroll —
-đổi = mọi token thành rác.
+DB không có key = vô dụng; key không có DB = vô dụng. **Đừng đổi
+`V2_FERNET_KEY`** khi đã có người enroll — đổi = mọi token thành rác.
+
+### Mất `state.db` gây HAI thiệt hại, cái thứ hai hay bị quên
+
+1. Mọi user token biến mất → cả công ty enroll lại.
+2. **Phân quyền hỏi đáp biến mất.** `qa.viewers_index()` dựng "ai được xem cuộc
+   họp nào" từ `jobs.meta_json.attendees`. Base vẫn còn nguyên biên bản, nhưng
+   không có job tương ứng thì `qa._may_see` trả `False` cho tất cả (trừ admin) —
+   **cả công ty mất quyền đọc biên bản của chính mình**, và không có lỗi nào hiện
+   ra để đoán vì sao.
+
+### Nay chạy tự động, không phải việc phải nhớ
+
+Sổ tay đã dặn "backup cùng nhau nhưng để tách chỗ" từ 30/07, và tới 02/08 vẫn
+**chưa có bản backup nào tồn tại**. Một quy trình dựa vào trí nhớ, bảo vệ thứ mà
+mất là hỏng cả hệ thống, thì không phải bảo vệ. Nên nó vào thẳng vòng `run`:
+
+| Cấu hình (`v2\.env`) | Mặc định | Nghĩa |
+|---|---|---|
+| `V2_BACKUP_EVERY_HOURS` | `24` | 0 = tắt hẳn |
+| `V2_BACKUP_KEEP` | `14` | giữ 14 bản mới nhất, xoay vòng |
+| `V2_BACKUP_DIR` | `v2\data\backups` | nơi để `state-<ngày>.db` |
+| `V2_KEY_BACKUP_PATH` | `%USERPROFILE%\.meetingxlark\fernet-key.txt` | khóa, **tách chỗ** |
+
+```bash
+python -m v2 backup --list
+```
+
+Mốc "đã tới lúc chưa" là **mtime của file backup mới nhất**, không phải biến
+trong RAM: `run-v2-auto.bat` tự bật lại tiến trình, đếm trong RAM thì mỗi lần
+khởi động lại đẻ một bản thừa.
+
+### Ba quyết định thiết kế, đừng đảo lại mà không đọc
+
+- **`VACUUM INTO`, KHÔNG phải copy file.** DB chạy WAL và lúc backup thì `run`
+  đang ghi (đo 02/08: file `-wal` 3.2 MB, gấp 32 lần file `.db`). Copy `.db` mà
+  bỏ `-wal` là chép về bản THIẾU những gì vừa ghi — mà nó vẫn mở được bình
+  thường nên không ai biết. `VACUUM INTO` đi qua chính engine SQLite: ra một file
+  đã checkpoint, nhất quán giao dịch, không phải dừng tiến trình nào.
+  Đã kiểm: bản sao đầu tiên có đủ 5 job / 3 token / 6 dòng `deliveries`,
+  `pragma integrity_check` = ok.
+- **Khóa để riêng chỗ.** Chép key vào cùng thư mục với DB là bỏ luôn tác dụng
+  của việc mã hóa mà không được thêm chút an toàn nào. Mặc định key nằm ngoài
+  repo và ngoài `data\`, nên hai tai nạn hay gặp nhất — sửa hỏng `v2\.env`, xoá
+  nhầm `v2\data\` — không thổi bay cả hai cùng lúc.
+- **Không được làm chết vòng `run`.** Cùng lý lẽ với `alerts.check_all`: đĩa đầy
+  không phải lý do dừng phát biên bản. Mọi lỗi bị nuốt và in ra.
+
+`_write_key()` còn bắt được tai nạn tệ nhất của hệ thống này: khóa đã lưu KHÁC
+khóa đang dùng = ai đó vừa đổi `V2_FERNET_KEY` khi đã có người enroll. Khi đó nó
+**không ghi đè** — đổi tên khóa cũ thành `.prev-<vân tay>` rồi nói to, vì khóa cũ
+là thứ duy nhất còn giải được các bản backup đã có.
+
+### ⚠️ Giới hạn PHẢI biết của cấu hình mặc định
+
+Trên máy này `C:`, `D:`, `E:` là ba **phân vùng của MỘT ổ vật lý** (đo 02/08/2026:
+`Win32_DiskDrive` chỉ có Disk #0, SKHynix 954 GB). Nên mặc định chống được DB
+corrupt / xoá nhầm / migration hỏng, **KHÔNG chống được chết ổ**. `doctor` nói
+câu đó ra thay vì để dấu `[+]` làm người ta yên tâm nhầm.
+
+Muốn chống chết ổ thì trỏ `V2_BACKUP_DIR` ra ngoài máy (OneDrive / ổ ngoài) —
+nhưng đó là **quyết định về dữ liệu, không phải kỹ thuật**: bản sao chứa recap
+nội dung họp ở dạng đọc được, chỉ token là mã hóa.
+
+### Phục hồi
+
+`README.txt` sinh kèm mỗi thư mục backup, có sẵn vân tay khóa. Tóm tắt:
+
+1. Dừng orchestrator.
+2. Copy `state-<ngày>.db` đè lên `v2\data\state.db`, **xoá** `state.db-wal` và
+   `state.db-shm` nếu còn.
+3. Đặt lại `V2_FERNET_KEY` đúng khóa có vân tay ghi trong README.
+4. `python -m v2 doctor` → mục `V2_FERNET_KEY` phải `[+]`.
 
 ---
 
@@ -171,6 +245,8 @@ an toàn miễn key giữ riêng. **Đừng đổi `V2_FERNET_KEY`** khi đã c�
   to (`doctor` cảnh báo >2GB) = có job kẹt, xóa tay được an toàn khi không chạy.
 - `v2\data\transcripts\` giữ transcript JSON — theo chính sách lưu giữ của bạn,
   chưa có job tự xóa (mốc sau, xem [V2_LONGTERM.md](V2_LONGTERM.md)).
+- `v2\data\backups\` **tự xoay vòng** (`V2_BACKUP_KEEP`), không cần dọn tay. Mỗi
+  bản ~0.2 MB hôm nay; 14 bản là vài MB.
 
 ---
 
@@ -267,8 +343,8 @@ GitHub"**: máy này có **HAI tài khoản GitHub**.
 | | |
 |---|---|
 | chủ repo, đã nối Vercel, `gh` CLI đăng nhập | **`tientham2005`** |
-| GitHub gán commit `2ff0ad1` cho | **`tienthamnguyen6`** (theo email `<gmail ca nhan A>`) |
-| tài khoản Vercel | `tungvatham05-3704` / `<gmail ca nhan B (tai khoan Vercel)>` |
+| GitHub gán commit `2ff0ad1` cho | **`tienthamnguyen6`** (theo email `tienthamnguyen6@gmail.com`) |
+| tài khoản Vercel | `tungvatham05-3704` / `tungvatham05@gmail.com` |
 | chốt đang bật | `gitForkProtection = true` |
 
 Vercel thấy tác giả commit là `tienthamnguyen6` — không phải tài khoản GitHub đã
@@ -303,11 +379,11 @@ git config user.email "243912165+tientham2005@users.noreply.github.com"
 ```
 
 Đặt **cục bộ cho repo này** (`git config`, không `--global`) — `--global` vẫn là
-`<gmail ca nhan A>` cho các repo khác. Số `243912165` là user id, lấy
+`tienthamnguyen6@gmail.com` cho các repo khác. Số `243912165` là user id, lấy
 bằng `gh api user --jq '"\(.id)+\(.login)@users.noreply.github.com"'`.
 Commit CŨ giữ nguyên tác giả cũ; chỉ commit mới được gán lại.
 
-Hai cách khác đã cân nhắc rồi bỏ: thêm `<gmail ca nhan A>` vào tài khoản
+Hai cách khác đã cân nhắc rồi bỏ: thêm `tienthamnguyen6@gmail.com` vào tài khoản
 `tientham2005` (một email chỉ thuộc MỘT tài khoản GitHub, phải gỡ khỏi tài khoản
 kia trước); tắt `gitForkProtection` (mất một chốt bảo mật).
 
@@ -400,21 +476,154 @@ theo tên/giờ) vẫn đúng, chỉ là yếu hơn.
 
 #### Hai điều về scope mà tenant này làm khác tài liệu
 
-- **Token luôn ra đúng 196 scope, KỂ CẢ khi chỉ xin 7.** Đo 30/07 rồi 31/07:
-  thêm/bớt tên trong `OAUTH_SCOPES` không làm con số đó đổi.
-  ⚠️ **SỬA LẠI 31/07 — tôi từng kết luận từ đó rằng "`OAUTH_SCOPES` chỉ còn giá
-  trị tài liệu, Console quyết hết". SAI.** Sau khi Console duyệt
-  `vc:meeting:readonly [user]`, enroll lại mà KHÔNG thêm nó vào `OAUTH_SCOPES`
-  thì token vẫn không có nó (vẫn 196, vẫn thiếu đúng cái cần). Tức 196 kia là
-  một tập nào đó Lark tự cấp thêm, KHÔNG phải "tất cả những gì app có" — và
-  scope mình thật sự cần thì **vẫn phải xin tường minh trong `OAUTH_SCOPES`**.
-  Quy tắc dùng được: Console duyệt (điều kiện cần) **+** có tên trong
-  `OAUTH_SCOPES` (điều kiện cần) **+** enroll lại. (Và luôn giữ `offline_access`,
-  không có nó là không có refresh_token.)
+- ~~**Token luôn ra đúng 196 scope, KỂ CẢ khi chỉ xin 7.**~~ — **CÂU NÀY SAI, và
+  nó sống sót nhiều phiên vì hệ thống chỉ có MỘT người dùng.** Phản chứng sạch,
+  đo 31/07/2026 lúc người THỨ HAI enroll:
+
+  | người | enroll | số scope |
+  |---|---|---|
+  | Thẩm | 30/07, đã bấm Đồng ý **nhiều lần** trong lúc phát triển | **197** |
+  | Chi | 31/07, bấm Đồng ý **đúng một lần** | **9** |
+
+  Cùng app, cùng `OAUTH_SCOPES`, và 9 scope của Chi là **tập con hoàn toàn** của
+  Thẩm (chiều ngược lại: 0 cái). Giải thích khớp mọi số liệu: **Lark cộng dồn
+  các lần cấp quyền trước của TỪNG người**. 197 của Thẩm là **di sản của quá
+  trình phát triển**, không phải quy tắc của tenant. Người mới nhận **đúng
+  những gì `OAUTH_SCOPES` xin**, cộng `auth:user.id:read`.
+
+  Hệ quả đã cắn thật: `minutes_search` của Chi trả `99991679` đòi
+  `minutes:minutes.search:read` — scope Console **đã duyệt từ lâu** ở danh tính
+  user, nhưng `OAUTH_SCOPES` không xin. Token của Thẩm có sẵn nên **che mất lỗi
+  suốt thời gian một người dùng**. Đây là dạng lỗi nguy hiểm nhất của dự án
+  này: kết luận đúng với phép đo đang có, sai với thực tế.
+
+  Quy tắc đúng, **cả ba** đều cần: Console duyệt (đúng danh tính user) **+** tên
+  có trong `OAUTH_SCOPES` **+** người đó enroll lại. Và vì thêm scope = **mọi
+  người** phải enroll lại, **xin đủ một lần** (V2_LONGTERM §3.2). Luôn giữ
+  `offline_access`, thiếu nó là không có refresh_token.
+
+  **Đừng chẩn scope bằng token của người dùng lâu năm.** Muốn biết người MỚI sẽ
+  có gì, đọc thẳng `OAUTH_SCOPES`, hoặc so hai token như bảng trên.
 - **Chuỗi `scope` trên token KHÔNG phải nguồn sự thật để chẩn quyền.** Token V2
   (196 scope) là **tập cha** của token lark-cli (172) — không thiếu một cái nào —
   mà vẫn bị chặn ở chỗ lark-cli qua được. Nguồn sự thật là danh sách cấp cho app
   **kèm `scope_type`**.
+
+#### "Xin hết scope" KHÔNG dùng được — có trần độ dài URL (đo 31/07/2026)
+
+User chốt "xin hết cho nhanh". Đã làm, rồi **hỏng vì một trần cứng** — ghi lại
+đầy đủ để đừng ai thử lại:
+
+| Số scope | URL authorize | Lark trả |
+|---:|---:|---|
+| 12 (tối thiểu) | ~1,6k | 302 |
+| **124 (theo họ)** | **3,8k** | **302** ✅ đang dùng |
+| 181 | 6,1k | 302 |
+| 201 | 6,9k | 302 ← mốc cao nhất còn chạy |
+| **222** | **7,5k** | **502** ⛔ bắt đầu gãy |
+| 301 | 9,7k | 400 ⛔ |
+| **411 (tất cả)** | **12,8k** | **400 Bad Request** ⛔ |
+
+Lặp 2 lần mỗi mốc để loại nhiễu. Trần thực tế **~7.000 ký tự ≈ 200 scope**.
+
+⚠️ **Tôi từng đặt hằng `_URL_LIMIT = 8192`** (con số sách vở của nhiều proxy) —
+**SAI**: URL 7.523 ký tự lọt qua guard nhưng Lark trả 502. Một cái guard nói
+"OK" cho thứ thực tế hỏng còn tệ hơn không có guard, vì nó tạo niềm tin sai.
+Nay là 7.000. Hai kiểu gãy khác nhau, đừng nhầm: **400** = URL quá dài, server
+không parse nổi; **502** = qua được cửa đầu rồi chết ở trong.
+
+Và Console **tự lớn lên**: chỉ sau một lần
+publish version (đổi tên + avatar, 31/07), scope duyệt ở danh tính user nhảy
+**244 → 410**. Nghĩa là "xin hết" không chỉ hỏng hôm nay — nó là quả bom hẹn
+giờ: admin duyệt thêm vài chục scope nữa là **link enroll gãy giữa lúc người ta
+đang bấm**, và lỗi hiện ra là một trang "Bad Request" trống trơn.
+
+**Cách đang dùng: xin TRỌN HỌ, không xin lẻ.** `scopecheck.SCOPE_FAMILIES` =
+`minutes: calendar: vc: contact:user task: docs: drive:` → **124 scope**, URL
+3,8k, **còn dư ~4,4k** cho Console lớn thêm. Được cái lợi chính của "xin hết"
+(thêm endpoint mới trong cùng vùng thì không phải bắt ai enroll lại) mà không
+dính trần, và **không** kéo theo `mail:*`, `moments:*`, `approval:*:write`.
+
+`base:` và `im:` **cố ý không có**: V2 ghi Base và gửi tin bằng **tenant** token,
+cho vào `OAUTH_SCOPES` chỉ làm dài URL chứ không thêm khả năng gì.
+
+```bash
+python -m v2 scopes --print-all     # in dòng OAUTH_SCOPES + TỰ ĐO độ dài URL
+python -m v2 scopes --everything    # lấy tất cả — lệnh sẽ báo ⛔ quá dài
+```
+
+Lệnh tự đo và tự báo hỏng, nên không ai phải phát hiện điều này bằng cách gửi
+một link chết cho đồng nghiệp. Cố ý **không dán cứng danh sách vào code**: nó
+đổi mỗi khi Console đổi (đã thấy 244 → 410).
+
+`config.py` và `.env.example` vẫn giữ **danh sách tối thiểu** làm mặc định và
+làm tài liệu; `.env` ghi đè.
+
+⚠️ **Cái giá còn lại, nhỏ hơn nhưng vẫn có.** 124 scope gồm cả nhóm ghi/xoá
+trong các họ đó (`calendar:calendar.acl:delete`, `task:task:write`, `docs:*`…).
+Token trong `state.db` vì thế **sửa được lịch và tài liệu** của người đã enroll,
+không chỉ đọc biên bản. Mất `state.db` **+** `V2_FERNET_KEY` là mất chừng đó —
+nên §6 (sao lưu tách chỗ) và Việc 3 (app secret còn trong git history) vẫn là
+việc phải làm.
+
+Xin rộng **không** thay thế `python -m v2 scopes`: nó che lỗi chứ không đóng.
+
+#### `python -m v2 scopes` — quét CẢ bề mặt, đừng vá lẻ tẻ
+
+```bash
+python -m v2 scopes                    # mọi người đã enroll
+python -m v2 scopes --open-id ou_xxx   # một người
+```
+
+Gọi **13 endpoint** V2 dùng user token, bằng token của chính người đó, với id
+**cố ý sai**. Không tác dụng phụ. `99991679/99991672` = thiếu quyền (Lark đọc
+thẳng tên scope); mã lỗi khác = đã qua cửa quyền = ĐẠT.
+
+Vì sao có lệnh này thay vì vá theo lỗi: **scope thiếu là lỗi im lặng và trễ** —
+chỉ những đường ĐÃ chạy mới lộ ra, nên vá xong vẫn không biết còn thiếu gì.
+Ngày 31/07 tôi vá ba lần liên tiếp theo đúng kiểu đó trước khi dừng lại quét
+một lượt. Lượt quét đó tìm ra ngay hai thứ mà cách cũ sẽ còn lâu mới thấy:
+
+- `bitable.base_media_upload` thiếu quyền với người mới (đường phụ),
+- và **Thẩm — người có 197 scope — cũng thiếu** `minutes:minutes.transcript:export`.
+  Tức "nhiều scope" chưa bao giờ đồng nghĩa "đủ scope".
+
+**Chạy nó sau mỗi lần có người enroll và sau mỗi lần đổi `OAUTH_SCOPES`.**
+Vòng `run` cũng tự chạy phép kiểm này **ngay sau khi ai đó enroll**
+(`oauth._warn_if_missing_scopes`): thiếu quyền ở đường chính thì DM cho
+`ALERT_UNION_IDS` luôn, thay vì để nhiều ngày sau mới có người hỏi "sao không
+thấy biên bản của chị ấy". Đã đo thật, có `message_id`.
+
+Sửa file `v2/lark_api.py` thêm lời gọi user-token mới thì **thêm một dòng vào
+`scopecheck._checks`** — nếu không, bề mặt lại hở mà không ai biết.
+
+#### Cách chẩn thủ công (khi cần soi một endpoint cụ thể)
+
+Gọi endpoint bằng token CỦA HỌ với `minute_token` **cố ý sai**. Không tác dụng
+phụ, và Lark đọc thẳng tên scope còn thiếu:
+
+```
+GET /open-apis/minutes/v1/minutes/<token_bia>/media    -> 99991679
+    "required one of these privileges under the user identity:
+     [minutes:minute:download, minutes:minutes.media:export]"
+```
+
+Phân biệt: `99991679`/`99991672` = **thiếu quyền**; `2091002`/`91402`/`234008` =
+**đã qua cửa quyền**, chỉ sai tham số. Đã dùng phép này 31/07 để tìm ra ba scope
+minutes còn thiếu chỉ trong một lượt, thay vì vá từng cái theo lỗi thực tế.
+
+Kết quả lượt đó — ba cái đã thêm vào `OAUTH_SCOPES`:
+
+| scope | dùng cho | trạng thái |
+|---|---|---|
+| `minutes:minutes.search:read` | `minutes_list` — quét phát hiện cuộc họp | **bắt buộc**, thiếu là không phát hiện được gì |
+| `minutes:minutes.media:export` | tải bản ghi để phiên âm | **bắt buộc** |
+| `minutes:minutes.transcript:export` | transcript sẵn của Lark | chưa dùng; xin trước cho hướng "bỏ whisper" (V2_VIEC_CAN_LAM hạng 1) để khỏi bắt mọi người enroll lại lần nữa |
+
+Còn một chỗ **chưa vá, chấp nhận được**: `bitable.base_media_upload` đính file
+transcript vào Base bằng **user token** qua `/drive/v1/medias/upload_all`, mà
+người mới không có scope drive nào. Hỏng chỗ này chỉ mất ô "File transcript"
+trên Base, không mất biên bản — đã bọc try riêng từ đầu.
 
 #### Cái gì đã chạy được rồi (dùng token V2 hiện tại)
 
@@ -1325,3 +1534,1107 @@ bấm lại link, và không ai thay họ bấm được.
 Trên DB **thật** chỉ chạy hai phép không phá: `users`, và `revoke` **không kèm
 `--yes`** (phải từ chối) + `revoke` người không tồn tại (phải báo rõ). Cả hai
 đúng, DB không đổi.
+
+---
+
+## 19. Ba lỗ "im lặng mất dữ liệu" đã vá (31/07/2026)
+
+Cùng một họ vấn đề: **một bước phụ hỏng, hệ thống vẫn báo thành công, và không
+gì chạy lại**. Trước bản này cả ba đều dẫn tới mất vĩnh viễn thứ mà người dùng
+tưởng đã có.
+
+### 19.1 LLM hỏng KHÔNG còn được coi là "phát xong"
+
+**Trước:** `summarize.summarize()` nuốt mọi lỗi LLM và trả về một `Recap` chỉ có
+câu "Chưa sinh được recap". Pipeline coi đó là thành công → phát cho tất cả →
+job `delivered` → Base ghi `không có recap` → **hết, không gì chạy lại**. Nghĩa
+là một cú 429 hoặc một lần Hermes timeout (`LLM_TIMEOUT=240`, vòng agent chạy
+lâu là chuyện thường) là cuộc họp đó **vĩnh viễn không có tóm tắt**, mà mọi
+người vẫn nhận được thẻ. Muốn cứu phải sửa SQL bằng tay.
+
+Bất đối xứng ở chỗ: bước phiên âm — đắt nhất, hàng chục phút CPU — được bảo vệ
+rất kỹ (`TranscribeUnavailable` → `unbump_attempts`, giữ `queued`, §17), còn
+bước **rẻ nhất để thử lại** thì không có lưới nào.
+
+**Nay:** phân biệt hai kiểu "không có recap", vì chúng khác nhau thật:
+
+| Tình huống | Xử lý |
+|---|---|
+| Thiếu `LLM_API_KEY` | trạng thái CẤU HÌNH, thử lại vô nghĩa → phát bản trần ngay, như cũ |
+| Gọi LLM thất bại (timeout/429/5xx) | ném `summarize.RecapUnavailable` → **hoãn**, y như whisper tắt |
+
+Nhánh hoãn: **không** tiêu `MAX_ATTEMPTS`, giữ job ở `queued`, vòng sau
+`orchestrator._reuse` nạp lại transcript đã lưu nên **chỉ làm lại recap** —
+không phiên âm lại. Đếm riêng ở cột mới `jobs.recap_fails`.
+
+Nhưng **không hoãn vô hạn**: hết `RECAP_MAX_TRIES` (mặc định 3 ≈ 15 phút với
+`POLL_INTERVAL=300`) thì chịu phát bản không có recap. Lý do: 429/timeout thì
+vòng sau chạy được, nhưng key sai/hết tiền thì chờ đến bao giờ cũng vậy — mà
+transcript vẫn đáng gửi hơn là im lặng mãi. Recap giữ chỗ nay nói rõ đã hỏng
+mấy lần và lỗi gì.
+
+Kèm một sửa **quan trọng không kém**: `_reuse` trước đây đòi CÓ CẢ
+`transcript_path` VÀ `recap_json` mới chịu dùng lại. Nên "làm lại recap" kéo
+theo **tải + phiên âm lại toàn bộ** — đúng cái đắt nhất phải tránh. Nay
+`transcript` có mà `recap` chưa là một trạng thái hợp lệ và hay gặp.
+
+Đường ranh dry-run cũng giữ: `process` (không `--send`) **không** ghi
+`recap_fails`, không cộng `attempts` — nó là lệnh chẩn đoán, chạy vài lần không
+được phép đốt ngân sách hoãn của lần gửi thật (cùng lý lẽ với sửa `MAX_ATTEMPTS`
+31/07, §5 handoff).
+
+```
+POLL_INTERVAL=300  RECAP_MAX_TRIES=3   # v2\.env
+```
+
+### 19.2 Ghi Base hỏng: nay có đường vá, cả tự động lẫn bằng tay
+
+`write_draft` cố ý chỉ log rồi đi tiếp khi ghi Base hỏng — biên bản đã tới tay
+người dự rồi, không được làm job `failed`. Đúng. **Nhưng sau đó không có gì thử
+lại, kể cả bằng tay:** `sync_tracking` chỉ đổ lại ô cho record ĐÃ tồn tại, nó
+`continue` qua mọi job không có `bitable_record_id`; và không lệnh nào tạo
+record thiếu.
+
+Hậu quả: một cú mất mạng lúc ghi Base = cuộc họp đó **vĩnh viễn không lên Base**,
+còn bot thì báo "CHƯA CÓ BIÊN BẢN" **mãi mãi** — `qa.pending_meetings()` xét
+đúng cột `bitable_record_id` đó (§ commit 2721d2d).
+
+Nay `bitable.retry_missing_records()`: quét job `delivered` mà thiếu record,
+đọc lại recap từ DB, lấy số người nhận từ bảng `deliveries`, ghi record. Gọi từ
+**hai** chỗ — cuối mỗi `process_queue` thật, và đầu `python -m v2 base-sync`
+(người vận hành cũng phải vá được, không chỉ vòng `run`). Idempotent: `write_draft`
+tự tra Base theo `minute_token` trước khi tạo nên không sinh record trùng.
+
+### 19.3 Bot không còn nói câu tự mâu thuẫn
+
+`_TINH_TRANG` thiếu `delivered`, nên job đã phát mà chưa lên Base bị in ra là
+`CHƯA CÓ BIÊN BẢN — delivered`: vừa lộ chuỗi tiếng Anh thô, vừa **nói sai theo
+chiều ngược lại** — biên bản đang nằm trong chat của người ta mà bot bảo chưa có,
+họ sẽ đi tìm cái đã có. Nay: `CHƯA LÊN BASE — ĐÃ phát cho người dự, nhưng chưa
+ghi được lên Base (hệ thống sẽ tự thử lại)`.
+
+### 19.4 Cảnh báo gia hạn token: link RÚT GỌN + không đốt nonce mỗi vòng
+
+`alerts._check_tokens` dán URL authorize **đầy đủ** vào DM. Với `OAUTH_SCOPES`
+hiện tại đó là **3.132 ký tự**: dán vào chat Lark thì xuống dòng làm gãy link,
+và người nhận ngại bấm. `enroll-url` và `gate` đã qua `short_link()` từ
+31/07/2026, đường này bị sót — mà nó lại là link **dễ bị chuyển tiếp nhất**.
+Đúng cái bài học "bốn đường ra cùng một dữ liệu thì phải sửa cả bốn" (commit
+2721d2d), lần này là đường thứ ba của link enroll.
+
+Kèm: nội dung DM nay dựng **lúc sắp gửi** (callable), và nonce đi qua
+`oauth.start_or_reuse(open_id)` — dùng lại nonce còn sống của cùng người thay vì
+sinh mới. Trước đó gửi hỏng → mốc chống spam không được ghi → vòng sau dựng lại
+→ **5 phút một nonce mới, mỗi cái sống 24h**: vừa rác DB, vừa là hàng trăm link
+enroll còn hiệu lực nằm chờ. Nonce nay cũng **buộc theo `open_id`** (cột đã có
+sẵn, chỉ chưa ai ghi vào) — chưa được ép ở `complete()`, xem việc còn mở dưới.
+
+### Đã đo (31/07/2026)
+
+Test trên **DB tạm**, mọi lời gọi Lark/LLM bị thay bằng hàm giả — 25/25 đạt:
+
+| Kiểm | Kết quả |
+|---|---|
+| LLM hỏng lần 1, 2 | không phát gì · job `queued` · `attempts=0` · `recap_fails=1,2` · **0 lần phiên âm lại** |
+| LLM hỏng lần 3 (hết ngưỡng) | phát đúng 1 lần cho **cả 2** người dự, recap giữ chỗ nói rõ "thất bại 3 lần liên tiếp", vẫn 0 lần phiên âm lại |
+| LLM sống lại | recap thật được phát, `recap_fails` về 0 |
+| `process` dry-run khi LLM hỏng | không phát, **không** ghi `recap_fails`, **không** cộng `attempts` |
+| `retry_missing_records()` | tạo record cho cả 2 job thiếu, lưu `record_id`, số người nhận đọc đúng từ `deliveries`; chạy lại = no-op |
+| `fmt_pending` job `delivered` | `CHƯA LÊN BASE — ĐÃ phát cho người dự…`, không còn chuỗi `— delivered` |
+| DM gia hạn token | dùng link rút gọn, **không** có `authen/v1/authorize` trong tin |
+| 3 vòng `check_all` liên tiếp (giả lập gửi hỏng) | số dòng `oauth_nonce` giữ nguyên 1 |
+
+Trên DB **thật** chỉ chạy phép không phá: `db.init()` thêm cột `recap_fails` OK,
+và `retry_missing_records()` trả `0` (2 job `delivered` đều đã có record — không
+gọi API nào).
+
+---
+
+## 20. Hỏi đáp: mỗi người chỉ đọc biên bản cuộc họp MÌNH DỰ (làm 31/07/2026)
+
+### Lỗ trước khi sửa
+
+`gate` chỉ trả lời được một câu: "người này đã enroll chưa". Qua cửa rồi thì
+`qa.records()` đọc **toàn bộ** Base và `pending_meetings()` đọc **toàn bộ** bảng
+`jobs` — không hàm nào biết ai đang hỏi. Nên **enroll = đọc được biên bản của cả
+nhà**, kể cả cuộc họp mình không dự, cộng tên + link Minutes của mọi cuộc đang xử
+lý. Càng thêm người enroll thì càng rộng: khi phát hiện đã có 3 người.
+
+Bất đối xứng: đường **phát** có phân quyền theo người dự (`meta.attendees`),
+đường **đọc lại** thì không có gì. Bỏ cửa duyệt 30/07 làm đường đọc thành đường
+chính, mà nó lại là đường duy nhất không phân quyền.
+
+### Chính sách (user chốt 31/07/2026)
+
+Người hỏi thấy một cuộc họp khi họ **có trong `attendees`** HOẶC **là chủ**
+(`owner_open_id`). `QA_ADMIN_UNION_IDS` thấy tất cả (mặc định = `ALERT_UNION_IDS`).
+Không xác định được người hỏi → **không trả gì** (`qa.NO_ASKER`).
+
+Nguồn sự thật là `jobs.meta_json.attendees`, **không** phải cột `Người dự` trên
+Base: cột đó chỉ có tên + `user_id`, khớp theo chuỗi tên là mời lỗi. `attendees`
+có sẵn cả `union_id` lẫn `open_id`, và nó **chính là danh sách đã dùng để PHÁT** —
+nên "ai nhận được biên bản" và "ai đọc lại được" là cùng một quy tắc.
+
+Record trên Base mà `jobs` không còn job tương ứng → **chỉ admin thấy**. Không tra
+được người dự thì không chứng minh được người hỏi có dự; đoán ở đây là rò biên bản.
+
+### Ẩn nội dung thì được, ẩn SỰ TỒN TẠI thì không
+
+Mọi câu trả lời liệt kê kèm dòng *"Còn N cuộc họp khác trong hệ thống mà bạn không
+có trong danh sách người dự"* — **chỉ con số**: không tên, không tóm tắt, không
+link. Đủ để đi hỏi, không đủ để biết nội dung.
+
+Vì sao bắt buộc (bài học commit 2721d2d áp cho tình huống mới): bộ lọc chỉ tốt
+bằng dữ liệu `attendees`, mà đo 31/07/2026 thấy **3/5 job thật chỉ có 1 người dự**
+(khớp theo GIỜ, hoặc rơi về `fallback:owner`). Nên "tôi có dự mà bot không cho
+thấy" là chuyện **sẽ xảy ra**, và im lặng thì người ta lại tưởng đã xem hết —
+đúng cái lỗi "ăn bớt cuộc họp" vừa sửa hôm trước. Kèm log `[qa] ẩn n/N record
+khỏi <tên>` để chẩn được là ẩn đúng luật hay do tra người dự sót.
+
+`get_meeting` với cuộc họp không được xem thì nói **"CÓ trong hệ thống nhưng bạn
+không có trong danh sách người dự"**, không nói "không tìm thấy". Người ta vừa tự
+gõ tên ra nên câu đó không tiết lộ gì thêm.
+
+`search_meetings` lọc **TRƯỚC** khi tìm từ khoá, không phải sau: tìm trước rồi lọc
+thì con số "khớp mà bạn không được xem" tự nó là một phép dò nội dung — thử nhiều
+từ khoá là đoán được biên bản người khác.
+
+### Cơ chế: vé phiên đi qua tin nhắn
+
+Vấn đề: **MCP server là MỘT tiến trình dùng chung cho cả tenant**, Hermes spawn nó
+một lần với env tĩnh (`tools/mcp_tool.py`), nên lời gọi tool KHÔNG mang danh tính.
+
+**Cách KHÔNG dùng được (đã đo, đừng thử lại):** `gate` ghi "người hỏi hiện tại"
+vào DB rồi MCP đọc ra. Hermes serialize **theo session**, không phải toàn cục
+(`gateway/run.py`, "Per-SESSION_ID turn lease") → hai người nhắn cùng lúc là hai
+session chạy song song: B nhắn lúc agent của A đang chạy thì lời gọi tool sau đó
+của A đọc ra danh tính B. Rò dữ liệu, im lặng.
+
+**Cách đang dùng:**
+
+```
+người nhắn -> plugin v2-enroll-gate (hook pre_gateway_dispatch)
+            -> v2-gate.bat -> gate.check() -> askers.issue(union_id) -> vé
+            -> {"action": "rewrite", "text": "[V2-ASKER: <vé>] …" + tin gốc}
+            -> agent đọc vé, truyền vào tham số asker_token của tool
+            -> mcp_server._who() -> askers.resolve() -> qa lọc theo người đó
+```
+
+`action: "rewrite"` là tính năng có sẵn của hook (`run.py`), không phải bản vá
+Hermes. Vé ngẫu nhiên + hết hạn (`QA_TOKEN_TTL`, mỗi tin gia hạn) + buộc với
+`union_id`, lưu ở bảng mới `qa_sessions`.
+
+An toàn: người khác **không đoán được** vé của ai, và prompt injection từ nội dung
+họp cũng không bịa ra được vé hợp lệ — kẻ xấu chỉ dùng được vé của CHÍNH họ, tức
+đúng bằng quyền họ vốn có.
+
+**Điểm yếu đã biết, đừng giấu:** phụ thuộc LLM chịu truyền tham số. Quên thì bị từ
+chối (fail-closed, không rò gì) nhưng người dùng thấy bot "không nhận ra tôi" —
+`qa.NO_ASKER` có kèm một dòng chỉ dẫn cho agent tự sửa và gọi lại. Vì vậy `qa.py`
+nhận **người hỏi đã giải** chứ không nhận vé: nếu đo thật thấy model hay quên thì
+lùi sang phương án "plugin chèn sẵn dữ liệu đã lọc" mà không phải viết lại tầng lọc.
+
+### Kiểm
+
+```bash
+python -m v2 gate --union-id on_… --no-send      # phải có "asker_token"
+python -m v2 ask --as on_…  "tôi có cuộc họp nào"   # hỏi BẰNG danh tính người đó
+python -m v2 ask "…"                             # không --as = quyền admin (in cảnh báo)
+```
+
+`--as` là cách duy nhất kiểm bộ lọc mà không cần hai tài khoản Lark.
+
+### Đã đo (31/07/2026)
+
+47/47 test trên DB tạm (Base thay bằng record giả): A/B mỗi người một cuộc riêng +
+một cuộc chung; A không thấy cuộc của B và ngược lại; record mồ côi chỉ admin thấy;
+số bị ẩn đúng; `get_meeting` nói "có nhưng không phải của bạn"; `search_meetings`
+không dò được nội dung người khác bằng từ khoá; **cả bốn** đường ra + `answer` đều
+trả `NO_ASKER` khi thiếu vé; vé bịa/hết hạn/rỗng → None; ba tool MCP đều khai
+`asker_token` là `required`; `gate.check` trả vé cho người đã enroll và KHÔNG trả
+cho người chưa.
+
+Trên dữ liệu **thật** (3 người đã enroll, 5 job):
+
+| Người | Thấy | Bị ẩn |
+|---|---|---|
+| Thẩm (admin) | cả 5 | 0 |
+| Chi | 2 (`test luồng tự động` là người dự; `[HAPAS] Review HRIS` là **chủ** bản ghi) | 3 |
+| Thiện | 3 | 2 |
+
+Và `python -m v2 ask --as <Chi>` qua LLM thật trả đúng 2 cuộc, **vẫn nêu** cuộc
+chưa có biên bản kèm link Minutes, kèm dòng "3 cuộc họp không hiển thị".
+
+⚠️ Một cái bẫy khi đọc bảng trên: Chi thấy cuộc HRIS **không phải** vì cô ấy trong
+`attendees` (attendee duy nhất ở đó là một `union_id` khác) mà vì `owner_open_id`
+của job là open_id của cô ấy. Tôi đã suy sai một lần đúng chỗ này — kiểm bằng
+`qa.viewers_index()` rồi hãy kết luận, đừng đọc `attendees` rồi đoán.
+
+### Sau khi cập nhật PHẢI khởi động lại
+
+`v2-gate.bat` spawn Python mới mỗi tin nên nó ăn code mới ngay, nhưng **plugin** và
+**MCP server** thì không:
+
+```bash
+hermes gateway restart      # nạp plugin mới VÀ spawn lại `v2 mcp`
+```
+
+Chạy `hermes/install-plugin.bat` trước để đồng bộ bản trong repo sang
+`%LOCALAPPDATA%\hermes\plugins\` (chỗ đó nằm ngoài repo). Không restart thì trạng
+thái là: gate cấp vé, plugin cũ không chèn vé, MCP cũ không lọc → **hành vi y như
+trước khi sửa**, không phải trạng thái nửa vời gãy.
+
+---
+
+## 21. Bot Lark CHỈ làm biên bản họp + tạo task (làm 01/08/2026)
+
+### Ba tầng, và tầng nào cưỡng chế được cái gì
+
+Đừng nhầm "đã dặn agent" với "agent không làm được". Ba tầng, mạnh dần:
+
+| Tầng | Chặn được gì | Chỗ sửa |
+|---|---|---|
+| Prompt (`platform_hints.feishu`) | từ chối câu hỏi ngoài phạm vi; không dùng `feishu_doc`/`feishu_drive`/`kanban` | `%LOCALAPPDATA%\hermes\config.yaml` |
+| Toolset (`platform_toolsets.feishu`) | bỏ hẳn `memory`, `session_search`, `todo` | cùng file |
+| CODE (`v2/tasks.py`, `v2/qa.py`) | task phải gắn cuộc họp có thật; chỉ đọc/ghi cuộc họp mình dự | repo |
+
+Chỉ tầng 3 là bảo đảm. Tầng 1 có thể bị nội dung họp lái đi (input không tin
+cậy), tầng 2 thì Hermes **luôn thêm lại** `feishu_doc` / `feishu_drive` /
+`kanban` bất kể config — đo bằng chính resolver của nó:
+
+```powershell
+& "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\python.exe" -X utf8 -c @"
+import sys; sys.path.insert(0, r'$env:LOCALAPPDATA\hermes\hermes-agent')
+from hermes_cli.tools_config import _get_platform_tools
+from hermes_cli.config import load_config
+print(sorted(_get_platform_tools(load_config(),'feishu')))
+"@
+```
+
+Kết quả hiện tại: `['clarify', 'feishu_doc', 'feishu_drive', 'kanban', 'meetings']`.
+Ba cái giữa **không bỏ được**, nên prompt phải cấm chúng bằng lời.
+
+### `platform_hints` — cơ chế đúng, không phải sửa SOUL.md
+
+`SOUL.md` là identity TOÀN CỤC: sửa nó là đụng cả surface CLI mà bạn vẫn dùng để
+làm việc khác. Hermes có sẵn thứ cần: **`platform_hints.<platform>`** ở
+**top-level** `config.yaml`, đọc bởi `agent/system_prompt.py::_resolve_platform_hint`,
+hỗ trợ `{append|replace}` (`replace` thắng nếu có cả hai).
+
+Dùng `append` chứ không `replace`: hint mặc định của feishu nói về Markdown và
+cú pháp `MEDIA:/đường/dẫn` để gửi file — thay hết là mất phần đó.
+
+Kiểm đã ăn (không cần chờ nhắn thật):
+
+```powershell
+& "...\venv\Scripts\python.exe" -X utf8 -c @"
+import sys; sys.path.insert(0, r'...hermes-agent')
+from agent.system_prompt import _resolve_platform_hint
+from hermes_cli.config import load_config
+class A: pass
+a=A(); a._platform_hint_overrides = load_config().get('platform_hints',{})
+out=_resolve_platform_hint(a,'feishu','HINT-MAC-DINH')
+print(len(out), 'HINT-MAC-DINH' in out, 'BIÊN BẢN HỌP' in out)
+print('cli khong dinh:', _resolve_platform_hint(a,'cli','X')=='X')
+"@
+```
+
+Đo 01/08/2026: hint feishu 2.108 ký tự, giữ hint mặc định, CLI **không** dính.
+
+⚠️ Comment trong `config.yaml` có thể **biến mất**: Hermes tự ghi lại file này
+(vd `hermes plugins enable`) bằng yaml.dump, mà yaml.dump bỏ comment. Giá trị thì
+còn. Nên phần giải thích thật nằm ở đây, không nằm trong config.
+
+### `todo` KHÔNG phải Lark Task
+
+Đây là lý do phải bỏ `todo` khỏi toolset feishu: nó là danh sách việc **nội bộ
+của Hermes**. Để lại thì người dùng bảo "tạo task" và agent sẽ chọn `todo` — task
+tạo ra không ai thấy trong Lark, mà agent vẫn báo "đã tạo xong". Lỗi im lặng.
+Việc tạo Lark Task thật đi qua `create_task` của MCP V2 (§dưới).
+
+### `create_task` — đường GHI duy nhất, và bốn ràng buộc cứng
+
+`v2/tasks.py`, KHÔNG đặt trong `qa.py` (file đó có bất biến "chỉ đọc"):
+
+1. Phải gắn `minute_token` của một cuộc họp **có thật** trong `jobs`.
+2. Người hỏi phải **được xem** cuộc họp đó — dùng đúng `qa._may_see`, không dựng
+   luật phân quyền thứ hai (hai luật song song sẽ lệch, và cái lỏng hơn thắng).
+3. Giao cho **chính người hỏi**. Không nhận assignee tuỳ ý: tên người trong
+   transcript là dữ liệu không tin cậy.
+4. Tạo bằng **user token của người hỏi** → bot không làm được nhiều hơn quyền họ
+   vốn có, và trên Lark task hiện đúng người tạo.
+
+Description luôn kèm tên cuộc họp + link Minutes. Task do máy sinh mà không nói
+rõ từ đâu thì vài hôm sau không ai dám tin nó.
+
+### ⚠️ Hạn task: BA cái bẫy, Lark trả `code=0` rồi lưu SAI
+
+Đo thật 01/08/2026, mỗi dòng là một task đã tạo và đọc lại:
+
+| Gửi đi | Lark lưu | Kết quả |
+|---|---|---|
+| epoch **giây** `1786726800`, all_day=true | `1728000000` | **04/10/2024** — sai 2 năm |
+| epoch **ms** `1786726800000` (nửa đêm +07), all_day=true | `1786665600000` | **14/08** — lùi một ngày |
+| epoch **ms** `1786752000000` (nửa đêm **UTC**), all_day=true | y nguyên | **15/08** ✅ |
+| epoch **ms** nửa đêm +07, all_day=**false** | y nguyên | 15/08 00:00 (+07) ✅ |
+
+Kết luận: `due.timestamp` là **chuỗi mili giây**, và `is_all_day=true` neo theo
+**nửa đêm UTC**. `tasks._parse_due` quy `YYYY-MM-DD` ra đúng mốc đó.
+
+Không có cái nào trong ba cái sai trả lỗi — Lark nhận hết, `code=0`. Đây đúng
+kiểu lỗi mà chỉ chạy thật mới thấy: unit test với hàm giả sẽ "đạt" cả ba.
+
+### Hoàn thành một task (khi cần dọn)
+
+`POST /tasks/{guid}/complete` **không tồn tại** (404 text/plain, không phải JSON —
+`.json()` sẽ ném). Đúng là:
+
+```
+PATCH /open-apis/task/v2/tasks/{guid}
+  {"task": {"completed_at": "<epoch ms>"}, "update_fields": ["completed_at"]}
+```
+
+### Đã kiểm (01/08/2026)
+
+- 24/24 test `tasks.py` trên DB tạm: 4 ràng buộc đều chặn đúng, và **không gọi
+  API lần nào** ở các nhánh bị từ chối.
+- Tạo task THẬT 5 lần để dò hợp đồng hạn (bảng trên), lần cuối bằng code đã sửa
+  → đọc lại từ Lark ra đúng `2026-08-15`. Cả 5 đã đánh dấu hoàn thành.
+- `hermes mcp test meetings` → **4 tool** (3 đọc + `create_task`).
+- Toolset feishu và platform hint: đo bằng resolver của Hermes (lệnh ở trên).
+
+Chưa kiểm: người thật nhắn bot rồi bot từ chối câu ngoài phạm vi. Đó là hành vi
+của model, chỉ chạy thật mới biết.
+
+---
+
+## 22. Siết OAUTH_SCOPES: 124 → 18 (làm 01/08/2026)
+
+### Vì sao
+
+Xin **trọn họ** scope có lý do thật: thêm scope = mọi người phải enroll lại, nên
+xin dư một lần cho đỡ phải xin lần hai (V2_LONGTERM §3.2). Nhưng cái giá đã rõ:
+màn hình Đồng ý của một bot biên bản họp đòi quyền **ghi Docs, ghi Drive, xoá
+comment, đổi permission** — người mới nhìn thấy thì ngại bấm (đã gặp thật), và
+máy local giữ refresh token với bề mặt đó.
+
+Bài học đúng từ vụ Chi (§10) là **"`OAUTH_SCOPES` phải liệt kê đủ những gì ta
+dùng"**, không phải "liệt kê tất cả".
+
+### Nay: danh sách tường minh, mỗi scope ứng một lời gọi
+
+`scopecheck.SCOPES_NEEDED` (18 scope) là **nguồn sự thật**; `config.OAUTH_SCOPES`
+chỉ là bản dự phòng cho máy chưa có `.env`. Giữ hai chỗ khớp nhau.
+
+Quy tắc: **thêm scope thì phải thêm phép kiểm tương ứng vào `scopecheck._checks()`**.
+Không có phép kiểm thì sau này không ai biết nó còn cần hay không — đúng cái vòng
+luẩn quẩn đã dẫn tới 124.
+
+Đã bỏ hẳn: cả họ `drive:` (14) — đường duy nhất chạm Drive là `base_media_upload`,
+và nó đi bằng `docs:document.media:upload`; và 30/31 scope `docs:`.
+`base:` / `im:` vốn đã không có: V2 gọi Base và gửi tin bằng **tenant** token.
+
+```bash
+python -m v2 scopes --print-all   # sinh lại dòng OAUTH_SCOPES + cảnh báo scope Console chưa duyệt
+python -m v2 scopes               # quét từng endpoint bằng token thật của từng người
+```
+
+`--print-all` nay còn báo scope nào V2 cần mà **Console chưa duyệt ở danh tính
+user** — xin cũng không được cấp, và đó là lỗi im lặng.
+
+### Đo được (01/08/2026)
+
+| | Trước | Sau |
+|---|---|---|
+| Số scope | 124 | **18** |
+| URL authorize | 3.132 ký tự | **731** (trần thực tế ~7.000) |
+| Lark nhận URL | 302 | **302** (mọi tên scope hợp lệ) |
+| Console đã duyệt đủ | — | **có**, không cái nào thiếu |
+| `v2 scopes` (3 người) | ĐẠT | **ĐẠT 14/14 mỗi người** |
+| 18 scope ⊆ quyền từng người | — | **có**, thiếu 0/17 |
+
+### ⚠️ Giới hạn của phép đo này — đọc kỹ
+
+`v2 scopes` chạy bằng token của người **đã có sẵn 125–257 scope** (Lark **cộng
+dồn** các lần cấp quyền của từng người, §10). Nên nó chứng minh **endpoint còn
+chạy**, KHÔNG chứng minh 18 scope là **đủ** cho một người mới tinh. Không có cách
+nào cô lập được điều đó với người đã enroll: enroll lại cũng không làm token hẹp lại.
+
+Phép thử thật sự là **người thứ tư enroll**. Lưới an toàn đã có sẵn và đó là lý do
+đủ để dám cắt: `oauth._warn_if_missing_scopes` chạy **ngay lúc enroll**, quét toàn
+bộ bề mặt bằng token mới, in ra scope thiếu và **DM cho admin** nếu thiếu đường
+quan trọng (`minutes_list` / `minutes_media_url`). Cắt hụt thì hỏng **ồn và tức
+thì**, không phải im lặng như vụ Chi.
+
+Người đang enroll KHÔNG bị ảnh hưởng: token cũ giữ nguyên quyền đã cấp.
+
+---
+
+## 23. Siết `attendees`: lọc người từ chối + gộp người THẬT SỰ vào họp (02/08/2026)
+
+Việc 1 của đợt rà soát vận hành. Sửa ở `v2\meetings.py` + một hàm mới ở
+`v2\lark_api.py`. Đây là hai lỗ **ngược chiều nhau** trong cùng một danh sách.
+
+### Vì sao danh sách người dự mỏng đến vậy — nguyên nhân gốc, đo được
+
+Đo 31/07 thấy 3/5 job chỉ có **1 người dự**, và trước giờ vẫn nghĩ là "họp mở
+tay, không có lịch". Sai. Soi thẳng `event_attendees` của cuộc họp
+`07-30 | Workforce AI Weekly Meeting` (02/08/2026):
+
+```
+event_attendees: 3 mục
+  type: {'resource': 1, 'chat': 1, 'user': 1}
+  rsvp_status: {'accept': 2, 'needs_action': 1}
+```
+
+Cuộc họp đó **mời bằng một GROUP CHAT**, không mời từng người. Mà bộ lọc
+`type == "user"` (đúng, phải giữ) chỉ nhặt được đúng **1** cá nhân. Trong khi
+số người thật sự ngồi trong phòng họp là **31**.
+
+Đó mới là nguyên nhân thật của "3/5 job chỉ có 1 người", không phải họp mở tay.
+Và nó im lặng theo cả hai chiều: 29 người không nhận biên bản, **và** bot giấu
+luôn cuộc họp khỏi họ (`qa.viewers_index` dùng đúng danh sách này), nên họ còn
+không biết mình đang thiếu.
+
+### Hai thay đổi
+
+**(a) Lọc `rsvp_status == "decline"`** — `meetings._attendee_ids()`.
+Trước đó người bấm "Từ chối" trên lời mời vẫn nhận **NGUYÊN VĂN transcript**, và
+vì cửa duyệt đã bỏ nên không ai chặn được bằng mắt. Đây là đường rò nội dung rẻ
+nhất mà hệ thống có: mời nhầm một người vào cuộc họp lương, họ từ chối, vẫn nhận
+toàn văn.
+
+CỐ Ý **không** lọc `needs_action` / `tentative`: chưa bấm nút ≠ không dự — họp
+nội bộ hầu như không ai bấm (đo trên: 1/3 mục là `needs_action`). Chỉ `decline`
+mới là lời từ chối tường minh.
+
+**(b) Gộp người THẬT SỰ vào phòng họp** — `meetings._vc_joiners()` +
+`lark_api.vc_meeting_participants()`.
+Contract lấy bằng `lark-cli vc meeting get --help`: cờ `--with-participants`
+trên `GET /open-apis/vc/v1/meetings/{meeting_id}`. Cần `vc:meeting:readonly` ở
+danh tính **người dùng** — đã có trong `OAUTH_SCOPES`, nhưng ai enroll trước
+02/08 phải **enroll lại** mới dùng được.
+
+Bốn ràng buộc của bước này, mỗi cái có lý do:
+
+1. **Chỉ chạy khi `how == "verified"`.** Chỉ khi đó `meeting_id` mới chắc chắn
+   thuộc về minute đang xử lý. Lấy người dự của một cuộc họp đoán mò = phát biên
+   bản cho người của cuộc họp khác.
+2. **Gộp thêm, không thay thế.** Người được mời mà hôm đó bận không vào vẫn nên
+   nhận biên bản.
+3. **Chỉ lấy `union_id`.** Ghép `union_id` với `open_id` từ hai lời gọi API khác
+   nhau theo THỨ TỰ là cái bẫy đang còn mở ở nhánh lịch (V2_HANDOFF §4.5 mục
+   11b) — đừng nhân nó lên. `union_id` đủ cho cả hai chỗ dùng danh sách này:
+   phát (`pipeline.deliver` gửi theo union_id) và phân quyền (`viewers_index`
+   hợp cả hai loại id).
+4. **Bỏ `user_type != 1` và `is_external`.** Phòng Rooms và người gọi vào bằng
+   điện thoại thì không nhắn tin được; người ngoài tenant thì bot không phát
+   hành cho họ. Gửi cho hai nhóm đó chỉ sinh dòng `deliveries` hỏng.
+
+### Vá kèm: `_meeting_ids_via_no` trả DANH SÁCH, không trả cái đầu
+
+Hàm cũ trả `metts[0]`, và caller coi "có meeting_id mà recording không khớp" =
+sự kiện khác → `continue`. Với **phòng họp cá nhân dùng lại** (2-3 cuộc liên
+tiếp cùng một số phòng — rất phổ biến) thì ứng viên đầu tiên thường không phải
+cuộc đang xử lý, và cả sự kiện ĐÚNG cũng bị bỏ, mất luôn danh sách người dự.
+
+Nay thử tối đa `MAX_MEETING_CANDIDATES = 5` ứng viên rồi mới kết luận. **Ngữ
+nghĩa fail-closed không đổi**: có ứng viên mà không cái nào sinh ra minute này
+thì vẫn là sự kiện khác, vẫn bỏ.
+
+### Vá kèm: không ghép cặp bừa khi hai lời gọi lệch nhau
+
+`len(unions) != len(opens)` = ghép theo thứ tự là gán danh tính SAI một cách im
+lặng. Nay in cảnh báo và để mỗi id đứng riêng. Không mất gì: mọi chỗ dùng danh
+sách này đều dùng nó như một **tập** id.
+
+### Đo bằng dữ liệu THẬT (02/08/2026, chạy lại trên cả 5 minute, chỉ gọi API đọc)
+
+| Cuộc họp | Trước | Sau |
+|---|---|---|
+| `07-30 \| Workforce AI Weekly Meeting` | 1 người · `calendar[near5m]` | **30 người** · `calendar[verified] +vc29` |
+| `test lại luồng` | 2 người · `calendar[title]` | 2 người · `calendar[verified]` |
+| `test luồng tự động` | 2 người · `calendar[title]` | 2 người · `calendar[verified]` |
+| `[HAPAS] Review HRIS…` | 1 người · `calendar[near6m]` | 1 người · `calendar[near6m]` (sự kiện lịch đã xoá: `event_get` → `193001 event not found`, rơi về khớp giờ — đúng như thiết kế) |
+| `Cuộc họp video của Lê Quý Thiện` | `no_match → fallback:owner` | `no_match` (giống hệt: `fallback:owner` áp ở `orchestrator.enqueue_minute`, không ở đây) |
+
+`_vc_joiners` giữ 30/31 mục — một người vào phòng hai lần, `uid not in out` dọn.
+
+### ⚠️ Quy công cho đúng chỗ — đừng đọc bảng trên thành "code mới làm ra verified"
+
+Cột "Trước" là giá trị **lưu trong DB từ 30/07**, không phải hành vi của code cũ
+chạy hôm nay. Với 3 job thành `verified`, mỗi sự kiện chỉ có **1 ứng viên
+meeting_id** (đã soi: Workforce ra đúng 1) — nên code CŨ chạy với token HÔM NAY
+cũng ra `verified`. Thứ đã đổi là **token nay có `vc:meeting:readonly`** sau khi
+enroll lại, không phải phần sửa multi-candidate.
+
+Phân định đúng:
+- `verified` 0/5 → 3/5: **công của việc enroll lại có scope**, không phải của
+  thay đổi này.
+- `1 → 30 người`: **hoàn toàn** của bước gộp VC ở (b).
+- Multi-candidate: là **lưới phòng xa** cho trường hợp phòng họp dùng lại — chưa
+  gặp trong 5 mẫu này, nên chưa có bằng chứng thật.
+- Lọc `decline`: trường `rsvp_status` **có thật** trong phản hồi (đo được
+  `accept` / `needs_action`), nhưng **không mẫu nào có `decline`**, nên nhánh
+  loại người CHƯA được kiểm bằng dữ liệu thật.
+
+### ⚠️ Hệ quả vận hành phải biết trước khi chạy tiếp
+
+Cuộc họp thật kế tiếp sẽ phát cho **mọi người vào phòng họp**, không còn 1-2
+người như trước. Kéo theo:
+
+- Đường **dùng lại `file_key` cho người thứ hai trở đi** (`pipeline.deliver`)
+  lần đầu chạy thật (V2_HANDOFF §3 — trước nay 6/6 dòng `deliveries` chỉ đi tới
+  2 người khác nhau, chưa lần nào ≥2 người trong CÙNG một job).
+- Mọi người dự nhận **file transcript toàn văn**, không chỉ tóm tắt.
+- Bot 230013 sẽ lộ ra ngay nếu app chưa phát hành cho toàn công ty.
+
+Nên chạy `python -m v2 process` (dry-run) và đọc dòng `[deliver] … -> N người ·
+<nguồn>` **trước** khi `--send` cho cuộc họp đông đầu tiên.
+
+---
+
+## 24. CHỈ GỬI CHO NGƯỜI ĐÃ CẤP QUYỀN (02/08/2026, user chốt)
+
+Đổi luật người nhận. Trước: ai có tên trên lời mời lịch cũng bị đẩy **nguyên văn
+transcript** vào chat, kể cả người chưa bao giờ cấp quyền cho hệ thống và không
+biết nó tồn tại. Nay: **chưa enroll = không nhận gì.**
+
+Đo trên cuộc `07-30 | Workforce AI Weekly Meeting`: **30 người dự → 3 người
+nhận**, 27 người chưa cấp quyền nên không nhận.
+
+### Tách hai khái niệm — đây là phần quan trọng nhất của mục này
+
+| | Nguồn | Dùng ở đâu | Rộng hay hẹp |
+|---|---|---|---|
+| Ai được **XEM** | `meta.attendees` (lịch + VC) **+** `db.minute_viewers` | `qa.viewers_index()` → bot hỏi đáp | **rộng** |
+| Ai được **GỬI** | phần giao của cái trên với **người đã enroll** | `orchestrator._recipients()` | **hẹp** |
+
+Vì sao rộng ở quyền đọc là an toàn: người chưa enroll không lọt vào
+`minute_viewers` được (bảng chỉ ghi người đã enroll), và cũng không dùng bot
+được (`gate` chặn rồi gửi link). Nới ở đó không mở thêm cửa nào ra ngoài, nhưng
+lại vá đúng khiếu nại "tôi có dự mà bot không cho tôi xem".
+
+### Bảng mới `minute_viewers`, và vì sao nó là nguồn người nhận TỐT NHẤT
+
+`minutes_list` gọi với `participant_ids:[open_id]` — tức **chính Lark khẳng
+định** người này có tham dự. Nguồn đó không phụ thuộc: cuộc họp có đặt qua
+Calendar không, mời từng người hay mời bằng group chat, có khớp được tên/giờ
+không, sự kiện lịch còn tồn tại không. Đúng bốn chỗ mà chuỗi tra người dự hay
+sót.
+
+`orchestrator.scan_once` ghi `db.note_viewer()` cho **mọi** người enroll thấy
+minute, **mỗi** vòng quét, **kể cả** khi minute đã bị chiếm khóa. Đặt dòng đó
+sau cửa `is_claimed` là mất đúng những người cần nhất (người thứ hai, thứ ba
+thấy cùng cuộc họp).
+
+**Bất biến rút ra:** một minute chỉ vào được hệ thống qua vòng quét của một
+người vừa tham dự vừa đã cấp quyền, nên người đó LUÔN nằm trong `minute_viewers`
+của nó. Tức "phát mà không ai nhận" gần như không xảy ra được nữa.
+
+### Đo bằng dữ liệu thật — nguồn (2) vá đúng hai chỗ nguồn (1) sót
+
+| Cuộc họp | Người dự | Chỉ lọc `attendees` | Có thêm `minute_viewers` |
+|---|---|---|---|
+| Workforce AI Weekly | 30 | 3 | 3 |
+| test lại luồng | 2 | 2 | 2 |
+| test luồng tự động | 2 | 2 | 2 |
+| `[HAPAS] Review HRIS…` | 1 | **0** | **1** (Chi) |
+| Cuộc họp video của Thiện | 0 | **0** | **1** (Thiện) |
+
+Hai dòng cuối là lý do phải có cả hai nguồn: một cái sự kiện lịch đã bị xoá
+(`event_get` → `193001`), một cái `no_match`. Chỉ lọc `attendees` thì hai người
+đó **mất biên bản của chính mình**, im lặng.
+
+### Không ai đã cấp quyền thì sao (user chốt: vẫn phiên âm, không gửi)
+
+`_deliver_now` thoát sớm **trước** khi upload file, job vẫn `delivered` (không
+retry — vòng sau cũng vậy thôi), `error` ghi lý do, và **vẫn ghi Base**. Người
+dự enroll về sau là đọc lại được qua bot, không mất gì.
+
+Cột `Trạng thái` có giá trị thứ tư: **`chưa ai cấp quyền`**. Tách khỏi
+`phát hỏng` vì hai cái đòi hai hành động khác hẳn — `phát hỏng` là đi sửa lỗi kỹ
+thuật, cái này là đi mời người ta cấp quyền. Gộp chung thì mỗi cuộc họp của
+phòng chưa dùng hệ thống lại hiện lên như một sự cố và người ta thôi đọc cột đó.
+
+Cách phân biệt: `deliveries` **không có dòng nào** = chưa lần nào chạm tới Lark
+= không thể là lỗi kỹ thuật. Suy luận này chỉ đúng vì `delivery_status()` chỉ
+được gọi cho job `delivered` — job `failed` cũng có 0 dòng nhưng không bao giờ
+tới đó (`retry_missing_records` lọc `by_status("delivered")`).
+
+### ⚠️ Bẫy đã suýt dính: cột select không tự nhận giá trị mới
+
+`write_draft` → `_ensure_fields_once()` chỉ gọi `ensure_fields()`, mà hàm đó
+**chỉ THÊM field còn thiếu, không đụng field đã có**. Nên Base vẫn giữ bộ 3
+option cũ và record ĐẦU TIÊN dùng `chưa ai cấp quyền` sẽ ghi hỏng — đúng cái bẫy
+đã trả giá với `draft`/`final` ở §11, chỉ khác là lần này **đường ghi tự động
+chạm vào trước khi ai kịp chạy `base-sync`**.
+
+Đã vá: `_ensure_fields_once()` gọi luôn `ensure_status_options()`. Ở đây chỉ
+THÊM option (3 → 4), không bỏ cái nào, nên cảnh báo "gửi `options` là THAY THẾ,
+record mất ô" của §11 **không** áp dụng. Đã chạy thật 02/08:
+
+```
+option TRUOC: ['đã phát', 'không có recap', 'phát hỏng']
+option SAU  : ['đã phát', 'không có recap', 'phát hỏng', 'chưa ai cấp quyền']
+```
+
+3 record cũ giữ nguyên `đã phát`.
+
+### Không có chuyện phát trùng — 4 lớp chặn
+
+Câu hỏi hay gặp: "chủ phòng và người được mời cùng quét thấy thì có thành hai
+cuộc họp không?" Không. **Một cuộc họp chỉ có MỘT `minute_token`** trong Lark —
+mọi người nhìn vào cùng một object.
+
+| Lớp | Ở đâu |
+|---|---|
+| `is_claimed(mt) or jobstore.get(mt)` → vòng quét người thứ 2 bỏ qua | `orchestrator.scan_once` |
+| `try_claim_minute()` = `INSERT OR IGNORE` trên PRIMARY KEY, khóa thật | `db.py` |
+| `resolve_participants` chỉ đọc lịch MỘT người, `return` ở sự kiện khớp đầu tiên | `meetings.py` |
+| `uuid_key=f"recap-{token}-{rid}"` → Lark tự khử trùng tin nhắn | `pipeline.deliver` |
+
+Đo: `minutes_lock=5 · jobs=5 · minute_token khác nhau=5`. `_recipients()` cũng
+khử trùng danh sách khi hợp hai nguồn.
+
+---
+
+## 25. Vì sao job `[HAPAS]` hỏng — và ba lỗi lộ ra từ đó (02/08/2026)
+
+Job `[HAPAS] Review HRIS & feedback hệ thống Chấm công` nằm `failed` với
+`attempts=6` và error đúng một câu vô nghĩa: **`quá 5 lần thử`**. Mở lại bằng
+tay mới biết nguyên nhân thật:
+
+```
+minutes_get       -> OK      (doc duoc thong tin cuoc hop)
+minutes_media_url -> 2091005 permission deny
+```
+
+### Phát hiện gốc: quyền TẢI bản ghi không suy ra được từ việc có dự
+
+Đo ma trận 5 minute × 3 người, **cả ba đều có scope
+`minutes:minutes.media:export`** (nên đây KHÔNG phải chuyện scope):
+
+| minute | chủ bản ghi | Thẩm | Chi | Thiện |
+|---|---|---|---|---|
+| `obsg5x1qwe3q8y` | Thiện | 2091005 | 2091005 | **OK** |
+| `obsg5m7r163j4g` | **ngoài hệ thống** | 2091005 | 2091005 | 2091005 |
+| `obsg47j9bxdja9` | Thiện | 2091005 | **OK** | **OK** |
+| `obsg3s3814mk8j` | Thẩm | **OK** | 2091005 | 2091005 |
+| `obsg39y1z264fo` | Thẩm | **OK** | 2091005 | 2091005 |
+
+Hai điều rút ra:
+1. **Chủ bản ghi luôn tải được.** Người dự khác thì thường không.
+2. **Nhưng không phải quy tắc "chỉ chủ".** Chi tải được bản ghi của Thiện
+   (`obsg47j9`) trong khi Thẩm thì không. Tức **không đoán trước được ai tải
+   được — phải THỬ từng người.**
+
+⚠️ Lần đo đầu có nhiều ô `99991400` (chạm giới hạn tần suất) và suýt cho ra kết
+luận sai "chỉ chủ mới tải được". Phải đo lại có giãn cách + thử lại mới ra bảng
+trên. Đừng kết luận từ một lượt quét nhanh.
+
+### Lỗi 1 — `minutes/search` KHÔNG trả `owner_id`, nên "chủ" là người quét thấy
+
+Item của `minutes/search` chỉ có **`display_info`, `meta_data`, `token`**. Không
+có `owner_id`. Nên `build_meta` luôn ra rỗng ở đường polling, và
+`enqueue_minute` lấp bằng `reader_open_id`. Tức từ trước tới nay
+`meta.owner_open_id` nghĩa là **"chủ bản ghi HOẶC người tình cờ quét thấy"** —
+và không có gì báo là nó đang là cái thứ hai.
+
+Trước giờ không lộ ra vì hai cái trùng nhau (Thẩm vừa là chủ vừa là người quét).
+`[HAPAS]` là ca đầu tiên chúng khác nhau: lưu `ou_aa3d34…` (Chi) trong khi chủ
+thật là `ou_45beeb12…` (Nguyễn Ngọc Phúc).
+
+Ba chỗ sai theo:
+- `pipeline` ưu tiên nhầm người mượn token — mà chủ bản ghi lại là người **chắc
+  chắn tải được nhất**.
+- Cột `Chủ cuộc họp` / `user_id chủ` trên Base ghi tên người quét thấy
+  (`_tracking_fields` tra danh bạ theo `owner_open_id`).
+- Câu báo lỗi chỉ tay nhầm người cần đi nhờ.
+
+**Vá:** `build_meta` gọi thêm `minutes_get` khi `raw_item` không có `owner_id`
+(`minutes_get` thì CÓ trả). Một lời gọi cho mỗi cuộc họp mới. Hỏng thì để rỗng
+như cũ, không tệ hơn trước.
+
+### Lỗi 2 — chọn một người rồi bỏ cuộc
+
+`_reader_token` cũ trả **người đầu tiên còn token sống**, không kiểm người đó có
+tải được không. Theo bảng trên thì đó là xổ số: người-được-chọn không có quyền
+là hỏng cả job, dù người bên cạnh tải được.
+
+**Vá:** `_reader_candidates()` + `download_recording()` thử **từng người** tới
+khi có ai lấy được URL. Ba nguồn ứng viên, khả năng thành công giảm dần: chủ bản
+ghi → người dự trên lịch → `db.minute_viewers`.
+
+### Lỗi 3 — lỗi VĨNH VIỄN bị xử như lỗi tạm thời
+
+`2091005` không tự khỏi. Nhưng nó đi vào nhánh `except Exception` chung: job
+quay lại `queued`, vòng `run` 5 phút/lần đốt hết `MAX_ATTEMPTS` trong ~25 phút,
+rồi ghi đè error thành `quá 5 lần thử`. Mất nguyên nhân, và DM cảnh báo cũng in
+đúng câu vô nghĩa đó.
+
+Đây là **thành viên thứ ba** của họ lỗi đã vá hai lần ở §19 — nhưng ngược chiều:
+
+| | Tự khỏi? | Xử lý đúng |
+|---|---|---|
+| `TranscribeUnavailable` (whisper tắt) | có | KHÔNG tiêu quota, chờ |
+| `RecapUnavailable` (LLM 429) | có | KHÔNG tiêu quota, chờ, tối đa 3 lần |
+| **`MediaDenied` (2091005)** | **không** | **`failed` NGAY, kèm việc phải làm** |
+
+**Vá:** lớp `pipeline.MediaDenied`, bắt riêng trong `process_queue` **trước**
+`except Exception` (nó là `PipelineError`, để sau là bị nuốt). Câu lỗi mới:
+
+```
+không ai được phép tải bản ghi này (1 người đã cấp quyền đều bị Lark từ chối
+2091005, 1 người chưa cấp quyền). Quyền tải gắn với CHỦ bản ghi — ở đây là
+Nguyễn Ngọc Phúc. Cách sửa: nhờ Nguyễn Ngọc Phúc cấp quyền cho hệ thống
+(nhắn bot để lấy link), rồi trả job về hàng đợi.
+```
+
+⚠️ Bẫy trong chính bản vá: `tokenstore.TokenError` (người chưa enroll) **không
+được** xếp vào nhóm "lỗi tạm thời". Gộp vào thì điều kiện `denied and not other`
+không bao giờ đúng khi chủ bản ghi chưa enroll — đúng ca phổ biến nhất — và job
+lại quay về đốt 5 lần thử. Ba nhóm riêng: `denied` / `no_token` / `other`.
+
+### Hệ quả vận hành: V2 chỉ làm được biên bản khi CHỦ BẢN GHI đã cấp quyền
+
+Người dự cấp quyền là **chưa đủ**. Đây là ràng buộc cứng của Lark, không phải
+thứ sửa bằng scope được. Khi một cuộc họp hỏng vì lý do này thì DM cảnh báo nay
+nói thẳng phải đi nhờ ai.
+
+Job `[HAPAS]` đã chuyển `discarded` kèm nguyên nhân thật trong `error` (không
+xoá dấu vết). Phúc cấp quyền xong thì trả về hàng đợi:
+
+```sql
+UPDATE jobs SET status='queued', attempts=0, error=NULL
+WHERE minute_token='obsg5m7r163j4g86n6vt76wi';
+```
+
+---
+
+## 26. `python -m v2 selftest` — phép kiểm tự động đầu tiên (02/08/2026)
+
+```bash
+python -m v2 selftest
+```
+
+90 phép kiểm, ~15 giây, **không mạng, không đụng `state.db` thật**. Chạy trước
+khi commit và sau mỗi lần cập nhật Hermes/Lark SDK.
+
+### Vì sao tới giờ mới có, và vì sao nó đáng
+
+Tới 02/08/2026 repo **không có phép kiểm tự động nào**. Mọi lỗi trong lịch sử —
+`MAX_ATTEMPTS` đếm sai loại lỗi, LLM hỏng thành "phát xong", ghi Base hỏng không
+có đường vá, hỏi đáp không lọc theo người — đều tìm bằng tay **sau khi** đã hỏng
+trên dữ liệu thật, và nhiều cái sống qua vài phiên. Sổ tay ghi từng cái rất kỹ,
+nhưng văn bản không chặn được ai làm lại.
+
+Bốn lỗi tìm ra trong ngày viết file này đều do CHẠY những phép kiểm đó, không
+phải do đọc code:
+
+| Lỗi | Tìm ra bằng |
+|---|---|
+| `txt_path` đụng nhau khi không có giờ họp → Base đính transcript của cuộc KHÁC | mục 2 |
+| `process` dry-run ghi `failed` vĩnh viễn (lỗi tôi vừa tạo lúc vá MediaDenied) | mục 4 |
+| dry-run gọi `unbump_attempts` → âm thầm tặng thêm lần thử | mục 4 |
+| lưới kiểm scope chỉ chạy ở 1/3 đường enroll | mục 16 |
+
+`doctor` KHÔNG thay được: nó soi **trạng thái** hệ thống đang chạy (whisper sống
+chưa, token còn mấy ngày); `selftest` soi **hành vi** của code trên nhánh hiếm.
+
+### Ba luật, giữ nguyên nếu thêm phép kiểm
+
+1. **Không đụng dữ liệu thật.** Đã kiểm bằng vân tay SHA-256 của cả 7 bảng
+   trước/sau: `0d307779ec6fb449` → `0d307779ec6fb449`.
+   Cơ chế: `selftest.run()` chạy lại chính nó trong **tiến trình con** với
+   `V2_DB_PATH` trỏ vào thư mục tạm. Phải là tiến trình con vì `config.py` đọc
+   `.env` **một lần lúc import** — khi CLI đã nạp config thật thì không còn cách
+   nào đổi đường DB nữa. Đó cũng là lý do `cmd_selftest` **không** gọi `_init()`.
+2. **Không gọi mạng.** Mọi lời gọi Lark/LLM bị thay bằng hàm giả. Phép kiểm cần
+   mạng là phép kiểm sẽ bị bỏ qua khi mạng chập.
+3. **Kiểm nhánh HIẾM, không kiểm đường sướng.** Đường sướng chạy hằng ngày rồi.
+   Giá trị nằm ở: dry-run có ghi bậy không, lỗi vĩnh viễn có bị xử như tạm thời
+   không, `who=None` có rò dữ liệu không, hai cuộc họp có dùng chung file không.
+
+### 17 nhóm đang phủ
+
+| # | Nhóm | Điều đắt nhất nó chặn |
+|---|---|---|
+| 1 | `deliver` nhiều người | upload lặp n lần; một người hỏng làm gãy cả job |
+| 2 | `txt_path` | Base đính transcript của cuộc họp KHÁC |
+| 3 | `download_recording` | lỗi vĩnh viễn bị thử lại 5 lần rồi mất nguyên nhân |
+| 4 | **bất biến dry-run** | lệnh chẩn đoán ghi hỏng dữ liệu thật |
+| 5 | phân loại lỗi khi chạy thật | mất biên bản vì đếm nhầm loại lỗi |
+| 6 | `_recipients` | gửi cho người chưa cấp quyền; sót người đã cấp |
+| 7 | phân quyền hỏi đáp | rò biên bản người khác; `who=None` lộ dữ liệu |
+| 8 | vé phiên | mượn vé của người khác |
+| 9 | cảnh báo | spam tới mức bị tắt thông báo; hoặc im vĩnh viễn |
+| 10 | lọc người dự / người vào họp | gửi toàn văn cho người đã từ chối |
+| 11 | bóc JSON của LLM | mất `decisions`/`action_items` lặng lẽ |
+| 12 | mốc thời gian whisper | transcript mất mốc |
+| 13 | hạn task | hạn lùi một ngày, Lark trả `code=0` |
+| 14 | thẻ Lark | vượt giới hạn ký tự |
+| 15 | sao lưu | mất bản sao; ghi đè khóa Fernet cũ |
+| 16 | enroll | lưới kiểm scope không chạy ở đủ ba đường |
+| 17 | `gate` | cho người lạ vào; gửi link hỏng mà vẫn ghi đã mời |
+
+### Thêm phép kiểm mới
+
+Mỗi lần sửa một lỗi thật, thêm MỘT `check()` chặn đúng lỗi đó vào nhóm phù hợp.
+Đặt tên theo **hậu quả**, không theo tên hàm — `"who=None -> hàng đợi không lộ
+cả CON SỐ"` nói được vì sao nó tồn tại, `"test_pending_split_none"` thì không.
+
+---
+
+## 27. Vòng rà thứ hai — năm lỗi ở ba vùng chưa ai kiểm (02/08/2026)
+
+Ba vùng §26 tự nhận là chưa phủ: `status_push`, `scopecheck`, đường ghi Base.
+Đọc kỹ ba chỗ đó ra năm lỗi.
+
+### 27.1 Dashboard công khai đang lộ đường dẫn máy — và sắp lộ chỗ để khóa
+
+`…/api/status?json=1` **đọc được bằng GET, không cần xác thực** (đo: HTTP 200).
+`STATUS_VIEW_TOKEN` có trong `api/status.js` nhưng là **tuỳ chọn** và hiện chưa
+đặt, nên trang phơi: họ tên đầy đủ của mọi người đã enroll, mốc hết hạn token,
+số job theo trạng thái, và toàn bộ mảng `checks`.
+
+Mà `build_snapshot` nhét NGUYÊN `doctor.collect()` vào `checks` — trong khi
+`doctor` viết cho người ngồi trước máy nên nó in đường dẫn đầy đủ. Kết quả:
+
+- đã rò sẵn từ trước: `E:\whisper\run-server.bat`
+- và mục `_check_backup` thêm sáng nay sẽ đẩy nốt **đường dẫn file khóa Fernet
+  kèm tên người dùng Windows** — tức chỉ thẳng cho người lạ biết khóa giải mã
+  token nằm ở đâu.
+
+Điều này vi phạm chính docstring của module (`KHÔNG: … đường dẫn tuyệt đối`) —
+một luật chỉ tồn tại bằng lời dặn thì sẽ bị phá.
+
+**Vá:** `status_push.scrub()`, gọi cho mọi `label`/`detail` trước khi đẩy. Thay
+đường dẫn đã biết bằng nhãn, quét lưới cuối bằng regex `[A-Za-z]:\`, và xoá cả
+vân tay khóa (vô dụng với người xem từ xa). Đặt ở `status_push` chứ **không** ở
+`doctor`: doctor phải giữ đường dẫn đầy đủ để copy-paste, còn đây là bề mặt công
+khai. Lưới này chặn luôn mọi mục doctor thêm về sau.
+
+⚠️ **Còn một quyết định của người dùng, chưa làm:** đặt `STATUS_VIEW_TOKEN` trên
+Vercel để khoá trang lại. Chưa đặt thì họ tên nhân viên vẫn công khai với ai
+biết URL.
+
+```bash
+npx vercel env add STATUS_VIEW_TOKEN production
+```
+
+Đặt xong thì xem trang bằng `…/api/status?k=<token>`.
+
+### 27.2 `scopecheck` thiếu probe cho endpoint vừa thêm
+
+`vc_meeting_participants` (§23) không có trong `_checks()`. Luật của repo ghi rõ
+"thêm scope thì PHẢI thêm phép kiểm", và ở đây hậu quả đúng kiểu khó chẩn nhất:
+thiếu quyền thì danh sách người nhận **lặng lẽ** tụt về mỗi người được mời trên
+lịch — tức quay lại đúng lỗi "cuộc họp 30 người chỉ 1 người nhận" vừa vá.
+
+Đã thêm probe. Đo thật cho cả 3 người: `code=9499` (lỗi tham số) = đã qua cửa
+quyền, `vc:meeting:readonly` hiện có là đủ.
+
+### 27.3 `bitable._user_token` rơi xuống "người bất kỳ"
+
+Nó thử `owner_open_id` rồi rơi thẳng xuống **người enroll ĐẦU TIÊN** — có thể
+chẳng liên quan gì tới cuộc họp. Nhánh đó nay bị chạm thường xuyên hơn: từ khi
+`build_meta` tra ra CHỦ THẬT (§25), `owner_open_id` không còn luôn là người đã
+enroll. Nay dùng chung `pipeline._reader_candidates` (chủ → người dự → viewers).
+
+### 27.4 Hai lượt `process_queue` chồng nhau = phát biên bản HAI LẦN
+
+`ws_listener` chạy trong **thread nền** và gọi thẳng `process_queue()`, trong
+khi vòng `run()` ở thread chính cũng gọi. `try_claim_minute` chỉ khoá lúc TẠO
+job, không khoá lúc XỬ LÝ.
+
+Hôm nay chưa xảy ra vì sổ tay dặn đừng bật `run --ws` (lý do khác: tranh
+WebSocket với Hermes) — nhưng "đừng bật" là loại dặn dò sẽ bị quên, và hậu quả
+nhìn thấy ngay trong chat của mọi người. Nay có `orchestrator._queue_lock`, bỏ
+lượt chứ không xếp hàng.
+
+### 27.5 `v2\.env` có BOM — hôm nay vô hại, mai thì không
+
+Đo được: `v2\.env` bắt đầu bằng `\ufeff`. `config._load_dotenv` đọc bằng `utf-8`
+nên ký tự đó dính vào dòng đầu, làm dòng đó không còn bắt đầu bằng `#` và cũng
+không còn là tên biến đúng.
+
+Vô hại **chỉ vì** dòng đầu đang là comment. Ngày nào có người đưa một cấu hình
+thật lên dòng đầu thì nó bị bỏ qua lặng lẽ — và vì `LARK_APP_ID` có giá trị mặc
+định dán cứng trong `config.py`, triệu chứng sẽ là "V2 chạy bằng app khác" chứ
+không phải một lỗi đọc được. Với `PAUSED` (`reload_switches`) thì còn nặng hơn:
+công tắc dừng khẩn im lặng không ăn, đúng lúc người ta đang hoảng.
+
+**Vá:** đọc bằng `utf-8-sig` ở cả hai chỗ. Trên Windows thì
+`Out-File -Encoding utf8` của PowerShell 5.1 và Notepad đều ghi kèm BOM, nên
+đây là chuyện sẽ lặp lại chứ không phải tai nạn một lần.
+
+### ⚠️ Bài học công cụ: ĐỪNG sửa file tiếng Việt bằng PowerShell
+
+Trong lúc làm mục 27.4 tôi thêm một dòng `import` vào `v2\selftest.py` bằng
+`Get-Content | -replace | Set-Content` và **mã hoá hỏng toàn bộ file**:
+`Get-Content` không có `-Encoding` đọc theo ANSI, nên byte UTF-8 bị hiểu thành
+cp1252 rồi ghi lại thành UTF-8 — mã hoá KÉP. Không đảo ngược sạch được (một số
+ký tự không map lại nổi), phải `git checkout` rồi làm lại.
+
+Lỗi này còn tự che giấu: file vẫn `compile` bình thường vì mojibake là văn bản
+hợp lệ; chỉ lộ ra khi một phép so chuỗi tiếng Việt bỗng sai.
+
+Ba điều rút ra:
+1. Sửa file nguồn bằng công cụ ghi UTF-8 thẳng, đừng qua pipeline PowerShell.
+2. Script chẩn đoán mojibake phải viết bằng **`\u` escape thuần ASCII** — bản
+   đầu tôi viết ký tự thật, PowerShell làm hỏng chính script dò, và nó báo 14
+   file "hỏng" trong khi thật ra nó đang khớp với chữ "à" hợp lệ.
+3. Commit trước khi thử nghiệm là thứ đã cứu file này.
+
+---
+
+## 28. Ba lỗ "không ai được báo" đã vá (02/08/2026)
+
+Cùng một họ với §19 ("im lặng mất dữ liệu") nhưng ở tầng khác: ở đây dữ liệu
+không mất, chỉ là **không ai biết** — hoặc biết thì đã muộn. Cả ba đều tìm ra
+bằng cách đọc lại luồng, không phải do hỏng thật.
+
+### 28.1 Base là CỬA THỨ HAI, và nó đang mở rộng hơn mọi người tưởng
+
+Mọi phân quyền của V2 nằm ở code: `qa._may_see` (§20) cho đường hỏi đáp,
+`_recipients` (§24) cho đường phát. Cả hai gác **một** cửa. Cùng nội dung đó còn
+nằm trên Base — tóm tắt, quyết định, danh sách người dự, và cột `File transcript`
+là **attachment chứa nguyên văn** buổi họp. Ai mở được Base thì thấy hết, không
+đi qua dòng code nào.
+
+**Đo thật 02/08/2026** (`GET /open-apis/drive/v1/permissions/{token}/members` và
+`/drive/v2/permissions/{token}/public`, tenant token, **không cần scope thêm**):
+
+| Mục | Giá trị |
+|---|---|
+| Cộng tác viên tường minh | **1** — Nguyễn Tiến Thẩm (`full_access`) |
+| `link_share_entity` | **`tenant_readable`** — MỌI người trong công ty có link đều ĐỌC được |
+| `external_access_entity` | **`open`** — link còn chuyển được RA NGOÀI công ty |
+| `share_entity` | `anyone` — ai cầm link cũng chia sẻ tiếp được |
+
+Tức toàn bộ công sức §20 + §24 bị đi vòng qua bằng một cái link. Đây **không phải
+lỗi code** — nó là thiết lập Lark thủ công nằm ngoài repo mà chưa ai từng nhìn.
+
+**Đã làm:** `lark_api.drive_members()` + `drive_public()` (chỉ ĐỌC), và mục
+`doctor._check_base_access`. Bảng ánh xạ `doctor.LINK_SHARE`: `closed` → OK,
+`tenant_*` → WARN, `anyone_*` → FAIL, **giá trị lạ → WARN** (Lark thêm enum mới
+thì mặc định phải là "chưa biết", không phải "coi như an toàn").
+
+**USER CHỌN GIỮ NGUYÊN (02/08/2026).** Đã báo cáo đầy đủ số đo ở trên và đề nghị
+siết `link_share_entity` về `closed`; chủ hệ thống quyết định để nguyên. Nên dòng
+`[!] Base: ai có link cũng đọc được` trong `doctor` là **trạng thái đã biết và đã
+chấp nhận**, KHÔNG phải việc còn tồn. Đừng tự đóng nó, và đừng báo lại như một
+phát hiện mới.
+
+Nhưng nhớ ràng buộc kèm theo: **§20 + §24 chỉ còn là hàng rào cho đường BOT, không
+phải cho dữ liệu.** Ai có link Base là đọc được hết. Điều đó đổi ý nghĩa của vài
+việc khác:
+- Mời người mới dùng hệ thống không còn là "cho họ xem thêm" — họ vốn xem được
+  nếu có link. Cửa thật là ai biết link.
+- Nếu sau này có cuộc họp thuộc loại KHÔNG được để cả công ty đọc (lương, nhân
+  sự, kỷ luật), thì phải xử lý TRƯỚC khi nó vào Base — lọc ở `write_draft`, hoặc
+  tách Base riêng. Siết `qa.py` lúc đó là vô nghĩa.
+- Đổi ý thì: Lark UI của Base -> Chia sẻ -> đổi "Ai có link" về chỉ người được
+  mời, rồi thêm tay từng người. `doctor` sẽ tự chuyển dòng đó sang `[+]`.
+
+Vì sao doctor để `tenant_readable` ở mức WARN chứ không FAIL: FAIL trong doctor
+nghĩa là "hệ thống không chạy được" (mã thoát 1, cắm vào script giám sát). Đây là
+vấn đề chính sách, không phải vấn đề vận hành. `anyone_*` thì FAIL vì lúc đó nội
+dung đã ra khỏi công ty.
+
+### 28.2 Cảnh báo nằm BÊN TRONG thứ nó canh
+
+`alerts.check_all()` chỉ được gọi từ vòng `while True` của `orchestrator.run`.
+Nên **`run` chết là mọi cảnh báo chết theo** — đúng cái tính chất mà §17 sinh ra
+để chữa (dashboard cũng chỉ sống khi `run` sống). Không có gì canh vòng canh.
+
+Và nó gấp hơn "biết muộn vài giờ". **Đo 02/08/2026:** refresh token của Lark sống
+**7 NGÀY**, không phải 30 như mặc định trong `tokenstore._save_refreshed`, và nó
+**trượt** — được gia hạn mỗi lần `get_access_token` refresh, tức bởi chính vòng
+`run`:
+
+| enroll | updated_at | refresh_exp |
+|---|---|---|
+| 30/07 13:09 | 02/08 12:07 | 09/08 12:07 |
+| 31/07 16:15 | 02/08 12:08 | 09/08 12:08 |
+| 31/07 21:17 | 02/08 12:08 | 09/08 12:08 |
+
+Ba người enroll ba ngày khác nhau, cùng ra `updated_at + 7 ngày`. **`run` tắt quá
+7 ngày (nghỉ lễ, đổi máy, cài lại Windows) là MỌI người phải enroll lại** — mà
+cảnh báo "token sắp hết" cũng nằm trong `run`.
+
+**Đã làm:**
+- `alerts.note_run_alive()` + thread nền trong `orchestrator._start_heartbeat()`
+  ghi mốc mỗi **60s**. Là THREAD chứ không phải một dòng đầu vòng lặp: một vòng
+  có thể bận phiên âm hàng chục phút cho cuộc họp dài, lấy mốc đầu vòng làm chuẩn
+  thì báo động giả đúng lúc hệ thống làm việc chăm nhất.
+- `alerts._check_run_stale()` + `ALERT_RUN_STALE_MIN` (mặc định 30 phút, 0 = tắt).
+- `run-v2-alerts.bat` + Scheduled Task **`V2_Alerts`**, chạy `/SC MINUTE /MO 15`.
+  `install-autostart-v2.bat` nay đăng ký nó ở **cả hai** nhánh (Scheduled Task và
+  Startup folder) và báo trong `/trangthai`.
+
+Cùng một `check_all()` dùng cho cả hai đường: gọi từ trong `run` thì nhịp luôn
+tươi nên mục này không bao giờ kêu — đúng như vậy. Chạy chồng nhau không sinh DM
+trùng vì mốc chống spam ở bảng `alert_state` (WAL + `busy_timeout`), không ở RAM.
+
+⚠️ **Chấp nhận có ý thức:** đo TIẾN TRÌNH còn sống, không đo vòng lặp còn tiến.
+Tiến trình treo mà thread còn chạy thì mục này im. Bắt cả ca đó phải đo tiến độ
+hàng đợi — phức tạp hơn nhiều và chưa cần.
+
+⚠️ **`note_run_alive()` CHỈ `orchestrator.run` được gọi.** Ghi mốc đó từ
+`v2 alerts` hay `v2 process` là che mất đúng cái nó sinh ra để phát hiện.
+
+### 28.3 LLM chết 15 phút = mất tóm tắt VĨNH VIỄN
+
+Bất đối xứng còn sót lại sau §19. Whisper chết → job nằm `queued`, `attempts`
+không tăng, không mất gì, và có DM. LLM chết → `_recap_step` chỉ hoãn được
+`RECAP_MAX_TRIES` (3) vòng × `POLL_INTERVAL` (300s) rồi **chịu phát bản trần**.
+Sau đó job thành `delivered`, không vòng nào nhặt lại, `recap_fails` nằm ở trần
+vĩnh viễn, ô tóm tắt trên Base rỗng — tức **bot trả lời "cuộc họp này không có
+tóm tắt" mãi mãi dù transcript vẫn nằm nguyên trên đĩa**. Và không có cảnh báo
+nào cho LLM cả (§17 canh whisper / job failed / token).
+
+**Đã làm:**
+- `alerts._check_llm()` + `ALERT_LLM_AFTER_MIN` (15). Chỉ gọi thử với provider
+  **local** — cùng quy tắc với `doctor._check_llm`; hai chỗ lệch nhau thì doctor
+  báo xanh còn DM báo đỏ và không ai tin cái nào. Nội dung DM nói rõ khác biệt
+  với whisper ("job vẫn bị PHÁT ĐI với tóm tắt rỗng").
+- `summarize.PLACEHOLDER_PREFIX` + `is_placeholder()` — recap rỗng cũng tính là
+  giữ chỗ, để job cũ trước 31/07 cũng được vá.
+- `orchestrator._backfill_recaps()` chạy mỗi vòng thật, **trước** `_backfill_base`
+  (record mới tạo phải mang recap đã vá, không phải bản giữ chỗ vừa được thay).
+  Trần `BACKFILL_RECAPS_PER_ROUND = 2` để đợt LLM chết dài không nuốt cả vòng.
+- `bitable.update_recap()` — chỉ 3 ô nội dung + `Trạng thái`, **không** đụng ô
+  theo dõi: upload lại file là sinh `file_token` mới và bỏ bản cũ thành rác.
+
+⚠️ **CỐ Ý không gửi lại thẻ cho người dự.** Họ đã nhận biên bản kèm transcript
+rồi; thêm một thẻ nữa cho cùng cuộc họp là tin rác, và "phát" là hành động hướng
+ra ngoài nên không nên tự động lặp. Chỉ sửa thứ **đọc lại được**: recap trong DB
+và ô tóm tắt trên Base — đúng cái bot dùng để trả lời.
+
+⚠️ **Cái bẫy đắt nhất của việc này**, và có `check()` riêng chặn:
+`pipeline.run_recap` đặt `status='recapping'`, mà `process_queue` nhặt đúng
+status đó. Quên trả job về `delivered` sau khi vá là vòng sau **phát lại biên bản
+cho toàn bộ người dự**.
+
+### Kiểm
+
+```bash
+python -m v2 selftest          # nhóm 22-25, tổng 142 phép kiểm
+python -m v2 doctor            # hai dòng "Base: ..." là mục 28.1
+python -m v2 alerts --dry-run  # in cái sắp gửi, KHÔNG gửi, KHÔNG ghi mốc
+schtasks /Query /TN V2_Alerts  # phải "Ready" + có Next Run Time
+```
+
+Đã đo 02/08/2026: doctor bắt đúng `tenant_readable` trên Base thật; selftest
+142/0; `V2_Alerts` chạy thật, ghi `v2\data\logs\alerts-<ngày>.log` (log RIÊNG —
+khi `run` chết thì đó là file duy nhất còn mới).
+
+### Sau khi cập nhật PHẢI khởi động lại `run`
+
+Heartbeat, `_backfill_recaps` và hai cảnh báo mới nằm trong tiến trình `run`.
+Chưa restart thì trạng thái là: task `V2_Alerts` chạy nhưng `run_heartbeat` chưa
+bao giờ được ghi, nên `_check_run_stale` **im** (không có mốc thì không kết luận
+gì — fail-safe, không phải fail-noisy). Nhớ **luật 6** khi kill: liệt kê PID
+trước, đừng `Stop-Process` theo chuỗi rộng.

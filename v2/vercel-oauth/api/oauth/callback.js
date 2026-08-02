@@ -20,13 +20,15 @@ function esc(s) {
   }[c]));
 }
 
-/** Gửi vào hộp thư. Hỏng thì trả false — trang vẫn hiện code để dán tay. */
-async function toMailbox(code, state) {
+/** Gửi vào hộp thư. Hỏng thì trả false — trang vẫn hiện code để dán tay.
+ *  `fail` có giá trị khi Lark từ chối: khi đó không có `code`, ta gửi lý do về
+ *  để máy local biết CÓ người bấm mà hỏng, thay vì tưởng chưa ai bấm. */
+async function toMailbox(code, state, fail) {
   if (!process.env.BLOB_READ_WRITE_TOKEN) return false;
   try {
     await put(
       `${PREFIX}${Date.now()}.json`,
-      JSON.stringify({ code, state, at: Date.now() }),
+      JSON.stringify({ code, state, at: Date.now(), ...(fail ? { fail } : {}) }),
       {
         access: "public",
         contentType: "application/json; charset=utf-8",
@@ -47,11 +49,18 @@ export default async function handler(req, res) {
   res.setHeader("Referrer-Policy", "no-referrer");
 
   if (error) {
+    // Ghi lỗi vào hộp thư luôn. Trước đây nhánh này chỉ hiện trang rồi thôi,
+    // nên phía máy local MÙ HOÀN TOÀN: người dùng báo "bấm rồi mà lỗi" và
+    // không ai biết Lark từ chối vì cái gì. Đã trả giá 31/07/2026 — mất một
+    // vòng chẩn đoán chỉ để biết "code chưa từng về tới nơi".
+    // `enroll-poll` đọc thấy `error` thì in ra thay vì cố đổi token.
+    await toMailbox(null, state, { error, error_description });
     res.status(400).send(page(
       "Từ chối / lỗi",
       `<p>Lark trả lỗi: <b>${esc(error)}</b></p>
        <p>${esc(error_description || "")}</p>
-       <p>Bấm lại link enroll để thử lại.</p>`));
+       <p>Lỗi này đã được báo về cho quản trị viên. Bấm lại link enroll để thử
+          lại, hoặc gửi ảnh chụp trang này cho họ.</p>`));
     return;
   }
   if (!code || !state) {

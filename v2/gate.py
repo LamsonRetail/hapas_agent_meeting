@@ -8,9 +8,14 @@ của uv, V2 chạy Python 3.12 với bộ thư viện riêng — nhập chéo l
 thuộc. Tiến trình tách nhau, giao tiếp bằng JSON một dòng.
 
 Ba trạng thái trả về:
-    {"decision": "allow"}                  đã enroll -> cho vào agent
+    {"decision": "allow", "asker_token": ...}   đã enroll -> cho vào agent
     {"decision": "invite", ...}            chưa, vừa gửi link
     {"decision": "wait", ...}              chưa, link còn hiệu lực -> im lặng
+
+`asker_token` (thêm 31/07/2026): vé phiên buộc với union_id này. Plugin chèn nó
+vào tin nhắn để agent truyền lại qua tham số `asker_token` của tool MCP — đó là
+cách duy nhất `qa.py` biết ai đang hỏi, vì MCP server dùng chung một tiến trình
+cho cả tenant. Xem `v2/askers.py`.
 
 KHÔNG bao giờ trả "allow" khi không chắc: hàm này là cửa duy nhất (user chốt
 31/07/2026), nên nghi ngờ thì đóng.
@@ -69,8 +74,19 @@ def check(union_id: str, user_id: str = "", name: str = "",
 
     who = _enrolled(union_id)
     if who:
+        # Cấp vé TẠI ĐÂY: đây là chỗ duy nhất đã xác thực người gửi bằng dữ liệu
+        # của V2 (bảng `tokens`), nên cũng là chỗ duy nhất được phép nói "người
+        # này là ai". Cấp vé hỏng thì vẫn cho vào — tầng dữ liệu sẽ tự từ chối
+        # khi thiếu vé (fail-closed nằm ở `qa`, một chỗ), chứ không chặn ở đây
+        # rồi người ta không hiểu vì sao bot im.
+        tok = ""
+        try:
+            from . import askers
+            tok = askers.issue(union_id, who["open_id"], who["name"] or name)
+        except Exception as exc:              # noqa: BLE001 — xem trên
+            print(f"[gate] không cấp được vé phiên cho {union_id}: {exc}")
         return {"decision": "allow", "open_id": who["open_id"],
-                "name": who["name"]}
+                "name": who["name"], "asker_token": tok}
 
     inv = db.conn().execute(
         "SELECT nonce, sent_at, times FROM enroll_invites WHERE union_id=?",
@@ -86,6 +102,12 @@ def check(union_id: str, user_id: str = "", name: str = "",
                 "times": inv["times"]}
 
     link, nonce = oauth.start()          # open_id trống: chỉ ràng buộc bằng nonce
+    # Rút gọn TRƯỚC khi nhắn. Đây là đường người mới thực tế đi (nhắn bot ->
+    # nhận link), nên nó là chỗ link dài gây hại nhất: URL authorize ~3.800 ký
+    # tự dán vào tin nhắn Lark thì xuống dòng gãy link, và người nhận nhìn một
+    # chuỗi khổng lồ thì ngại bấm. Rút gọn hỏng (Vercel tắt) thì `short_link`
+    # trả "" và ta gửi link dài — vẫn chạy, chỉ xấu.
+    link = oauth.short_link(link) or link
     if send:
         try:
             lark_api.im_send_text(

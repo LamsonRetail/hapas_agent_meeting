@@ -36,10 +36,16 @@ from .models import MeetingMeta, Recap
 
 # Giá trị cột `Trạng thái` — về VIỆC PHÁT (xem docstring module).
 ST_SENT = "đã phát"          # ít nhất một người nhận được tóm tắt
-ST_FAILED = "phát hỏng"      # không ai nhận được (gửi hỏng, hoặc 0 người nhận)
+ST_FAILED = "phát hỏng"      # đã THỬ gửi mà không ai nhận được
 ST_NO_RECAP = "không có recap"   # có người nhận, nhưng tóm tắt rỗng
+# Thêm 02/08/2026 cùng luật "chỉ gửi cho người đã cấp quyền": không ai trong
+# cuộc họp đã enroll nên KHÔNG THỬ gửi cho ai. Tách khỏi `phát hỏng` vì hai cái
+# đòi hai hành động khác hẳn — `phát hỏng` là đi sửa lỗi kỹ thuật, còn cái này
+# là đi mời người ta cấp quyền. Gộp chung thì mỗi cuộc họp của phòng chưa dùng
+# hệ thống lại hiện lên như một sự cố.
+ST_NO_CONSENT = "chưa ai cấp quyền"
 
-STATUS_OPTIONS = [ST_SENT, ST_NO_RECAP, ST_FAILED]
+STATUS_OPTIONS = [ST_SENT, ST_NO_RECAP, ST_FAILED, ST_NO_CONSENT]
 
 # Tên field là KHÓA khi ghi record (base/v3 nhận map tên -> giá trị). Đổi tên
 # field trên UI Base = code ghi hỏng. Muốn đổi nhãn thì đổi cả hai chỗ.
@@ -161,13 +167,23 @@ def delivery_status(minute_token: str, recap: Recap | None = None) -> str:
     Thứ tự xét có chủ ý: "không ai nhận được" là câu hỏi cấp bách hơn "tóm tắt
     có rỗng không", nên nó xét trước.
 
-    0 người nhận cũng tính là `phát hỏng`: người dùng quan tâm "biên bản có tới
-    tay ai không", và câu trả lời ở đây là không — dù lý do là tra người dự ra
-    danh sách rỗng chứ không phải Lark từ chối.
+    Phân biệt "đã THỬ gửi mà hỏng" với "không có ai để gửi" (02/08/2026): dấu
+    hiệu là bảng `deliveries` KHÔNG có dòng nào cho cuộc họp này — tức chưa lần
+    nào chạm tới Lark, nên không thể là lỗi kỹ thuật. Từ khi có luật "chỉ gửi
+    cho người đã cấp quyền", lý do gần như luôn là chưa ai trong cuộc họp
+    enroll. Gộp hai cái vào `phát hỏng` thì mỗi cuộc họp của phòng chưa dùng hệ
+    thống lại hiện lên như một sự cố, và người ta thôi đọc cột này.
+
+    Suy luận đó chỉ đúng vì hàm này CHỈ được gọi cho job `delivered`
+    (`write_draft` từ `_deliver_now`, `retry_missing_records` lọc
+    `by_status("delivered")`, `sync_tracking` chỉ đụng record đã có). Job
+    `failed` cũng có 0 dòng `deliveries` nhưng vì lý do khác hẳn — nó không bao
+    giờ tới đây. Nếu sau này có ai cho job `failed` lên Base thì phải xét
+    `jobs.status` trước, đừng để nó nhận nhãn này.
     """
-    ok, _failed = jobstore.delivery_counts(minute_token, "recap")
+    ok, failed = jobstore.delivery_counts(minute_token, "recap")
     if ok == 0:
-        return ST_FAILED
+        return ST_FAILED if failed else ST_NO_CONSENT
     if recap is None:
         recap = _recap_from_db(minute_token)
     empty = recap is None or (not (recap.summary or "").strip()
@@ -211,6 +227,18 @@ def _ensure_fields_once() -> None:
         ensure_fields()
     except lark_api.LarkError as exc:
         print(f"[base] không kiểm được field ({exc}) — vẫn ghi record")
+    # Bộ option của cột select PHẢI kiểm ở đây nữa, không chỉ trong
+    # `sync_tracking` (thêm 02/08/2026). `ensure_fields` chỉ THÊM field còn
+    # thiếu, không đụng field đã có — nên khi `STATUS_OPTIONS` có thêm giá trị
+    # mới (`chưa ai cấp quyền`), Base vẫn giữ bộ 3 option cũ và record ĐẦU TIÊN
+    # dùng giá trị mới sẽ ghi hỏng. Đúng cái bẫy đã trả giá với `draft`/`final`,
+    # chỉ khác là lần này đường ghi tự động chạm vào trước khi ai kịp chạy
+    # `base-sync`. Ở đây CHỈ THÊM option (3 -> 4), không bỏ cái nào, nên không
+    # record nào mất ô — cảnh báo "gửi options là THAY THẾ" không áp dụng.
+    try:
+        ensure_status_options()
+    except lark_api.LarkError as exc:
+        print(f"[base] không kiểm được option cột {F_STATUS!r} ({exc})")
 
 
 def sync_tracking(only_token: str = "") -> int:
@@ -336,16 +364,23 @@ def _tracking_fields(meta: MeetingMeta, *,
 def _user_token(meta: MeetingMeta) -> str:
     """access_token của NGƯỜI DÙNG để upload attachment (xem base_media_upload).
 
-    Ưu tiên người đã enroll gắn với job; không có thì lấy người enroll đầu tiên.
-    Trả "" nếu không ai enroll — lúc đó upload sẽ thử bằng tenant token và
-    (với app này) sẽ hỏng, nhưng chỉ mất ô file chứ không mất record.
+    Thứ tự ưu tiên: chủ bản ghi -> người dự -> người đã enroll mà Lark báo có dự
+    -> bất kỳ ai đã enroll. Trả "" nếu không ai enroll — lúc đó upload sẽ thử
+    bằng tenant token và (với app này) sẽ hỏng, nhưng chỉ mất ô file chứ không
+    mất record.
+
+    Dùng chung danh sách ứng viên với `pipeline._reader_candidates` (sửa
+    02/08/2026). Trước đó chỉ thử `owner_open_id` rồi rơi thẳng xuống "người
+    enroll ĐẦU TIÊN bất kỳ" — một người có thể chẳng liên quan gì tới cuộc họp
+    này. Nhánh đó nay bị chạm thường xuyên hơn: từ khi `build_meta` tra ra CHỦ
+    THẬT (§25), `owner_open_id` không còn luôn là người đã enroll nữa.
     """
-    from . import tokenstore
-    try:
-        if meta.owner_open_id:
-            return tokenstore.get_access_token(meta.owner_open_id)
-    except Exception:                      # noqa: BLE001 - token hỏng/thu hồi
-        pass
+    from . import pipeline, tokenstore
+    for oid in pipeline._reader_candidates(meta):
+        try:
+            return tokenstore.get_access_token(oid)
+        except Exception:                  # noqa: BLE001 — chưa enroll/token hỏng
+            continue
     try:
         users = tokenstore.list_users(active_only=True)
         return tokenstore.get_access_token(users[0]["open_id"]) if users else ""
@@ -440,6 +475,80 @@ def write_draft(meta: MeetingMeta, recap: Recap, n_recipients: int) -> str:
                         bitable_record_id=rid)
     print(f"[base] đã ghi record ({fields[F_STATUS]}): {rid}")
     return rid
+
+
+def update_recap(minute_token: str, recap: Recap) -> bool:
+    """Đổ lại ba ô nội dung + `Trạng thái` cho record ĐÃ có. True nếu đã ghi.
+
+    Chỉ cho `orchestrator._backfill_recaps`: một cuộc họp lỡ phát với tóm tắt
+    rỗng (LLM chết quá `RECAP_MAX_TRIES` vòng) thì record trên Base cũng rỗng
+    theo, và Base chính là thứ bot đọc — nên tới khi ô này được vá thì người
+    dùng hỏi vẫn nhận được "không có tóm tắt", dù transcript vẫn còn nguyên.
+
+    KHÔNG đụng các ô theo dõi (`_tracking_fields`): file transcript đã upload
+    rồi, ghi lại là sinh `file_token` mới và bỏ bản cũ thành rác trong Base —
+    đúng cái bẫy `sync_tracking` đã phải chống.
+    """
+    if not enabled():
+        return False
+    row = jobstore.get(minute_token) or {}
+    rid = row.get("bitable_record_id")
+    if not rid:
+        return False                          # `retry_missing_records` lo ca này
+    vals = {
+        F_SUMMARY: (recap.summary or "").strip(),
+        F_DECISIONS: _bullets(recap.decisions),
+        F_ACTIONS: _action_lines(recap),
+        F_STATUS: delivery_status(minute_token, recap),
+    }
+    try:
+        lark_api.base_record_update(
+            config.BITABLE_APP_TOKEN, config.BITABLE_TABLE_ID, rid, vals)
+    except lark_api.LarkError as exc:
+        print(f"[base] cập nhật tóm tắt {minute_token} hỏng: {exc}")
+        return False
+    print(f"[base] đã cập nhật tóm tắt cho {minute_token} ({vals[F_STATUS]})")
+    return True
+
+
+def retry_missing_records() -> int:
+    """Ghi record cho job ĐÃ phát mà trên Base chưa có. Trả số record vừa tạo.
+
+    Vì sao phải có (sửa 31/07/2026): `write_draft` cố ý chỉ log rồi đi tiếp khi
+    ghi Base hỏng — biên bản đã tới tay người dự rồi, không được làm job
+    `failed`. Nhưng sau đó KHÔNG có đường vá nào, kể cả bằng tay: `sync_tracking`
+    bỏ qua mọi job không có `bitable_record_id` (nó chỉ đổ lại ô cho record đã
+    tồn tại), và không lệnh nào tạo record thiếu. Hậu quả: một cú mất mạng lúc
+    ghi Base là cuộc họp đó vĩnh viễn không lên Base, còn bot thì báo "CHƯA CÓ
+    BIÊN BẢN" mãi mãi (`qa.pending_meetings` xét đúng cột này) dù đã phát xong.
+
+    Gọi từ hai chỗ: cuối mỗi `process_queue` thật, và đầu `base-sync` (người
+    chạy tay cũng phải vá được, không chỉ vòng `run`).
+
+    Idempotent: `write_draft` tự tra Base theo `minute_token` trước khi tạo, nên
+    chạy lại nhiều lần không sinh record trùng.
+    """
+    if not enabled():
+        return 0
+    n = 0
+    for row in jobstore.by_status("delivered"):
+        if row.get("bitable_record_id"):
+            continue
+        token = row["minute_token"]
+        try:
+            meta = jobstore.meta_from_json(row["meta_json"])
+        except (ValueError, KeyError, TypeError) as exc:
+            print(f"[base] {token} meta_json méo, bỏ qua: {exc}")
+            continue
+        # Recap đọc từ DB; không có thì vẫn ghi record với recap rỗng —
+        # `delivery_status` sẽ tự cho ra `không có recap`, và có record trống
+        # còn hơn không có gì (bot mới thôi nói "chưa có biên bản").
+        recap = _recap_from_db(token) or Recap(summary="")
+        n_recip, _ = jobstore.delivery_counts(token, "recap")
+        print(f"[base] {token} đã phát mà CHƯA có record trên Base -> ghi lại")
+        if write_draft(meta, recap, n_recip):
+            n += 1
+    return n
 
 
 # `mark_final()` và lệnh `python -m v2 base-final` ĐÃ BỎ (31/07/2026, Việc 5b).

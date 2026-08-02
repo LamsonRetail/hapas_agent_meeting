@@ -377,7 +377,7 @@ lark-cli auth login --profile mine --domain all
 
 | Thứ | Giá trị |
 |---|---|
-| App "Agent meeting" (gửi tin) | `cli_aae288361ef89eed` |
+| App "Meeting Agent CĐS" (gửi tin) | `cli_aae288361ef89eed` |
 | App "AI Agent Assistant" (MCP team) | `cli_a9bd0ff8d6619ed1` |
 | Whisper server local | `http://localhost:8000` (`/docs` có UI thử API) |
 

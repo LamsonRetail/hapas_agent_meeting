@@ -407,6 +407,83 @@ def vc_meeting_recording(access_token: str, meeting_id: str) -> dict[str, Any]:
     return _check(resp, "vc_recording").get("data", {}).get("recording", {})
 
 
+def vc_meeting_participants(access_token: str, meeting_id: str,
+                            id_type: str = "union_id") -> list[dict[str, Any]]:
+    """Người THẬT SỰ vào phòng họp (khác hẳn với người được MỜI trên lịch).
+
+    Contract lấy từ `lark-cli vc meeting get --help` (02/08/2026): cờ
+    `--with-participants` trên `GET /open-apis/vc/v1/meetings/{meeting_id}`.
+    Cần `vc:meeting:readonly` ở danh tính NGƯỜI DÙNG — đã có trong
+    `OAUTH_SCOPES`, nhưng người enroll trước 02/08 phải enroll lại mới có.
+
+    Trả `[]` thay vì ném, có chủ ý: đây là bước LÀM GIÀU danh sách người nhận.
+    Thiếu quyền / cuộc họp quá cũ / API đổi hình dạng thì rơi về danh sách lịch
+    như trước, chứ không được làm gãy việc phát biên bản.
+    """
+    try:
+        resp = _http().get(
+            f"/open-apis/vc/v1/meetings/{meeting_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"with_participants": "true", "user_id_type": id_type},
+        )
+        meeting = (_check(resp, "vc_meeting_get").get("data", {})
+                   .get("meeting", {}))
+    except LarkError as exc:
+        print(f"[lark_api] không đọc được người dự VC của {meeting_id} ({exc})")
+        return []
+    return meeting.get("participants") or []
+
+
+# =====================================================================
+#  Task (USER token) — tạo việc cần làm từ nội dung cuộc họp
+# =====================================================================
+
+def task_create(access_token: str, summary: str, *,
+                description: str = "", due_ms: int | None = None,
+                all_day: bool = True,
+                assignee_open_id: str = "") -> dict[str, Any]:
+    """Tạo một Lark Task bằng danh tính NGƯỜI DÙNG. Trả object task.
+
+    Dùng user token chứ không phải tenant token có chủ ý: task hiện ra là do
+    CHÍNH người hỏi tạo, và bot không bao giờ làm được nhiều hơn quyền người đó
+    vốn có. Bot tạo task danh nghĩa app thì nó thành một thực thể có quyền riêng,
+    khó truy trách nhiệm khi nội dung task bắt nguồn từ transcript (không tin cậy).
+
+    `due_ms` là epoch MILI GIÂY, dạng chuỗi khi gửi đi. ĐO THẬT 01/08/2026 (sổ
+    tay §21) — cả ba điều dưới đây đều là bẫy im lặng, Lark trả `code=0` rồi lưu
+    sai chứ không báo lỗi:
+
+        gửi epoch GIÂY (1786726800)     -> Lark lưu 1728000000 = 04/10/2024 (!)
+        ms + is_all_day=True            -> Lark làm tròn về nửa đêm UTC, tức LÙI
+                                           một ngày khi xem ở giờ VN
+        ms nửa đêm UTC + is_all_day=True -> đúng ngày mong muốn
+
+    Nên caller phải tự quy ra **nửa đêm UTC của ngày muốn** khi `all_day=True`
+    (xem `tasks._parse_due`). Sai chỗ này là người ta trễ hạn mà không hiểu vì sao.
+
+    `client_token` chống tạo trùng khi mạng chập chờn và ta gọi lại.
+    """
+    body: dict[str, Any] = {
+        "summary": summary[:255],
+        "client_token": str(uuid.uuid4()),
+    }
+    if description:
+        body["description"] = description[:3000]
+    if due_ms:
+        body["due"] = {"timestamp": str(int(due_ms)), "is_all_day": all_day}
+    if assignee_open_id:
+        body["members"] = [{"id": assignee_open_id, "role": "assignee",
+                            "type": "user"}]
+    resp = _http().post(
+        "/open-apis/task/v2/tasks",
+        headers={"Authorization": f"Bearer {access_token}",
+                 "Content-Type": "application/json; charset=utf-8"},
+        params={"user_id_type": "open_id"},
+        json=body,
+    )
+    return _check(resp, "task_create").get("data", {}).get("task", {})
+
+
 # =====================================================================
 #  IM (tenant token / bot) — gửi tin, upload file
 # =====================================================================
@@ -741,6 +818,38 @@ def base_record_update(base_token: str, table_id: str, record_id: str,
         f"/records/{record_id}",
         headers=_im_headers(), json=fields)
     _check(resp, "base_record_update")
+
+
+def drive_members(token: str, doc_type: str = "bitable") -> list[dict[str, Any]]:
+    """Ai được thêm tường minh vào tài liệu này (cộng tác viên).
+
+    Đây mới là NỬA ĐẦU của câu "ai đọc được Base": nửa sau là `drive_public()`
+    (chia sẻ bằng link), và nửa sau mới là chỗ thường rộng hơn người ta tưởng.
+
+    Chạy bằng tenant token, KHÔNG cần scope thêm — đã đo 02/08/2026 trên Base
+    thật: `code=0`, trả đúng danh sách. Cùng họ endpoint với `drive_member_add`
+    vốn đã dùng được từ trước.
+    """
+    resp = _http().get(f"/open-apis/drive/v1/permissions/{token}/members",
+                       headers=_im_headers(), params={"type": doc_type})
+    data = _check(resp, "drive_members").get("data", {})
+    return list(data.get("items") or [])
+
+
+def drive_public(token: str, doc_type: str = "bitable") -> dict[str, Any]:
+    """Thiết lập chia sẻ bằng LINK của tài liệu này.
+
+    Khóa quan trọng nhất là `link_share_entity`: `closed` = chỉ cộng tác viên;
+    `tenant_*` = mọi người trong công ty có link; `anyone_*` = bất kỳ ai trên
+    Internet. Kèm `external_access_entity` (link có chuyển ra ngoài tenant được
+    không) và `share_entity` (ai được chia sẻ tiếp).
+
+    Dùng v2 chứ không v1: v1 trả thiếu `external_access_entity` trên tenant này.
+    """
+    resp = _http().get(f"/open-apis/drive/v2/permissions/{token}/public",
+                       headers=_im_headers(), params={"type": doc_type})
+    data = _check(resp, "drive_public").get("data", {})
+    return dict(data.get("permission_public") or {})
 
 
 def drive_member_add(token: str, doc_type: str, member_id: str,

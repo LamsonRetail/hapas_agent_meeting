@@ -8,6 +8,16 @@ Hook `pre_gateway_dispatch` chạy TRƯỚC cửa auth của Hermes (gateway/run
 nhận `MessageEvent`. Trả về:
     {"action": "skip", "reason": ...}   -> bỏ tin, agent không thấy
     {"action": "allow"}                 -> đi tiếp
+    {"action": "rewrite", "text": ...}  -> đổi nội dung tin rồi đi tiếp
+
+VÉ PHIÊN (thêm 31/07/2026): khi cho vào, V2 trả kèm `asker_token` — vé định danh
+người gửi. Plugin chèn nó vào ĐẦU tin bằng `rewrite` để agent truyền lại qua
+tham số `asker_token` của tool MCP. Đó là cách duy nhất `qa.py` biết ai đang hỏi:
+MCP server là MỘT tiến trình dùng chung cho cả tenant, Hermes spawn nó một lần
+với env tĩnh, nên lời gọi tool không mang danh tính. Xem `v2/askers.py`.
+
+Không có vé thì vẫn `allow`: cửa fail-closed nằm ở tầng dữ liệu của V2 (một chỗ
+duy nhất), không phải ở đây. Chặn ở đây nữa thì bot im mà không ai biết vì sao.
 
 Định danh: `SessionSource.user_id_alt` = union_id của Feishu (theo chính chú thích
 trong gateway/session.py) — đó cũng là khoá V2 lưu trong bảng `tokens`, nên khớp
@@ -80,7 +90,21 @@ def _on_pre_dispatch(**kwargs):
     if decision == "allow":
         logger.info("[v2-gate] cho vào: %s (%s)", name or user_id,
                     res.get("open_id", ""))
-        return {"action": "allow"}
+        token = (res.get("asker_token") or "").strip()
+        if not token:
+            # V2 không cấp được vé (lỗi DB?) -> vẫn cho vào, nhưng nói to: tầng
+            # dữ liệu sẽ từ chối và người dùng sẽ thấy bot "không nhận ra tôi".
+            logger.warning("[v2-gate] KHÔNG có asker_token cho %s — bot sẽ "
+                           "không đọc được biên bản của người này", union_id)
+            return {"action": "allow"}
+        text = getattr(event, "text", "") or ""
+        # Chèn ĐẦU tin, giữ nguyên phần người dùng gõ. Kèm một câu chỉ dẫn ngắn
+        # vì đây là thứ agent đọc như tin của người dùng: không nói rõ thì nó
+        # hoặc bỏ qua vé, hoặc nhắc lại vé cho người dùng xem (rác + lộ vé).
+        marker = (f"[V2-ASKER: {token}] (hệ thống chèn — truyền chuỗi này vào "
+                  f"tham số asker_token khi gọi tool meetings; đừng nhắc lại "
+                  f"với người dùng)\n")
+        return {"action": "rewrite", "text": marker + text}
 
     if decision == "invite":
         logger.info("[v2-gate] đã gửi link cấp quyền cho %s (%s)",

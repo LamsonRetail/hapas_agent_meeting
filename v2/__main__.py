@@ -83,19 +83,31 @@ def cmd_enroll(args) -> None:
         sys.exit(1)
 
 
-def cmd_enroll_url(_) -> None:
+def cmd_enroll_url(args) -> None:
     """In link OAuth rồi thoát. Dùng khi redirect về Vercel (không mở server
-    local). Người dùng bấm link -> Vercel hiện code+state -> admin chạy
-    `complete`. Nonce sống theo NONCE_TTL (mặc định 10 phút)."""
+    local). Người dùng bấm link -> Vercel giữ code -> vòng `run` tự kéo về
+    (enroll-poll), hoặc admin chạy `complete` bằng tay."""
     _init()
     if not config.OAUTH_REDIRECT_URI:
         print("Chưa đặt OAUTH_REDIRECT_URI (URL Vercel).", file=sys.stderr)
         sys.exit(1)
     url, nonce = oauth.start()
-    print("Gửi link này cho người cần enroll (hết hạn sau ~10 phút):\n")
-    print(url)
+    # Đọc TTL thật từ config, đừng dán cứng: từ 31/07/2026 nonce sống 24h
+    # (§14) chứ không phải 10 phút như bản đầu — in sai làm người ta tưởng
+    # link đã chết và đi xin link mới.
+    hours = config.OAUTH_NONCE_TTL / 3600
+    han = f"~{hours:.0f} giờ" if hours >= 1 else f"~{config.OAUTH_NONCE_TTL // 60} phút"
+
+    short = oauth.short_link(url) if not args.long else ""
+    print(f"Gửi link này cho người cần enroll (hết hạn sau {han}):\n")
+    print(short or url)
+    if short:
+        print(f"\n(link đầy đủ {len(url)} ký tự, đã rút gọn qua chính Vercel của "
+              f"dự án — không qua bên thứ ba. Dùng --long để lấy bản đầy đủ.)")
     print(f"\nstate (nonce) = {nonce}")
-    print("Sau khi họ bấm Đồng ý, lấy code+state từ trang Vercel rồi chạy:")
+    print("Họ bấm Đồng ý là xong: vòng `run` tự kéo code về mỗi vòng quét.")
+    print("Muốn ngay: python -m v2 enroll-poll")
+    print("Hộp thư Vercel tắt thì dán tay:")
     print(f"  python -m v2 complete --code <CODE> --state {nonce}")
 
 
@@ -135,6 +147,12 @@ def cmd_gate(args) -> None:
 def cmd_base_sync(args) -> None:
     _init()
     from . import bitable
+    # TẠO record thiếu trước khi đổ lại ô: `sync_tracking` chỉ sửa record đã có,
+    # nên job phát xong mà ghi Base hỏng thì nó bỏ qua vĩnh viễn (xem
+    # bitable.retry_missing_records). Đây là đường vá bằng tay của người vận hành.
+    created = bitable.retry_missing_records()
+    if created:
+        print(f"Đã tạo {created} record còn thiếu (job đã phát mà Base chưa có).")
     n = bitable.sync_tracking(args.token)
     print(f"Xong: {n} record đã cập nhật ô theo dõi.")
 
@@ -160,6 +178,19 @@ def cmd_invites(_) -> None:
                              time.localtime((r["sent_at"] or 0) / 1000))
         print(f"  {r['name'] or '(chưa rõ tên)':40s} {r['union_id']}  "
               f"mời {r['times']} lần, lần cuối {when}")
+
+
+def cmd_scopes(args) -> None:
+    """Quét toàn bộ bề mặt user-token, cho từng người đã enroll.
+
+    Thay cho cách cũ "chờ nó cắn rồi vá": scope thiếu là lỗi im lặng và trễ,
+    chỉ những đường ĐÃ chạy mới lộ ra. Xem docstring v2/scopecheck.py.
+    """
+    _init()
+    from . import scopecheck
+    if args.print_all or args.everything:
+        sys.exit(scopecheck.print_all_scopes(everything=args.everything))
+    sys.exit(scopecheck.run(args.open_id))
 
 
 def cmd_users(_) -> None:
@@ -327,15 +358,70 @@ def cmd_base_init(_) -> None:
     print(bitable.setup_commands())
 
 
+def cmd_selftest(_) -> None:
+    """Tự kiểm hành vi code. KHÔNG gọi `_init()`: xem docstring `selftest.run`
+    — nó chạy lại chính nó trong tiến trình con với `V2_DB_PATH` trỏ vào DB tạm,
+    và `_init()` ở đây sẽ mở DB THẬT trước khi kịp làm việc đó."""
+    from . import selftest
+    sys.exit(selftest.run())
+
+
+def cmd_backup(args) -> None:
+    """Sao lưu ngay, hoặc liệt kê các bản đã có.
+
+    Chạy tay được nhưng KHÔNG phải cách dùng chính: vòng `run` tự gọi
+    `backup.maybe_backup()` mỗi vòng. Lệnh này để (a) tạo bản đầu tiên ngay lập
+    tức thay vì chờ tới hạn, (b) kiểm trước khi làm gì nguy hiểm với DB.
+    """
+    _init()
+    from . import backup
+    files = backup.snapshots()
+    if args.list:
+        print(f"Thư mục: {config.BACKUP_DIR}")
+        print(f"Khóa Fernet: {config.KEY_BACKUP_PATH} "
+              f"({'có' if config.KEY_BACKUP_PATH.exists() else 'CHƯA CÓ'}, "
+              f"vân tay {backup.key_fingerprint()})")
+        if not files:
+            print("  (chưa có bản nào — chạy `python -m v2 backup`)")
+            return
+        now = time.time()
+        for p in files:
+            st = p.stat()
+            print(f"  {p.name:<28} {st.st_size/1_048_576:6.1f} MB   "
+                  f"{(now - st.st_mtime)/3600:7.1f}h trước")
+        return
+    dest = backup.run_backup()
+    sys.exit(0 if dest else 1)
+
+
 def cmd_ask(args) -> None:
     """Hỏi đáp ở terminal — thử được cả đường dữ liệu lẫn backend mà KHÔNG cần
-    app Lark thứ hai."""
+    app Lark thứ hai.
+
+    `--as <union_id|open_id>` để hỏi BẰNG DANH TÍNH của một người đã enroll: đây
+    là cách duy nhất kiểm được bộ lọc phân quyền (§20) mà không cần hai tài khoản
+    Lark. Không có cờ thì xem bằng quyền admin — nói TO điều đó, vì kết quả lúc
+    ấy khác hẳn cái người dùng thật sẽ thấy.
+    """
     _init()
-    from . import qa
+    from . import askers, qa
+    if args.as_who:
+        who = askers.find_enrolled(args.as_who)
+        if not who:
+            print(f"Không thấy ai đã enroll có id '{args.as_who}'. "
+                  f"Xem: python -m v2 users", file=sys.stderr)
+            sys.exit(1)
+        print(f"[hỏi bằng danh tính] {who['name']}"
+              f"{' (là admin, thấy hết)' if who['admin'] else ''}\n")
+    else:
+        who = askers.admin_view("(CLI, quyền admin)")
+        print("[!] Không có --as: đang xem bằng QUYỀN ADMIN, thấy hết mọi cuộc "
+              "họp.\n    Người dùng thật chỉ thấy cuộc họp họ có dự — thử bằng "
+              "`--as <union_id>`.\n")
     if args.show_context:
-        print(qa.context())
+        print(qa.context(who))
         print("-" * 60)
-    print(qa.answer(" ".join(args.question)))
+    print(qa.answer(who, " ".join(args.question)))
 
 
 def cmd_mcp(_) -> None:
@@ -375,7 +461,10 @@ def main() -> None:
     e.add_argument("--timeout", type=int, default=600)
     e.set_defaults(fn=cmd_enroll)
 
-    sub.add_parser("enroll-url").set_defaults(fn=cmd_enroll_url)
+    eu = sub.add_parser("enroll-url", help="in link enroll (mặc định: rút gọn)")
+    eu.add_argument("--long", action="store_true",
+                    help="in URL authorize đầy đủ thay vì link rút gọn")
+    eu.set_defaults(fn=cmd_enroll_url)
 
     c = sub.add_parser("complete")
     c.add_argument("--code", required=True)
@@ -404,6 +493,17 @@ def main() -> None:
 
     sub.add_parser("users", help="bảng người đã enroll (kể cả đã thu hồi)")\
        .set_defaults(fn=cmd_users)
+
+    sc = sub.add_parser("scopes",
+                        help="quét: mỗi người đã enroll có ĐỦ quyền V2 cần chưa")
+    sc.add_argument("--open-id", default="", help="chỉ kiểm một người")
+    sc.add_argument("--print-all", action="store_true",
+                    help="in dòng OAUTH_SCOPES theo các HỌ scope V2 dùng, kèm "
+                         "đo độ dài URL authorize (dán vào v2/.env)")
+    sc.add_argument("--everything", action="store_true",
+                    help="lấy TẤT CẢ scope Console duyệt — hiện vượt trần độ "
+                         "dài URL, lệnh sẽ báo hỏng")
+    sc.set_defaults(fn=cmd_scopes)
 
     rv = sub.add_parser("revoke", help="thu hồi quyền của một người")
     who = rv.add_mutually_exclusive_group(required=True)
@@ -446,11 +546,25 @@ def main() -> None:
                         help="in lệnh tạo Base 'nội dung đã chốt' + tự kiểm")
     bi.set_defaults(fn=cmd_base_init)
 
+    sub.add_parser("selftest",
+                   help="tự kiểm hành vi code trên DB tạm (không mạng, không "
+                        "đụng state.db thật)").set_defaults(fn=cmd_selftest)
+
+    bk = sub.add_parser("backup",
+                        help="sao lưu state.db + khóa Fernet (vòng `run` tự "
+                             "chạy mỗi V2_BACKUP_EVERY_HOURS giờ)")
+    bk.add_argument("--list", action="store_true",
+                    help="chỉ liệt kê các bản đã có, không tạo bản mới")
+    bk.set_defaults(fn=cmd_backup)
+
     sub.add_parser("mcp", help="MCP server dữ liệu họp (Hermes gọi vào)"
                    ).set_defaults(fn=cmd_mcp)
 
     q = sub.add_parser("ask", help="hỏi đáp về các cuộc họp ở terminal")
     q.add_argument("question", nargs="+")
+    q.add_argument("--as", dest="as_who", default="",
+                   help="hỏi bằng danh tính một người đã enroll (union_id hoặc "
+                        "open_id) — để kiểm bộ lọc phân quyền")
     q.add_argument("--show-context", action="store_true",
                    help="in cả dữ liệu Base đưa vào prompt")
     q.set_defaults(fn=cmd_ask)

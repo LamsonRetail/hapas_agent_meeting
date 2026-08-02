@@ -6,7 +6,7 @@ REM  Lark event listener - nghe event qua persistent connection
 REM  Chay SONG SONG voi run-meeting-note.bat
 REM ============================================================
 
-REM --- App "Agent meeting" (app moi, dung rieng cho event)
+REM --- App "Meeting Agent CDS" (app moi, dung rieng cho event)
 set EVENT_APP_ID=cli_aae288361ef89eed
 set EVENT_APP_SECRET=
 

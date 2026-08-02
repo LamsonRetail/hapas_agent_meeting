@@ -76,6 +76,12 @@ export default async function handler(req, res) {
         const item = await r.json();
         if (item && item.code && item.state) {
           pending.push({ code: item.code, state: item.state, at: item.at || null });
+        } else if (item && item.fail) {
+          // Lark từ chối ở bước Đồng ý. Không có code để đổi, nhưng máy local
+          // PHẢI biết là có người đã bấm mà hỏng — im lặng ở đây nghĩa là
+          // "tưởng chưa ai bấm", và đó là một vòng chẩn đoán bị mất.
+          pending.push({ fail: item.fail, state: item.state || null,
+                         at: item.at || null });
         }
       }
     } catch { /* bỏ qua cái đọc hỏng, vẫn xoá để không tắc hộp thư */ }

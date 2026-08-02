@@ -15,7 +15,7 @@ CÁCH HOẠT ĐỘNG
 CHUẨN BỊ
     pip install lark-oapi
 
-    Đặt biến môi trường (app "Agent meeting"):
+    Đặt biến môi trường (app "Meeting Agent CĐS"):
         set EVENT_APP_ID=cli_aae288361ef89eed
         set EVENT_APP_SECRET=<secret cua app do>
 

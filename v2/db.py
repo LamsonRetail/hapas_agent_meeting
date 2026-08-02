@@ -52,6 +52,31 @@ CREATE TABLE IF NOT EXISTS minutes_seen (
     first_seen_at INTEGER
 );
 
+-- Ai (trong số người ĐÃ ENROLL) nhìn thấy minute này trong `minutes/search`
+-- của chính họ. Thêm 02/08/2026 cho luật "chỉ gửi cho người đã cấp quyền".
+--
+-- Vì sao đây là nguồn người nhận TỐT NHẤT, tốt hơn cả danh sách lịch:
+-- `minutes_list` gọi với `participant_ids:[open_id]`, tức chính LARK khẳng định
+-- người này có tham dự. Nó không phụ thuộc cuộc họp có được đặt qua Calendar
+-- không, có mời từng người hay mời bằng group chat, hay có khớp được tên/giờ
+-- không — đó đúng là bốn chỗ mà chuỗi tra người dự hay sót.
+--
+-- Và nó cho một BẤT BIẾN dễ kiểm: một minute chỉ vào được hệ thống qua vòng
+-- quét của một người vừa tham dự vừa đã cấp quyền, nên người đó LUÔN có mặt ở
+-- đây. Tức "phát mà không ai nhận" gần như không xảy ra được nữa.
+--
+-- Ghi cho MỌI người thấy nó, mỗi vòng quét, KỂ CẢ khi minute đã bị chiếm khóa:
+-- người thứ hai thấy cùng cuộc họp không tạo job thứ hai (minutes_lock lo việc
+-- đó) nhưng vẫn phải được ghi nhận là người nhận.
+CREATE TABLE IF NOT EXISTS minute_viewers (
+    minute_token TEXT NOT NULL,
+    open_id      TEXT NOT NULL,
+    union_id     TEXT,
+    name         TEXT,
+    seen_at      INTEGER,
+    PRIMARY KEY (minute_token, open_id)
+);
+
 -- Nonce OAuth một lần dùng (state trong authorize URL). TTL ngắn.
 CREATE TABLE IF NOT EXISTS oauth_nonce (
     nonce       TEXT PRIMARY KEY,
@@ -70,6 +95,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     meta_json    TEXT,               -- MeetingMeta serialize
     status       TEXT DEFAULT 'detected',
     attempts     INTEGER DEFAULT 0,
+    recap_fails  INTEGER DEFAULT 0,   -- số lần gọi LLM hỏng LIÊN TIẾP (đếm riêng
+                                      -- khỏi attempts: lỗi hạ tầng không tiêu quota)
     error        TEXT,
     transcript_path TEXT,
     recap_json   TEXT,
@@ -108,6 +135,18 @@ CREATE TABLE IF NOT EXISTS alert_state (
     key        TEXT PRIMARY KEY,
     value      TEXT,
     updated_at INTEGER
+);
+
+-- "Vé phiên" của người đang hỏi bot (v2/askers.py). Vì sao phải có bảng thay vì
+-- truyền thẳng union_id: MCP server là MỘT tiến trình dùng chung, lời gọi tool
+-- không mang danh tính, nên vé đi đường vòng qua tin nhắn (plugin Hermes chèn) và
+-- V2 phải tra lại được vé đó. Ngẫu nhiên + hết hạn = người khác không mượn được.
+CREATE TABLE IF NOT EXISTS qa_sessions (
+    token      TEXT PRIMARY KEY,
+    union_id   TEXT,
+    open_id    TEXT,
+    name       TEXT,
+    expires_at INTEGER
 );
 
 -- Ghi từng lần gửi để truy 'ai nhận gì, lúc nào'.
@@ -173,7 +212,8 @@ def _migrate() -> None:
                   f"(cửa duyệt đã bỏ)")
 
         have = {r["name"] for r in c.execute("PRAGMA table_info(jobs)")}
-        for col, decl in (("bitable_record_id", "TEXT"),):
+        for col, decl in (("bitable_record_id", "TEXT"),
+                          ("recap_fails", "INTEGER DEFAULT 0")):
             if col not in have:
                 c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
                 print(f"[db] thêm cột jobs.{col}")
@@ -237,6 +277,48 @@ def clear_seen(minute_token: str) -> None:
     with tx() as c:
         c.execute("DELETE FROM minutes_seen WHERE minute_token=?",
                   (minute_token,))
+
+
+def note_viewer(minute_token: str, open_id: str, union_id: str = "",
+                name: str = "") -> None:
+    """Ghi nhận: người đã enroll này nhìn thấy minute đó trong Minutes của họ.
+
+    Idempotent (`INSERT OR IGNORE` trên khóa kép) — gọi mỗi vòng quét là bình
+    thường. Giữ `seen_at` của LẦN ĐẦU, không cập nhật: nó trả lời "từ bao giờ ta
+    biết người này có dự", câu hỏi hữu ích khi truy vì sao ai đó nhận/không nhận.
+    """
+    if not minute_token or not open_id:
+        return
+    with tx() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO minute_viewers"
+            "(minute_token, open_id, union_id, name, seen_at) VALUES (?,?,?,?,?)",
+            (minute_token, open_id, union_id, name, _now_ms()),
+        )
+
+
+def viewers_of(minute_token: str) -> list[dict]:
+    """Người đã enroll mà Lark báo là có dự cuộc họp này (thứ tự thấy trước)."""
+    rows = conn().execute(
+        "SELECT open_id, union_id, name, seen_at FROM minute_viewers "
+        "WHERE minute_token=? ORDER BY seen_at", (minute_token,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def viewers_all() -> dict[str, list[dict]]:
+    """Như `viewers_of` nhưng cho MỌI minute, trong MỘT lời gọi.
+
+    Có riêng hàm này vì `qa.viewers_index()` lặp qua toàn bộ `jobs`, và nó chạy
+    HAI lần cho mỗi câu hỏi của bot (`_only_visible` và `pending_split` đều dựng
+    lại chỉ mục). Gọi `viewers_of` trong vòng lặp là N+1 query — 5 cuộc họp thì
+    không thấy gì, 500 cuộc là 2.000 query cho một tin nhắn.
+    """
+    out: dict[str, list[dict]] = {}
+    for r in conn().execute(
+            "SELECT minute_token, open_id, union_id, name, seen_at "
+            "FROM minute_viewers ORDER BY seen_at").fetchall():
+        out.setdefault(r["minute_token"], []).append(dict(r))
+    return out
 
 
 def is_claimed(minute_token: str) -> bool:

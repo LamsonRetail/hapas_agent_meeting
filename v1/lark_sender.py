@@ -3,7 +3,7 @@
 Gửi tin nhắn Lark bằng app riêng (không qua lark-cli).
 
 lark-cli chỉ gắn được một app, mà app đó là của anh Thiện. Muốn gửi
-bằng app "Agent meeting" của mình thì phải gọi API trực tiếp.
+bằng app "Meeting Agent CĐS" của mình thì phải gọi API trực tiếp.
 
 Phần ĐỌC dữ liệu vẫn qua lark-cli với user token, không đụng tới.
 

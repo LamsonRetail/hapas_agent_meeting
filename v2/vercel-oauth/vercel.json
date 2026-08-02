@@ -2,6 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     { "source": "/oauth/callback", "destination": "/api/oauth/callback" },
+    { "source": "/e/:code", "destination": "/api/enroll-link?c=:code" },
     { "source": "/", "destination": "/api/status" },
     { "source": "/status", "destination": "/api/status" }
   ]

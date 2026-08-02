@@ -23,10 +23,68 @@ chỉ in cảnh báo.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from . import config, jobstore, tokenstore
+
+# Đường dẫn ổ đĩa Windows, cắt tới khoảng trắng đầu tiên. Lưới CUỐI cho những
+# đường dẫn chưa có trong `_known_paths()`.
+_ABS_PATH = re.compile(r"[A-Za-z]:\\[^\s]*")
+
+
+def _known_paths() -> list[tuple[str, str]]:
+    """(đường dẫn thật, chuỗi thay thế) — dài trước, để cái ngắn không nuốt cái dài."""
+    pairs = [
+        (str(config.KEY_BACKUP_PATH), "<khóa Fernet, để ngoài repo>"),
+        (str(config.BACKUP_DIR), "<thư mục sao lưu>"),
+        (str(config.DB_PATH), "<state.db>"),
+        (str(config.TRANSCRIPT_DIR), "<transcripts>"),
+        (str(config.WORK_DIR), "<work>"),
+        (str(config.DATA_DIR), "<data>"),
+        (str(Path.home()), "~"),
+    ]
+    return sorted([p for p in pairs if p[0]], key=lambda kv: -len(kv[0]))
+
+
+def scrub(text: str) -> str:
+    """Bỏ đường dẫn tuyệt đối khỏi chuỗi TRƯỚC khi đẩy lên dashboard.
+
+    Vì sao phải cưỡng chế bằng code chứ không bằng lời dặn ở docstring module
+    (thêm 02/08/2026): `build_snapshot` nhét NGUYÊN kết quả `doctor.collect()`
+    vào snapshot, mà `doctor` là công cụ cho người ngồi trước máy nên nó in
+    đường dẫn đầy đủ — rất đúng ở terminal, rất sai trên một trang web.
+
+    Đã rò thật, đo được trên `…/api/status?json=1` (GET, **không cần xác thực**):
+      - có sẵn từ trước: `E:\\whisper\\run-server.bat` (gợi ý sửa lỗi whisper)
+      - và mục `_check_backup` mới thêm hôm nay sẽ đẩy nốt đường dẫn file khóa
+        Fernet, KÈM tên người dùng Windows — tức chỉ thẳng cho người lạ biết
+        khóa giải mã token nằm ở đâu.
+
+    Đặt ở `status_push` chứ không ở `doctor` có chủ ý: `doctor` phải giữ đường
+    dẫn đầy đủ (người vận hành cần copy-paste), còn đây là bề mặt CÔNG KHAI nên
+    đây là chỗ đúng để siết. Lưới này cũng chặn luôn mọi mục `doctor` thêm về
+    sau, không phải nhớ sửa hai nơi.
+    """
+    if not text:
+        return text
+    for real, mask in _known_paths():
+        if real in text:
+            text = text.replace(real, mask)
+    text = _ABS_PATH.sub("<đường dẫn cục bộ>", text)
+
+    # Vân tay khóa Fernet: có ích cho người ngồi trước máy (đối chiếu bản sao
+    # với khóa nào), VÔ DỤNG với người xem từ xa. Không phải lỗ hổng — 16 ký tự
+    # đầu của SHA-256 không lần ngược ra khóa — nhưng thứ không có lý do gì để
+    # ở trên trang công khai thì đừng để nó ở đó.
+    if config.FERNET_KEY:
+        from . import backup
+        fp = backup.key_fingerprint()
+        if fp and fp != "(trống)":
+            text = text.replace(fp, "…")
+    return text
 
 # v2 (31/07/2026): thêm `pushed_by` — xem build_snapshot.
 SNAPSHOT_VERSION = 2
@@ -108,8 +166,11 @@ def build_snapshot(next_scan_at_ms: int | None = None,
         # Dùng đúng bộ kiểm tra của `doctor` để dashboard không lệch với CLI.
         from . import doctor
         report = doctor.collect()
+        # `scrub` BẮT BUỘC ở đây: doctor in đường dẫn đầy đủ cho người ngồi
+        # trước máy, còn trang này ai cũng GET được (đo 02/08: HTTP 200, không
+        # cần xác thực). Xem docstring `scrub`.
         snap["checks"] = [
-            {"level": lvl, "label": label, "detail": detail}
+            {"level": lvl, "label": scrub(label), "detail": scrub(detail)}
             for lvl, label, detail in report.rows
         ]
         snap["verdict"] = report.worst()
