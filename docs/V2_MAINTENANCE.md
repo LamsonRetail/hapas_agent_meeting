@@ -2952,6 +2952,18 @@ khuôn với `retry_missing_records`: chỉ gửi cho người **chưa lần nà
 `BACKFILL_DELIVERIES_PER_ROUND=2` job mỗi vòng. Hết lượt thì **nói to** trong
 log — 230013 (app chưa phát hành cho người đó) không tự khỏi.
 
+**Nửa còn lại của cùng lỗ, vá ngay sau đó:** bản trên chỉ tra `kind="recap"`,
+nên người **nhận được thẻ mà file hỏng** (429 lúc gửi transcript) vẫn không ai
+thử lại — `pending_recipients` loại họ ra vì thẻ đã `ok=1`. Đây đúng là ca có
+thật trong DB (`obsg22ct…`). Không gọi lại `deliver` được: nó luôn gửi thẻ
+trước, nên người ta nhận **thẻ trùng**. Nay có `pipeline.deliver_file` (gửi
+riêng file, dùng lại `uuid_key` cũ nên Lark tự khử trùng) +
+`jobstore.pending_file_recipients` — điều kiện `MAX(...)` bắt CẢ ca "không có
+dòng `full` nào", vì dữ liệu trước 02/08 không ghi dòng nào để đếm.
+
+Transcript rỗng thì `deliver_file` **không ghi lần thử nào**: thử lại một thứ
+không tồn tại chỉ làm `deliveries` nói dối là đã cố.
+
 ### 31.5 `event_attendees` cắt im lặng ở người thứ 100
 
 Gửi `page_size=100` rồi lấy trang đầu và thôi, không đọc `has_more`/`page_token`.
@@ -2985,10 +2997,32 @@ tới đúng ngày nó không trùng.
 token của người thứ nhất bay thẳng ra khỏi vòng `for u in users` — hai người còn
 lại không được quét gì trong vòng đó. Nay bắt cả `Exception` cho từng người.
 
+### 31.8 `selftest` đã GỌI MẠNG THẬT — và giờ không thể nữa
+
+Lỗi này lộ ra ngay khi viết nhóm 32: tôi stub `pipeline.deliver` mà quên
+`pipeline.deliver_file`, nên hàm THẬT chạy giữa lượt selftest và gọi
+`im_send_file` tới Lark thật. Chứng cứ nằm trong chính output:
+
+```
+[deliver] gửi bù transcript cho on_OK hỏng: im_send lỗi 99992364: ...
+```
+
+Lần đó vô hại vì `on_OK` là union_id bịa. **Trùng một id thật là gửi tin thật
+cho người thật, từ trong một lệnh mà cả sổ tay lẫn docstring đều hứa là "không
+gọi mạng".**
+
+Luật 2 ở đầu `selftest.py` chỉ là một câu trong docstring — không chặn được gì.
+Nay `lark_api._http` bị thay bằng hàm **ném `AssertionError`** ngay đầu lượt
+chạy: mọi lời gọi HTTP của `lark_api` đều đi qua đó, nên quên stub một hàm giờ
+thành FAIL ngay dòng đó. Nhóm 34 kiểm ở CUỐI lượt rằng lưới vẫn còn nguyên —
+nhiều nhóm lưu-rồi-trả-lại thuộc tính của `lark_api`, trả nhầm `_http` là lưới
+biến mất trong im lặng.
+
 ### Kết quả
 
-`selftest` **180 → 201**. Nhóm mới: 31 (`.bat`), 32 (gửi bù), 33 (token chập);
-nhóm 10 thêm 2 phép kiểm ghép cặp; nhóm 4/5 thêm `EmptyTranscript`.
+`selftest` **180 → 213**. Nhóm mới: 31 (`.bat`), 32 (gửi bù, cả hai nửa),
+33 (token chập), 34 (lưới chặn mạng); nhóm 10 thêm 2 phép kiểm ghép cặp;
+nhóm 4/5 thêm `EmptyTranscript`.
 
 ### Một điều tra ra mà KHÔNG phải lỗi: `file_key` dùng lại ĐÃ chạy thật
 

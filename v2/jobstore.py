@@ -218,6 +218,32 @@ def pending_recipients(minute_token: str, kind: str = "recap",
     return [r["recipient"] for r in rows]
 
 
+def pending_file_recipients(minute_token: str,
+                            max_tries: int = 3) -> list[str]:
+    """Người ĐÃ nhận được thẻ tóm tắt nhưng CHƯA lần nào nhận được transcript.
+
+    Tách khỏi `pending_recipients` vì hai ca cần hai cách gửi khác nhau: người
+    chưa nhận được gì thì gửi cả thẻ lẫn file (`deliver`), còn người này chỉ
+    được gửi file (`deliver_file`) — gọi `deliver` cho họ là thẻ trùng.
+
+    Hai điều kiện `MAX(...)` bên dưới cố ý bắt CẢ ca "không có dòng `full` nào":
+    trước 02/08/2026 nhánh `if not file_key: continue` bỏ qua mà không ghi gì,
+    nên dữ liệu cũ không có dòng nào để đếm — mà đó chính là ca đang tồn tại
+    thật trong DB. `ftries = 0` thì vẫn nhỏ hơn `max_tries`, nên vẫn được thử.
+    """
+    rows = db.conn().execute(
+        """SELECT recipient,
+                  SUM(CASE WHEN kind='full' THEN 1 ELSE 0 END) AS ftries
+             FROM deliveries
+            WHERE minute_token = ?
+         GROUP BY recipient
+           HAVING MAX(CASE WHEN kind='recap' AND ok=1 THEN 1 ELSE 0 END) = 1
+              AND MAX(CASE WHEN kind='full'  AND ok=1 THEN 1 ELSE 0 END) = 0
+              AND ftries < ?""",
+        (minute_token, max_tries)).fetchall()
+    return [r["recipient"] for r in rows]
+
+
 def record_delivery(minute_token: str, recipient: str, kind: str,
                     ok: bool, error: str = "") -> None:
     with db.tx() as c:

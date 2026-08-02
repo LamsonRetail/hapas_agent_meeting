@@ -93,6 +93,24 @@ def _main() -> int:
 
     config.ensure_dirs()
     db.init()
+
+    # LƯỚI CHẶN MẠNG (02/08/2026). Luật 2 ở đầu file nói "không gọi mạng",
+    # nhưng nó chỉ là một câu trong docstring — và tôi đã phá nó ngay hôm thêm
+    # nhóm 32: stub `pipeline.deliver` mà quên `pipeline.deliver_file`, nên hàm
+    # THẬT chạy và gọi `im_send_file` tới Lark thật giữa lúc selftest. Lần đó vô
+    # hại vì union_id là bịa (99992364), nhưng trùng một id thật là GỬI TIN THẬT
+    # cho người thật.
+    #
+    # Mọi lời gọi HTTP của `lark_api` đều đi qua `_http()`, nên chặn ở đây là
+    # chặn được tất cả: quên stub một hàm giờ thành FAIL ngay dòng đó, thay vì
+    # một lời gọi mạng im lặng mà chỉ đọc log mới thấy.
+    def _no_net(*a, **k):
+        raise AssertionError(
+            "selftest gọi MẠNG THẬT: có hàm lark_api chưa được thay bằng hàm "
+            "giả. Xem stack để biết hàm nào, rồi stub nó (luật 2 đầu file).")
+
+    lark_api._http = _no_net
+
     ok: list[str] = []
     bad: list[str] = []
 
@@ -1386,10 +1404,17 @@ def _main() -> int:
           "on_HONG" in _pend32, str(_pend32))
     check("quá 3 lần thử -> thôi, không thử mãi", "on_BOCUOC" not in _pend32)
 
-    keep32 = pipeline.deliver
+    # Chặn CẢ HAI đường gửi. Bản đầu chỉ chặn `deliver`, nên `deliver_file`
+    # THẬT đã chạy và gọi Lark thật (`im_send_file` -> 99992364) ngay giữa
+    # selftest — đúng thứ luật 2 của file này cấm. Nó chỉ không gây hại vì
+    # `on_OK`/`on_OKSAU` là union_id bịa; trùng một id thật là gửi tin thật.
+    keep32 = (pipeline.deliver, pipeline.deliver_file)
     got32: list = []
+    file32a: list = []
     pipeline.deliver = lambda m, r, t, recips, **k: (got32.extend(recips),
                                                      (recips, []))[1]
+    pipeline.deliver_file = lambda m, t, recips: (file32a.extend(recips),
+                                                  (recips, []))[1]
     orchestrator._backfill_deliveries()
     check("gửi bù CHỈ cho người chưa nhận được, không phát lại cả phòng",
           got32 == ["on_HONG"], f"thực tế gửi cho: {got32}")
@@ -1401,7 +1426,61 @@ def _main() -> int:
     orchestrator._backfill_deliveries()
     check("hết lượt thử -> KHÔNG gọi gửi nữa (khỏi đốt API mỗi vòng)",
           got32 == [], f"vẫn gọi cho: {got32}")
-    pipeline.deliver = keep32
+    # --- Nhận được THẺ mà chưa có FILE: ca riêng, đường gửi riêng -----------
+    # `deliver` luôn gửi thẻ trước rồi mới tới file, nên gọi lại nó cho người
+    # này là họ nhận THẺ TRÙNG. Đây là mảnh còn thiếu của chính bản vá trên:
+    # `pending_recipients(kind="recap")` loại họ ra vì thẻ đã `ok=1`.
+    with db.tx() as c:
+        c.execute("DELETE FROM deliveries")
+    jobstore.record_delivery(_tok32, "on_CHUAFILE", "recap", True)   # chưa có full
+    jobstore.record_delivery(_tok32, "on_DU", "recap", True)
+    jobstore.record_delivery(_tok32, "on_DU", "full", True)
+    jobstore.record_delivery(_tok32, "on_HETLUOT", "recap", True)
+    for _ in range(3):
+        jobstore.record_delivery(_tok32, "on_HETLUOT", "full", False, "429")
+    jobstore.record_delivery(_tok32, "on_CHUATHE", "recap", False, "429")
+
+    _pf32 = jobstore.pending_file_recipients(_tok32, 3)
+    check("nhận thẻ rồi mà KHÔNG có dòng file -> phải gửi bù file",
+          "on_CHUAFILE" in _pf32, str(_pf32))
+    check("đã có file -> thôi", "on_DU" not in _pf32)
+    check("file hỏng quá 3 lần -> thôi", "on_HETLUOT" not in _pf32)
+    check("chưa nhận được thẻ -> KHÔNG thuộc ca này (đi đường thẻ+file)",
+          "on_CHUATHE" not in _pf32)
+
+    file32: list = []
+    got32.clear()
+    pipeline.deliver_file = lambda m, t, recips: (file32.extend(recips),
+                                                  (recips, []))[1]
+    orchestrator._backfill_deliveries()
+    check("gửi bù file CHỈ cho người thiếu file", file32 == ["on_CHUAFILE"],
+          f"thực tế: {file32}")
+    check("và KHÔNG gửi lại thẻ cho họ (tránh thẻ trùng)",
+          "on_CHUAFILE" not in got32, f"deliver được gọi với: {got32}")
+    check("người chưa nhận thẻ vẫn đi đường thẻ+file",
+          got32 == ["on_CHUATHE"], f"thực tế: {got32}")
+
+    # Transcript rỗng: KHÔNG gọi API, và KHÔNG ghi thêm lần thử nào — thử lại
+    # mãi một thứ không tồn tại chỉ làm bảng `deliveries` nói dối là đã cố.
+    # Từ đây chạy hàm THẬT (bỏ stub), nên phải chặn ở tầng lark_api bên dưới.
+    pipeline.deliver_file = keep32[1]
+    keep32c = (pipeline.write_txt, lark_api.im_upload_file)
+    pipeline.write_txt = lambda t, m: empty_txt
+    up32: list = []
+    lark_api.im_upload_file = lambda *a, **k: up32.append("upload")
+    with db.tx() as c:
+        c.execute("DELETE FROM deliveries")
+    s32, f32 = pipeline.deliver_file(meta(minute_token=_tok32), empty_tr,
+                                     ["on_CHUAFILE"])
+    n32 = db.conn().execute(
+        "SELECT COUNT(*) c FROM deliveries WHERE minute_token=?",
+        (_tok32,)).fetchone()["c"]
+    check("transcript rỗng -> không gọi upload", not up32)
+    check("transcript rỗng -> KHÔNG ghi thêm lần thử nào", n32 == 0, str(n32))
+    check("transcript rỗng -> không báo là đã gửi", s32 == [])
+    pipeline.write_txt, lark_api.im_upload_file = keep32c
+
+    pipeline.deliver, pipeline.deliver_file = keep32
     with db.tx() as c:
         c.execute("DELETE FROM deliveries")
 
@@ -1421,6 +1500,22 @@ def _main() -> int:
                  if "timeout /t" in ln and not ln.strip().upper().startswith("REM")]
         check(f"{_b}: không còn `timeout /t` nào chạy thật",
               not _live, "; ".join(_live))
+
+    # =================================================================
+    part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")
+    # =================================================================
+    # Nhiều nhóm ở trên lưu-rồi-trả-lại thuộc tính của `lark_api`. Một cái trả
+    # nhầm `_http` là lưới biến mất mà không ai biết, và lần sau quên stub thì
+    # lại gọi mạng thật trong im lặng. Kiểm ở CUỐI vì đó là lúc duy nhất câu
+    # trả lời có nghĩa.
+    check("lark_api._http vẫn là hàm chặn, không bị trả về bản thật",
+          lark_api._http is _no_net)
+    try:
+        lark_api._http()
+        _bit = False
+    except AssertionError:
+        _bit = True
+    check("gọi thẳng vào nó thì NỔ, không im lặng đi ra mạng", _bit)
 
     # =================================================================
     print("\n" + "=" * 66)

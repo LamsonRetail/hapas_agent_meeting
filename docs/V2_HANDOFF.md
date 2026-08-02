@@ -382,13 +382,16 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
      để lúc đổi hạ tầng máy. §31.2
    - **Transcript rỗng đi qua như thành công** — job `delivered`, `error=NULL`,
      nhưng file 0 byte và không ai được báo. Thêm `EmptyTranscript`. §31.3
-   - **Gửi hỏng một phần thì không ai thử lại** — thêm `_backfill_deliveries`.
-     §31.4
+   - **Gửi hỏng một phần thì không ai thử lại** — thêm `_backfill_deliveries`,
+     và nửa còn lại: người **nhận được thẻ mà file hỏng** đi đường
+     `pipeline.deliver_file` (gửi riêng file, không gửi lại thẻ trùng). §31.4
    - `event_attendees` **cắt im lặng ở người thứ 100**. §31.5
    - Ghép `union_id`/`open_id` theo thứ tự → nay theo `attendee_id`. §31.6
    - Một người token chập **làm mù cả vòng quét**. §31.7
+   - **`selftest` đã gọi MẠNG THẬT** (quên stub một hàm) — nay `lark_api._http`
+     bị thay bằng hàm ném lỗi, quên stub là FAIL ngay. §31.8
 
-   `selftest` **180 → 201**. ⚠️ Phải khởi động lại `run` mới nạp.
+   `selftest` **180 → 213**. ⚠️ Phải khởi động lại `run` mới nạp.
 
 ---
 

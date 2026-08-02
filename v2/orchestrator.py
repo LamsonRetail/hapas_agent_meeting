@@ -422,7 +422,10 @@ def _backfill_deliveries() -> None:
             return
         token = row["minute_token"]
         pend = jobstore.pending_recipients(token, "recap", DELIVERY_MAX_TRIES)
-        if not pend:
+        # Người đã nhận THẺ mà chưa có FILE: ca riêng, phải gửi bằng đường
+        # `deliver_file` chứ không phải `deliver` — xem docstring hàm đó.
+        pend_file = jobstore.pending_file_recipients(token, DELIVERY_MAX_TRIES)
+        if not (pend or pend_file):
             # Đã hết lượt thử mà vẫn chưa ai nhận được -> nói một câu rõ ràng.
             stuck = jobstore.pending_recipients(token, "recap", 10_000)
             if stuck:
@@ -443,8 +446,14 @@ def _backfill_deliveries() -> None:
             print(f"[deliver] {token} meta_json méo, bỏ qua: {exc}")
             continue
         done += 1
-        print(f"[deliver] {token} gửi BÙ cho {len(pend)} người lần trước hỏng")
-        pipeline.deliver(meta, recap, t, pend, dry_run=False)
+        if pend:
+            print(f"[deliver] {token} gửi BÙ (thẻ+file) cho {len(pend)} người "
+                  f"lần trước hỏng")
+            pipeline.deliver(meta, recap, t, pend, dry_run=False)
+        if pend_file:
+            print(f"[deliver] {token} gửi BÙ RIÊNG FILE cho {len(pend_file)} "
+                  f"người đã nhận thẻ mà chưa có transcript")
+            pipeline.deliver_file(meta, t, pend_file)
 
 
 def _backfill_base() -> None:

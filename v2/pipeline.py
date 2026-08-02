@@ -325,6 +325,62 @@ def write_txt(t: Transcript, meta: MeetingMeta) -> Path:
 # --------------------------------------------------------------- phát
 
 
+def _upload_txt(txt: Path) -> tuple[str | None, str]:
+    """(file_key, lý do KHÔNG có file). Đúng một trong hai giá trị có nghĩa."""
+    if txt.stat().st_size == 0:
+        # Lark từ chối file 0 byte (234010) — đừng gọi API để nhận đúng câu đó.
+        # Với job mới thì `EmptyTranscript` đã chặn từ trước; nhánh này là cho
+        # job CŨ đang được phát lại từ một transcript rỗng đã lưu.
+        return None, "transcript rỗng (0 byte) — không có gì để gửi"
+    try:
+        ftype = {".mp4": "mp4", ".pdf": "pdf", ".opus": "opus"}.get(
+            txt.suffix.lower(), "stream")
+        return lark_api.im_upload_file(txt, ftype), ""
+    except lark_api.LarkError as exc:
+        return None, f"upload transcript hỏng: {exc}"
+
+
+def deliver_file(meta: MeetingMeta, t: Transcript,
+                 recipients: list[str]) -> tuple[list[str], list[str]]:
+    """Gửi RIÊNG file transcript, KHÔNG gửi lại thẻ tóm tắt.
+
+    Vì sao phải có hàm riêng (02/08/2026): `deliver` luôn gửi thẻ rồi mới tới
+    file. Người đã nhận được thẻ mà file hỏng (429, mạng chớp) thì gọi lại
+    `deliver` là họ nhận **thẻ trùng** cho cùng một cuộc họp — nên trước đó
+    không có đường nào thử lại, và `_backfill_deliveries` chỉ dám tra
+    `kind="recap"`. Đây là mảnh còn thiếu của chính bản vá đó.
+
+    Transcript rỗng thì KHÔNG ghi gì và KHÔNG tính là một lần thử: không có gì
+    để gửi thì thử lại bao nhiêu lần cũng vậy, mà ghi thêm dòng `ok=0` mỗi vòng
+    chỉ làm bảng `deliveries` nói dối là đã cố.
+    """
+    txt = write_txt(t, meta)
+    token = meta.minute_token
+    file_key, why = _upload_txt(txt)
+    if file_key is None:
+        print(f"[deliver] {token} gửi bù file: {why}")
+        if txt.stat().st_size > 0:
+            # Upload hỏng (khác với rỗng) LÀ một lần thử — phải ghi, nếu không
+            # bộ đếm không bao giờ tới hạn và vòng nào cũng thử lại mãi.
+            for rid in recipients:
+                jobstore.record_delivery(token, rid, "full", False, why)
+        return [], list(recipients)
+
+    sent, failed = [], []
+    for rid in recipients:
+        try:
+            lark_api.im_send_file(rid, txt, id_type="union_id",
+                                  uuid_key=f"txt-{token}-{rid}",
+                                  file_key=file_key)
+            jobstore.record_delivery(token, rid, "full", True)
+            sent.append(rid)
+        except lark_api.LarkError as exc:
+            jobstore.record_delivery(token, rid, "full", False, str(exc))
+            failed.append(rid)
+            print(f"[deliver] gửi bù transcript cho {rid} hỏng: {exc}")
+    return sent, failed
+
+
 def deliver(meta: MeetingMeta, recap: Recap, t: Transcript,
             recipients: list[str], *,
             dry_run: bool = False) -> tuple[list[str], list[str]]:
@@ -349,22 +405,9 @@ def deliver(meta: MeetingMeta, recap: Recap, t: Transcript,
 
     # Upload transcript MỘT lần rồi dùng lại file_key cho mọi người: upload lặp
     # theo từng người là n lần tải file lên cho cùng một nội dung.
-    file_key = None
-    no_file_why = ""
-    if txt.stat().st_size == 0:
-        # Lark từ chối file 0 byte (234010) — đừng gọi API để nhận đúng câu đó.
-        # Với job mới thì `EmptyTranscript` đã chặn từ trước; nhánh này là cho
-        # job CŨ đang được phát lại từ một transcript rỗng đã lưu.
-        no_file_why = "transcript rỗng (0 byte) — không có gì để gửi"
+    file_key, no_file_why = _upload_txt(txt)
+    if no_file_why:
         print(f"[deliver] {no_file_why}, chỉ gửi tóm tắt")
-    else:
-        try:
-            ftype = {".mp4": "mp4", ".pdf": "pdf", ".opus": "opus"}.get(
-                txt.suffix.lower(), "stream")
-            file_key = lark_api.im_upload_file(txt, ftype)
-        except lark_api.LarkError as exc:
-            no_file_why = f"upload transcript hỏng: {exc}"
-            print(f"[deliver] {no_file_why}, chỉ gửi tóm tắt")
 
     for rid in recipients:
         try:
