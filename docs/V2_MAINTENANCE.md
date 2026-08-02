@@ -3107,7 +3107,10 @@ cửa vào thì có.
    không có nonce hoặc nonce hết hạn, nên code nằm đó lúc không có nonce sống
    thì đọc về cũng không dùng được. `v2 enroll-poll` truyền `force=True` vì
    người gõ lệnh đó chính là để kiểm hộp thư. **−100 ops/ngày.**
-2. **`STATUS_PUSH_EVERY` mặc định 0 → 1800.** 0 nghĩa là đẩy mỗi vòng
+2. **`STATUS_PUSH_EVERY` mặc định 0 → 1800**, và khởi động không còn đẩy hai
+   lần (`last_push` đặt theo cú đẩy lúc khởi động thay vì `0.0` — đo trong log:
+   23:17:50 rồi 23:17:59; máy ngủ nên khởi động lại nhiều lần mỗi ngày).
+   `0` nghĩa là đẩy mỗi vòng
    `POLL_INTERVAL`. Không mất khả năng phát hiện "run đã chết": việc đó do
    `alerts._check_run_stale` + Scheduled Task `V2_Alerts` lo, chạy từ NGOÀI và
    không đụng Vercel. **109 → ~18 lần đẩy/ngày.**

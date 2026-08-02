@@ -1567,6 +1567,15 @@ def _main() -> int:
     check("nhịp đẩy status mặc định KHÔNG còn là 'mỗi vòng'",
           config.STATUS_PUSH_EVERY >= 900, str(config.STATUS_PUSH_EVERY))
 
+    # Khởi động KHÔNG được đẩy hai lần. Với `last_push = 0.0` thì điều kiện
+    # `now - last_push >= STATUS_PUSH_EVERY` đúng ngay vòng đầu, nên cú đẩy lúc
+    # khởi động bị lặp lại sau vài giây — đo trong log: 23:17:50 và 23:17:59.
+    # Máy này khởi động lại nhiều lần mỗi ngày vì ngủ, nên nó cộng dồn thật.
+    _src35 = _inspect.getsource(orchestrator.run)
+    check("khởi động đẩy status xong thì ĐẶT LẠI mốc, không để 0.0",
+          "last_push = time.monotonic()" in _src35,
+          "vòng đầu sẽ đẩy lần thứ hai ngay sau cú lúc khởi động")
+
     # =================================================================
     part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")
     # =================================================================

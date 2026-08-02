@@ -737,10 +737,16 @@ def run() -> None:
         print("[PAUSED] công tắc dừng đang bật — chỉ theo dõi, không phát.")
 
     from . import status_push
+    # `last_push` phải tính TỪ cú đẩy lúc khởi động, không phải 0.0 (sửa
+    # 02/08/2026). Với 0.0 thì điều kiện `now - last_push >= STATUS_PUSH_EVERY`
+    # đúng ngay ở vòng đầu, nên mỗi lần khởi động đẩy HAI lần cách nhau vài
+    # giây — đo trong log: 23:17:50 và 23:17:59. Mỗi cú là một thao tác ghi
+    # Vercel Blob (§32), mà máy này khởi động lại nhiều lần mỗi ngày vì ngủ.
+    last_push = 0.0
     if status_push.enabled():
         print(f"[status] dashboard: {config.STATUS_PUSH_URL}")
         status_push.heartbeat()          # đẩy ngay, đừng để trang trống
-    last_push = 0.0
+        last_push = time.monotonic()
 
     from . import oauth
     if config.OAUTH_PULL_URL and config.STATUS_PUSH_SECRET:
