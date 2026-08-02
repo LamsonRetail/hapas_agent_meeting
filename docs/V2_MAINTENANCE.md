@@ -2819,10 +2819,37 @@ thấy sự kiện trong khi chủ toạ thì thấy. Kết quả tốt hơn th�
 tra lại làm mọi thứ TỆ ĐI. Phải chạy trên BẢN SAO và chỉ nhận kết quả khi nguồn
 mới bắt đầu bằng `calendar[`.
 
+### 30.4 Nhãn "token sắp hết" lúc nào cũng đỏ
+
+Lộ ra ngay trong log khởi động sau khi restart `run`: cả ba người đều
+`refresh còn 7.0 ngày [SẮP HẾT]`, kể cả token vừa gia hạn xong vài phút trước.
+
+`tokenstore.auth_report` đánh `OK` khi `days > 7`. Nhưng refresh token của Lark
+sống **đúng 7 ngày** và **trượt** (§28.2) — nên `days` không bao giờ vượt 7, và
+điều kiện đó không bao giờ đúng. Nhãn `SẮP HẾT` là trạng thái VĨNH VIỄN của mọi
+token khoẻ mạnh.
+
+Cùng một họ với hai lỗi khác trong ngày (mẫu quét secret tự khớp §29, và trước
+đó là whisper báo mỗi vòng): **một cảnh báo lúc nào cũng kêu là một cảnh báo sẽ
+bị bỏ qua**, rồi tới lúc kêu thật cũng không ai nhìn.
+
+**Đã làm:** `tokenstore.WARN_DAYS = 3`, dùng chung với `doctor._check_enrolled`
+(trước đó doctor hard-code 3 còn `auth_report` hard-code 7 — hai chỗ nói hai
+kiểu về cùng một token). Thứ tự nay nhất quán:
+
+| Ngưỡng | Ai kêu | Vì sao |
+|---|---|---|
+| 3 ngày | `doctor`, `auth_report` | chỗ người ta chủ động vào xem, cảnh báo sớm là rẻ |
+| 2 ngày | DM (`alerts.TOKEN_DAYS`) | thứ đi tìm người, phải hiếm mới còn giá trị |
+| 0 | `HẾT HẠN` / `status='expired'` | không đọc được minutes nữa |
+
+⚠️ Đừng đặt `WARN_DAYS` về 7 — đó chính là lỗi vừa sửa. `selftest` nhóm 29 chặn
+đúng nó, kèm phép kiểm `alerts.TOKEN_DAYS < WARN_DAYS`.
+
 ### Kiểm
 
 ```bash
-python -m v2 selftest           # nhóm 26-28, tổng 175 phép kiểm
+python -m v2 selftest           # nhóm 26-29, tổng 180 phép kiểm
 python -m v2 gate --union-id <on_...> --chat-type group --no-send   # phải != allow
 python -m v2 gate --union-id <on_...> --chat-type dm    --no-send   # phải allow
 python -m v2 doctor && python -m v2 scan   # lời gọi thật vẫn chạy qua transport mới

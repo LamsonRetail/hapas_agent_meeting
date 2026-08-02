@@ -88,7 +88,9 @@ def _check_enrolled(r: Report) -> None:
         name = u.get("name") or u.get("open_id")
         if days <= 0:
             r.add(FAIL, f"{name}: refresh HẾT HẠN", "phải enroll lại")
-        elif days <= 3:
+        elif days <= tokenstore.WARN_DAYS:
+            # Ngưỡng dùng CHUNG với `tokenstore.auth_report` — xem chú thích ở
+            # `tokenstore.WARN_DAYS` để biết vì sao KHÔNG được đặt là 7.
             r.add(WARN, f"{name}: refresh còn {days:.1f} ngày", "enroll lại sớm")
         else:
             r.add(OK, f"{name}: refresh còn {days:.1f} ngày")

@@ -1158,6 +1158,50 @@ def _main() -> int:
     meetings.resolve_participants, tokenstore.get_access_token = keep10
 
     # =================================================================
+    part("29. Nhãn 'token sắp hết' không được lúc nào cũng đỏ")
+    # =================================================================
+    # `auth_report` từng đánh OK khi `days > 7`. Nhưng refresh token của Lark
+    # sống ĐÚNG 7 ngày và TRƯỢT (đo 02/08/2026: refresh_exp = updated_at + 7d
+    # cho cả ba người, dù enroll ba ngày khác nhau), nên `days > 7` không bao
+    # giờ đúng và MỌI người luôn hiện `[SẮP HẾT]`, kể cả token vừa gia hạn.
+    # Nhãn lúc nào cũng đỏ là nhãn người ta thôi đọc.
+    check("ngưỡng cảnh báo THẤP hơn 7 ngày (cửa sổ trượt của Lark)",
+          tokenstore.WARN_DAYS < 7, str(tokenstore.WARN_DAYS))
+    check("DM hiếm hơn doctor (alerts.TOKEN_DAYS < WARN_DAYS)",
+          alerts.TOKEN_DAYS < tokenstore.WARN_DAYS,
+          f"{alerts.TOKEN_DAYS} vs {tokenstore.WARN_DAYS}")
+
+    with db.tx() as c:
+        c.execute("DELETE FROM tokens")
+    now_ms = int(time.time() * 1000)
+
+    def add_tok(name, days):
+        with db.tx() as c:
+            c.execute(
+                "INSERT INTO tokens(open_id,union_id,name,access_enc,refresh_enc,"
+                "access_exp,refresh_exp,scopes,status,enrolled_at,updated_at,"
+                "last_used) VALUES (?,?,?,'','',?,?,'','active',0,0,0)",
+                (f"ou_{name}", f"on_{name}", name, now_ms,
+                 now_ms + int(days * 86_400_000)))
+
+    # Token VỪA gia hạn: với cửa sổ trượt thì đây là trạng thái BÌNH THƯỜNG
+    # nhất, và nó phải hiện OK.
+    add_tok("VuaGiaHan", 7.0)
+    add_tok("SapHet", 2.0)
+    add_tok("HetHan", -1.0)
+    rep = tokenstore.auth_report()
+    line = {l.split()[0]: l for l in
+            (x.strip() for x in rep.splitlines()) if l}
+    check("token vừa gia hạn (còn 7 ngày) -> OK, KHÔNG phải SẮP HẾT",
+          "[OK]" in line["VuaGiaHan"], line["VuaGiaHan"])
+    check("token còn 2 ngày -> SẮP HẾT", "[SẮP HẾT]" in line["SapHet"],
+          line["SapHet"])
+    check("token quá hạn -> HẾT HẠN", "[HẾT HẠN]" in line["HetHan"],
+          line["HetHan"])
+    with db.tx() as c:
+        c.execute("DELETE FROM tokens")
+
+    # =================================================================
     print("\n" + "=" * 66)
     print(f"selftest: PASS {len(ok)}   FAIL {len(bad)}")
     for f in bad:

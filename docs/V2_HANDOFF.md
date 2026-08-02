@@ -7,7 +7,7 @@ cái gì chỉ mới test mock, và việc kế tiếp làm theo thứ tự nào
 cho một phiên mới làm ngay.
 
 > **Chạy `python -m v2 selftest` trước khi sửa gì và trước khi commit.**
-> 175 phép kiểm, ~15 giây, không mạng, không đụng `state.db` thật
+> 180 phép kiểm, ~15 giây, không mạng, không đụng `state.db` thật
 > (V2_MAINTENANCE §26). Đây là phép kiểm tự động DUY NHẤT của repo — trước
 > 02/08/2026 không có cái nào, và mọi lỗi đều tìm bằng tay sau khi đã hỏng thật.
 > Sửa xong một lỗi thì thêm một `check()` chặn đúng nó.
@@ -364,7 +364,7 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
      đang có.
 
    ⚠️ Cần `hermes\install-plugin.bat` + `hermes gateway restart` + khởi động
-   lại `run`. `selftest` 142 → **175**.
+   lại `run`. `selftest` 142 → **180**.
 
 ---
 

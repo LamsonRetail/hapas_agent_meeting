@@ -27,6 +27,22 @@ _REFRESH_MARGIN = 300
 
 _lock = threading.Lock()
 
+# Còn ít hơn ngần này ngày thì gọi là "sắp hết". Dùng chung với
+# `doctor._check_enrolled` để hai chỗ không nói hai kiểu về cùng một token.
+#
+# ⚠️ ĐỪNG đặt lại thành 7. Đo 02/08/2026: refresh token của Lark sống đúng
+# **7 ngày** và TRƯỢT — mỗi lần `get_access_token` refresh là `refresh_exp`
+# được đẩy ra 7 ngày nữa (cả ba người đều có `refresh_exp = updated_at + 7d`
+# dù enroll ba ngày khác nhau). Với ngưỡng 7 thì `days > 7` KHÔNG BAO GIỜ
+# đúng, nên `auth_report` in `[SẮP HẾT]` cho mọi người, mãi mãi, kể cả token
+# vừa gia hạn xong 5 phút trước. Một nhãn lúc nào cũng đỏ là một nhãn người ta
+# thôi đọc — rồi tới lúc sắp hết thật cũng không ai nhìn.
+#
+# Thứ tự mong muốn, từ sớm tới muộn: `doctor`/`auth_report` kêu ở 3 ngày ->
+# DM (`alerts.TOKEN_DAYS` = 2) -> hết hạn ở 0. Chỗ người ta chủ động vào xem
+# thì cảnh báo sớm là rẻ; DM là thứ đi tìm người nên phải hiếm hơn.
+WARN_DAYS = 3
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -153,7 +169,8 @@ def auth_report() -> str:
     lines = []
     for u in users:
         days = (u["refresh_exp"] - now) / 86_400_000
-        flag = "OK" if days > 7 else ("SẮP HẾT" if days > 0 else "HẾT HẠN")
+        flag = ("OK" if days > WARN_DAYS
+                else "SẮP HẾT" if days > 0 else "HẾT HẠN")
         lines.append(f"  {u['name'] or u['open_id']:<24} "
                      f"{u['status']:<8} refresh còn {days:5.1f} ngày  [{flag}]")
     return "\n".join(lines)
