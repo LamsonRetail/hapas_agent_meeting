@@ -42,3 +42,11 @@ nul
 
 # File link enroll sinh tam (co nonce) - dung commit
 enroll-links.html
+# Hai dòng dưới do `vercel link` tự thêm (02/08/2026).
+.vercel
+.env*
+# ...nhưng `.env*` khớp CẢ `v2/.env.example` — file mẫu mà repo cần có.
+# Hôm nay nó vẫn còn vì đã được tracked từ trước (gitignore không đuổi file đã
+# tracked), nên lỗi này vô hình: chỉ lộ ra vào ngày ai đó xoá rồi thêm lại, và
+# lúc đó người mới clone về sẽ không có file mẫu nào để chép.
+!.env.example

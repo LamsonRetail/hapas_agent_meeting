@@ -1,0 +1,27 @@
+# Cái gì được TẢI LÊN Vercel — danh sách TRẮNG, không phải danh sách đen.
+#
+# Vì sao phải có file này (02/08/2026): project `vercel-oauth` đặt
+# Root Directory = `v2/vercel-oauth` trong Settings, nên `npx vercel --prod`
+# chạy TỪ TRONG thư mục đó sẽ hỏng ("path .../v2/vercel-oauth/v2/vercel-oauth
+# does not exist") — phải chạy từ GỐC REPO. Mà gốc repo có:
+#
+#   v2/data/         state.db (user token đã mã hoá), transcript NGUYÊN VĂN
+#                    của mọi cuộc họp, log, backup
+#   v2/.env          app secret + V2_FERNET_KEY
+#   v1/config.bat    app secret Lark ĐANG DÙNG THẬT + OPENAI_API_KEY, và nó
+#                    đang được git TRACKED (xem V2_MAINTENANCE §29 / Việc 3)
+#
+# Vercel CLI có tôn trọng .gitignore hay không là chuyện không đáng đánh cược
+# khi cái giá là đẩy transcript họp và app secret sống lên một dịch vụ ngoài.
+# Deployment là bất biến: tải nhầm rồi thì không rút lại được.
+#
+# Danh sách trắng theo đúng thành ngữ của gitignore: loại sạch, rồi mở lại
+# đúng một nhánh. Thêm thư mục nào cần deploy thì mở thêm ở đây, có ý thức.
+
+/*
+!/v2
+/v2/*
+!/v2/vercel-oauth
+
+# Vercel tự cài dependency, khỏi tải lên
+/v2/vercel-oauth/node_modules
