@@ -3069,3 +3069,67 @@ obsg23lsr45qp273r1m6i8nc  on_a505446a…  recap,full
 obsg3q5tb1w9i1v6q368gj1y  on_1f34d05d…  recap,full
 obsg3q5tb1w9i1v6q368gj1y  on_a505446a…  recap,full
 ```
+
+---
+
+## 32. Hạn mức Vercel Blob — vì sao vòng `run` suýt tự khoá cửa enroll
+
+**Thư Vercel 02/08/2026:** `worn-s-projects` đã dùng **75%** hạn mức
+*Advanced Requests* của gói free cho Vercel Blob — **2.000 thao tác/THÁNG**.
+
+### Cái gì đốt, đo từ log chứ không đoán
+
+| Endpoint | Thao tác Blob mỗi lần | Lần/ngày (đếm trong log) | Ops/ngày |
+|---|---|---|---|
+| `POST /api/status` | `put` + `list` + `del` = **3** | 109 | ~327 |
+| `GET /api/oauth-pending` | `list` = **1** | 100 | ~100 |
+
+≈ **427 ops/ngày** ⇒ cạn hạn mức THÁNG trong **~4,7 ngày**. Khớp với "75% sau
+~3,5 ngày chạy".
+
+Đếm bằng:
+```bash
+grep -c "đã đẩy snapshot" v2/data/logs/v2-<ngày>.log
+grep -c "scan xong"       v2/data/logs/v2-<ngày>.log
+```
+
+### Vì sao đây là chuyện nghiêm trọng, không phải phiền toái về tiền
+
+Cạn hạn mức thì **hộp thư OAuth chết theo** — `GET /api/oauth-pending` không
+`list()` được nữa. Tức **không ai enroll được**, và V2 chỉ ghi một dòng
+`[enroll] không đọc được hộp thư`. Cái dashboard thì không ai chết vì thiếu;
+cửa vào thì có.
+
+### Ba việc đã làm
+
+1. **Chỉ đọc hộp thư khi CÓ người đang giữa chừng cấp quyền**
+   (`oauth.has_live_nonce`). Không mất gì: `complete()` vốn đã từ chối state
+   không có nonce hoặc nonce hết hạn, nên code nằm đó lúc không có nonce sống
+   thì đọc về cũng không dùng được. `v2 enroll-poll` truyền `force=True` vì
+   người gõ lệnh đó chính là để kiểm hộp thư. **−100 ops/ngày.**
+2. **`STATUS_PUSH_EVERY` mặc định 0 → 1800.** 0 nghĩa là đẩy mỗi vòng
+   `POLL_INTERVAL`. Không mất khả năng phát hiện "run đã chết": việc đó do
+   `alerts._check_run_stale` + Scheduled Task `V2_Alerts` lo, chạy từ NGOÀI và
+   không đụng Vercel. **109 → ~18 lần đẩy/ngày.**
+3. **`api/status.js` ghi đè MỘT pathname** thay vì mỗi snapshot một file +
+   `list`+`del` để dọn. POST còn **1 thao tác**. Đây là đảo lại quyết định
+   30/07 (§ ghi chú đầu file đó) một cách có ý thức: giá phải trả là trang có
+   thể cũ tới 60 giây — vô nghĩa khi nhịp đẩy là 30 phút, nhưng hồi đó thì
+   đáng lo vì đẩy mỗi vòng và người ta F5 để xem đổi ngay.
+   ⚠️ **Cần deploy Vercel mới ăn.** Chưa deploy thì vẫn là 3 thao tác/lần đẩy.
+
+### Kết quả
+
+| | Trước | Sau (1+2) | Sau (1+2+3) |
+|---|---|---|---|
+| ops/ngày | ~427 | ~54 | ~18 |
+| ops/tháng | ~12.800 | ~1.600 | ~540 |
+
+Duty cycle thật của máy là ~38% (109/288 vòng), đã tính vào các số trên.
+
+### Bài học
+
+Một vòng lặp gọi dịch vụ ngoài **mỗi nhịp, bất kể có việc hay không** là một
+đồng hồ đang chạy ngược. Chỗ đúng để hỏi "có việc không" là ở phía mình
+(`state.db` biết có nonce nào sống), không phải để dịch vụ ngoài trả lời "rỗng"
+2.000 lần một tháng.

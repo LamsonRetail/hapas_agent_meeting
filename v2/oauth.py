@@ -199,15 +199,37 @@ def _warn_if_missing_scopes(info: dict) -> None:
         print(f"[enroll] không kiểm được quyền (bỏ qua): {exc}")
 
 
-def poll_pending(*, notify: bool = True) -> list[dict]:
+def has_live_nonce() -> bool:
+    """Có ai đang giữa chừng cấp quyền không (nonce chưa hết hạn)."""
+    return db.conn().execute(
+        "SELECT 1 FROM oauth_nonce WHERE expires_at > ? LIMIT 1",
+        (_now_ms(),)).fetchone() is not None
+
+
+def poll_pending(*, notify: bool = True, force: bool = False) -> list[dict]:
     """Lấy các code đang chờ ở Vercel rồi enroll. Trả danh sách người vừa xong.
 
     Lỗi mạng KHÔNG ném ra ngoài: hàm này chạy trong vòng `run`, một cú Vercel
     502 không được phép làm chết orchestrator.
+
+    KHÔNG gọi khi không có nonce nào còn sống (02/08/2026), trừ khi `force`.
+    Vì sao: mỗi lời gọi là một `list()` trên Vercel Blob, tính vào hạn mức
+    **Advanced Requests — 2.000 thao tác/tháng ở gói free**. Vòng `run` gọi mỗi
+    5 phút bất kể có ai đang enroll hay không: đo từ log là ~100 lần/ngày, tức
+    riêng hộp thư đã ăn 1/20 hạn mức THÁNG mỗi ngày. Vercel đã gửi thư báo 75%.
+    Cạn hạn mức = hộp thư ngừng chạy = **không ai enroll được nữa**, và đó là
+    thứ hỏng đúng lúc cần nhất.
+    Không mất gì: `complete()` từ chối state không có nonce hoặc nonce hết hạn,
+    nên code nằm trong hộp thư lúc không có nonce sống thì dù đọc về cũng không
+    dùng được.
+    `force=True` cho lệnh tay `v2 enroll-poll` — người ta gõ nó chính là để
+    kiểm tra hộp thư.
     """
     import httpx
 
     if not (config.OAUTH_PULL_URL and config.STATUS_PUSH_SECRET):
+        return []
+    if not force and not has_live_nonce():
         return []
 
     try:

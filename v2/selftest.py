@@ -1536,6 +1536,38 @@ def _main() -> int:
               not _live, "; ".join(_live))
 
     # =================================================================
+    part("35. Không đốt hạn mức Vercel Blob khi không có việc")
+    # =================================================================
+    # "Advanced Requests" của gói free = 2.000 thao tác/THÁNG. Vòng `run` gọi
+    # hộp thư OAuth mỗi 5 phút bất kể có ai đang enroll hay không (~100 lần/ngày
+    # theo log), cộng 3 thao tác mỗi lần đẩy status. Vercel đã gửi thư báo 75%
+    # sau ~3,5 ngày. Cạn hạn mức = hộp thư chết = KHÔNG AI ENROLL ĐƯỢC.
+    keep35 = oauth.poll_pending
+    with db.tx() as c:
+        c.execute("DELETE FROM oauth_nonce")
+    check("không có nonce sống -> KHÔNG gọi hộp thư", not oauth.has_live_nonce())
+    with db.tx() as c:
+        c.execute("INSERT INTO oauth_nonce(nonce,open_id,expires_at) "
+                  "VALUES ('n1','ou_x',?)", (int(time.time() * 1000) + 60_000,))
+    check("có người đang giữa chừng cấp quyền -> CÓ gọi", oauth.has_live_nonce())
+    with db.tx() as c:
+        c.execute("DELETE FROM oauth_nonce")
+        c.execute("INSERT INTO oauth_nonce(nonce,open_id,expires_at) "
+                  "VALUES ('n2','ou_x',?)", (int(time.time() * 1000) - 1,))
+    check("nonce hết hạn -> KHÔNG gọi (complete() cũng sẽ từ chối nó)",
+          not oauth.has_live_nonce())
+    with db.tx() as c:
+        c.execute("DELETE FROM oauth_nonce")
+    # `_http` đã bị lưới chặn mạng thay, nên nếu gate hỏng thì lời gọi thật sẽ
+    # nổ chứ không im lặng đi ra Vercel — nhưng poll_pending dùng httpx trực
+    # tiếp, nên kiểm bằng giá trị trả về là đủ và không chạm mạng.
+    check("gate chặn TRƯỚC khi mở kết nối", oauth.poll_pending() == [])
+    oauth.poll_pending = keep35
+
+    check("nhịp đẩy status mặc định KHÔNG còn là 'mỗi vòng'",
+          config.STATUS_PUSH_EVERY >= 900, str(config.STATUS_PUSH_EVERY))
+
+    # =================================================================
     part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")
     # =================================================================
     # Nhiều nhóm ở trên lưu-rồi-trả-lại thuộc tính của `lark_api`. Một cái trả

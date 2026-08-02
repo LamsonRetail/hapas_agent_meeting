@@ -15,15 +15,28 @@
 //
 // CẠM BẪY ĐÃ ĐO (2026-07-30): ghi đè MỘT pathname cố định thì đọc bị cũ tới
 // ~60s — cả `get(..., {useCache:false})` cũng không thoát, vì SDK không cho
-// cacheControlMaxAge < 60s. Vì vậy mỗi snapshot ghi vào pathname RIÊNG
-// (status/<epoch_ms>.json): URL mới = chưa từng cache = đọc luôn thấy bản mới
-// nhất. list() là gọi API metadata nên không bị cache. Mỗi lần POST dọn luôn
-// các bản cũ, chỉ giữ KEEP bản gần nhất.
+// cacheControlMaxAge < 60s.
+//
+// ĐÃ ĐỔI LẠI (2026-08-02) — và đây là đánh đổi có chủ ý, không phải quên bẫy
+// trên. Mỗi snapshot ghi pathname RIÊNG thì POST tốn BA thao tác Blob
+// (put + list + del để dọn), mà "Advanced Requests" của gói free chỉ có
+// **2.000 thao tác/THÁNG**. Đo từ log: 109 lần đẩy/ngày x 3 = ~327 thao
+// tác/ngày, cộng hộp thư OAuth ~100 nữa. Vercel đã gửi thư báo dùng hết 75%
+// sau ~3,5 ngày. Cạn hạn mức thì hộp thư OAuth chết theo -> KHÔNG AI ENROLL
+// ĐƯỢC, tức mất thứ quan trọng hơn hẳn cái dashboard này.
+//
+// Nay ghi đè MỘT pathname cố định: POST còn ĐÚNG MỘT thao tác. Giá phải trả là
+// đúng cạm bẫy trên — trang có thể hiện dữ liệu cũ tới 60 giây. Với nhịp đẩy
+// 30 phút/lần thì 60 giây là vô nghĩa; hồi 30/07 nó mới đáng lo vì lúc đó đẩy
+// mỗi vòng và người ta F5 để xem thay đổi tức thì.
+//
+// Hệ quả nữa: không còn giữ lịch sử KEEP bản. Lịch sử thật nằm ở `state.db` và
+// log trên máy local, không phải ở đây.
 
-import { put, list, del } from "@vercel/blob";
+import { put, list } from "@vercel/blob";
 
 const PREFIX = "status/";
-const KEEP = 3;                       // giữ vài bản để soi khi cần
+const LATEST = `${PREFIX}latest.json`;   // MỘT file, ghi đè — xem ghi chú trên
 const MAX_BODY = 256 * 1024;          // snapshot lành mạnh chỉ vài KB
 
 // ------------------------------------------------------------------ helpers
@@ -126,28 +139,21 @@ async function handlePost(req, res) {
   snap.received_at = Date.now();
 
   try {
-    await put(`${PREFIX}${snap.received_at}.json`, JSON.stringify(snap), {
+    await put(LATEST, JSON.stringify(snap), {
       access: "public",
       contentType: "application/json; charset=utf-8",
       addRandomSuffix: false,
       allowOverwrite: true,
-      cacheControlMaxAge: 60,      // SDK không cho thấp hơn 60s; URL đã là duy nhất
+      cacheControlMaxAge: 60,      // sàn của SDK; trang chịu cũ tối đa 60s
     });
   } catch (e) {
     return res.status(502).json({ ok: false, error: `ghi Blob hỏng: ${e.message}` });
   }
 
-  // Dọn bản cũ. Hỏng ở đây KHÔNG được làm POST thất bại — snapshot đã ghi xong.
-  let pruned = 0;
-  try {
-    const old = (await listNewest()).slice(KEEP);
-    if (old.length) {
-      await del(old.map((b) => b.url));
-      pruned = old.length;
-    }
-  } catch {
-    pruned = -1;
-  }
+  // KHÔNG dọn gì ở đây nữa: chỉ có đúng một file nên không có gì tích tụ, và
+  // list()+del() mỗi lần POST chính là hai phần ba lượng thao tác Blob đã đốt
+  // hết hạn mức tháng trong ~4 ngày.
+  const pruned = 0;
   return res.status(200).json({ ok: true, received_at: snap.received_at, pruned });
 }
 

@@ -353,7 +353,18 @@ OAUTH_PULL_URL = _get(
     if STATUS_PUSH_URL else "",
 )
 # Giãn cách tối thiểu giữa 2 lần đẩy trong vòng run() (giây). 0 = mỗi vòng.
-STATUS_PUSH_EVERY = _get_int("STATUS_PUSH_EVERY", 0)
+#
+# Mặc định 1800 chứ KHÔNG phải 0 (đổi 02/08/2026): mỗi lần đẩy là một thao tác
+# ghi Vercel Blob, tính vào hạn mức "Advanced Requests" — **2.000 thao
+# tác/THÁNG** ở gói free. Với 0 thì đẩy mỗi vòng `POLL_INTERVAL`; đo từ log là
+# 109 lần/ngày, và Vercel đã gửi thư báo dùng hết 75% sau ~3,5 ngày. Cạn hạn
+# mức thì hộp thư OAuth chết theo, tức KHÔNG AI ENROLL ĐƯỢC — mất thứ quan
+# trọng hơn hẳn cái dashboard.
+#
+# 1800s không làm mất khả năng phát hiện "run đã chết": việc đó do
+# `alerts._check_run_stale` + Scheduled Task `V2_Alerts` (15 phút/lần) lo, chạy
+# từ NGOÀI và không đụng Vercel. Dashboard chỉ để người nhìn.
+STATUS_PUSH_EVERY = _get_int("STATUS_PUSH_EVERY", 1800)
 
 
 # ----------------------------------------------------------------- helpers

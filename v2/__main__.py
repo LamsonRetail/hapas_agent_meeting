@@ -161,7 +161,9 @@ def cmd_base_sync(args) -> None:
 def cmd_enroll_poll(_) -> None:
     _init()
     from . import oauth
-    done = oauth.poll_pending()
+    # force: người gõ lệnh này chính là để kiểm hộp thư, đừng bỏ qua vì
+    # không có nonce sống (xem docstring poll_pending).
+    done = oauth.poll_pending(force=True)
     if not done:
         print("Hộp thư trống (hoặc chưa bật OAUTH_PULL_URL).")
 

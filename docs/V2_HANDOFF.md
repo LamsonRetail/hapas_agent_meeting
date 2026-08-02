@@ -397,6 +397,18 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
 
 ---
 
+17. **Hạn mức Vercel Blob suýt tự khoá cửa enroll — V2_MAINTENANCE §32.**
+   Thư Vercel 02/08: đã dùng **75%** của **2.000 thao tác/tháng** (gói free).
+   Đo từ log: `POST /api/status` 3 thao tác × 109 lần/ngày + hộp thư OAuth 1 ×
+   100 = **~427/ngày**, cạn trong ~4,7 ngày. Cạn = **hộp thư OAuth chết = không
+   ai enroll được**, chỉ để lại một dòng log.
+   Đã: (1) chỉ đọc hộp thư khi có nonce còn sống; (2) `STATUS_PUSH_EVERY`
+   0 → 1800; (3) `api/status.js` ghi đè một pathname (3 → 1 thao tác).
+   ⇒ ~427 → **~18 ops/ngày**.
+   ⚠️ **(3) cần deploy Vercel mới ăn** — chưa deploy thì đang ở ~54/ngày.
+
+---
+
 ## 5. Ba điều KHÔNG được làm sai
 
 1. **Đừng chạy `run --ws` khi Hermes đang chạy.** Hermes dùng CÙNG `app_id`.
