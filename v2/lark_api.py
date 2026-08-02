@@ -42,11 +42,89 @@ class LarkError(RuntimeError):
 
 _client: httpx.Client | None = None
 
+# =====================================================================
+#  Thử lại khi Lark chập — CHỈ cho lời gọi ĐỌC
+# =====================================================================
+#
+# Vì sao cần (02/08/2026): trước bản này không có một dòng retry nào trong cả
+# file. Mà `meetings.resolve_participants` cho MỘT cuộc họp có thể tốn hàng
+# chục lời gọi (tới `MAX_EVENTS_TO_CHECK`=12 sự kiện × (event_get +
+# list_by_no + tới 5 lần recording) + 2 lần event_attendees +
+# vc_meeting_participants). Một cú 429 hay 502 lẻ ở giữa chuỗi đó không làm
+# hỏng job — nó `continue` hoặc trả `agenda_failed`, rồi job được tạo với
+# danh sách người dự SAI và giữ nguyên như vậy mãi (xem
+# `orchestrator._maybe_reresolve`). Lỗi im lặng, đúng loại đắt nhất ở đây.
+#
+# CHỈ ĐỌC, có chủ ý. Thử lại một POST là rủi ro gửi trùng, mà trong file này
+# POST gồm cả `im_send_card` / `im_send_file` — phát biên bản hai lần cho cả
+# phòng họp là thứ ai cũng nhìn thấy. `uuid_key` có chống trùng ở phía Lark
+# nhưng không phải mọi endpoint đều nhận nó, nên không dựa vào đó.
+#
+# Ba endpoint ĐỌC lại là POST theo thiết kế của Lark (`minutes/search`,
+# `calendars/primary`, `mget_instance_relation_info`). Chúng tự khai bằng
+# header `_READ_HDR`; transport đọc cờ đó rồi bỏ header đi trước khi gửi.
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+_RETRY_CALLS = 3            # tổng số LẦN GỌI, không phải số lần thử lại
+_RETRY_BASE_S = 0.5
+_RETRY_CAP_S = 8.0
+_READ_HDR = "x-v2-read"     # POST tự khai "tôi chỉ đọc, thử lại được"
+
+# Header đánh dấu POST-chỉ-đọc. Dùng dict hằng để chỗ gọi không gõ sai tên.
+READ_ONLY = {_READ_HDR: "1"}
+
+
+def _retry_after_s(resp: httpx.Response, attempt: int) -> float:
+    """Chờ bao lâu trước lần gọi sau. Ưu tiên `Retry-After` của Lark.
+
+    Lark biết rõ hơn ta khi nào hết bóp; chỉ khi nó không nói mới tự lùi theo
+    cấp số nhân. Chặn trên `_RETRY_CAP_S` để một header hỏng (`Retry-After:
+    3600`) không treo cả vòng `run`.
+    """
+    raw = resp.headers.get("retry-after", "")
+    if raw.strip().isdigit():
+        return min(float(raw.strip()), _RETRY_CAP_S)
+    return min(_RETRY_BASE_S * (2 ** attempt), _RETRY_CAP_S)
+
+
+class _RetryTransport(httpx.HTTPTransport):
+    """Thử lại 429/5xx cho GET (và POST đã tự khai là chỉ đọc).
+
+    Đặt ở tầng transport chứ không bọc từng lời gọi: file này có 35 chỗ gọi
+    `_http()`, sửa từng chỗ là chắc chắn sót, và chỗ sót sẽ là chỗ im lặng.
+    """
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        may_retry = (request.method == "GET"
+                     or request.headers.get(_READ_HDR) == "1")
+        request.headers.pop(_READ_HDR, None)     # đừng gửi header nội bộ ra ngoài
+
+        resp = super().handle_request(request)
+        if not may_retry:
+            return resp
+        for attempt in range(_RETRY_CALLS - 1):
+            if resp.status_code not in _RETRY_STATUS:
+                return resp
+            wait = _retry_after_s(resp, attempt)
+            # PHẢI đọc hết rồi đóng: bỏ một response chưa đọc là giữ lại
+            # connection trong pool cho tới lúc bị thu, và sau vài chục lần
+            # trong một vòng quét thì pool cạn — hỏng ở chỗ không ai ngờ.
+            resp.read()
+            resp.close()
+            print(f"[lark_api] {resp.status_code} {request.url.path} — "
+                  f"thử lại sau {wait:.1f}s ({attempt + 2}/{_RETRY_CALLS})")
+            time.sleep(wait)
+            resp = super().handle_request(request)
+        return resp
+
 
 def _http() -> httpx.Client:
     global _client
     if _client is None:
-        _client = httpx.Client(timeout=60.0, base_url=config.base_url())
+        # `retries=2` của httpx CHỈ thử lại lúc BẮT TAY kết nối (ConnectError /
+        # ConnectTimeout), tức request chưa hề rời máy — an toàn cho cả POST,
+        # khác hẳn với việc thử lại một response đã nhận.
+        _client = httpx.Client(timeout=60.0, base_url=config.base_url(),
+                               transport=_RetryTransport(retries=2))
     return _client
 
 
@@ -199,7 +277,7 @@ def minutes_list(access_token: str, start_ms: int, end_ms: int,
                 params["page_token"] = page_token
             resp = _http().post(
                 "/open-apis/minutes/v1/minutes/search",
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {access_token}", **READ_ONLY},
                 params=params,
                 json={"filter": {
                     "create_time": {"start_time": _iso(start_ms),
@@ -282,7 +360,7 @@ def calendar_primary(access_token: str) -> str:
     """calendar_id của lịch chính người dùng."""
     resp = _http().post(
         "/open-apis/calendar/v4/calendars/primary",
-        headers={"Authorization": f"Bearer {access_token}"},
+        headers={"Authorization": f"Bearer {access_token}", **READ_ONLY},
     )
     data = _check(resp, "calendar_primary").get("data", {})
     cals = data.get("calendars", [])
@@ -331,7 +409,7 @@ def event_meeting_ids(access_token: str, calendar_id: str,
     resp = _http().post(
         f"/open-apis/calendar/v4/calendars/{calendar_id}"
         "/events/mget_instance_relation_info",
-        headers={"Authorization": f"Bearer {access_token}"},
+        headers={"Authorization": f"Bearer {access_token}", **READ_ONLY},
         json={"instance_ids": instance_ids},
     )
     infos = (_check(resp, "event_meeting_ids").get("data", {})

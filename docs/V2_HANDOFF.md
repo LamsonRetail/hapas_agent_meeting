@@ -7,7 +7,7 @@ cái gì chỉ mới test mock, và việc kế tiếp làm theo thứ tự nào
 cho một phiên mới làm ngay.
 
 > **Chạy `python -m v2 selftest` trước khi sửa gì và trước khi commit.**
-> 142 phép kiểm, ~15 giây, không mạng, không đụng `state.db` thật
+> 175 phép kiểm, ~15 giây, không mạng, không đụng `state.db` thật
 > (V2_MAINTENANCE §26). Đây là phép kiểm tự động DUY NHẤT của repo — trước
 > 02/08/2026 không có cái nào, và mọi lỗi đều tìm bằng tay sau khi đã hỏng thật.
 > Sửa xong một lỗi thì thêm một `check()` chặn đúng nó.
@@ -351,6 +351,20 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
    và **`--force` là điều tuyệt đối không được làm** — nó đẩy secret sống vào
    repo công ty, không lùi lại được. Đồng bộ bằng quy trình worktree ở §29 (đã
    chạy thật 02/08 → `91add5d`).
+
+15. **Hai lỗ còn lại từ vòng rà — VÁ 02/08/2026, V2_MAINTENANCE §30.**
+   - **Bot chỉ trả lời chat 1-1** (`gate._refuse_group` + plugin). Lý do KHÔNG
+     phải "agent lẫn vé của hai người" — Hermes để `group_sessions_per_user:
+     true` nên chuyện đó đã bị chặn sẵn; lý do thật là bộ lọc cấp quyền cho
+     **người hỏi** còn câu trả lời thì **cả phòng đọc**.
+   - **`lark_api` nay có retry** 429/5xx — **CHỈ cho lời gọi ĐỌC**. POST không
+     thử lại (gồm `im_send_card`: phát trùng biên bản cho cả phòng họp).
+   - **`meta` không còn đông cứng**: `_maybe_reresolve` tra lại người dự ngay
+     trước khi phát, chạy trên BẢN SAO để tra hỏng không xoá trắng danh sách
+     đang có.
+
+   ⚠️ Cần `hermes\install-plugin.bat` + `hermes gateway restart` + khởi động
+   lại `run`. `selftest` 142 → **175**.
 
 ---
 

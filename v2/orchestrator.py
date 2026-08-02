@@ -236,6 +236,14 @@ def _process_queue(dry_run: bool | None = None) -> None:
             if recap is None:
                 continue             # hoãn sang vòng sau, KHÔNG phát bản trống
 
+        # Tra lại người dự NGAY TRƯỚC khi phát, không sớm hơn: xem docstring.
+        # Bọc try riêng — tra lại là việc CẢI THIỆN, hỏng thì phát bằng danh
+        # sách cũ chứ không được chặn cả biên bản.
+        try:
+            meta = _maybe_reresolve(meta, dry_run=dry_run)
+        except Exception as exc:     # noqa: BLE001 — xem trên
+            print(f"[reresolve] {token} bỏ qua vì lỗi: {exc}")
+
         _deliver_now(meta, recap, t, dry_run=dry_run)
 
     if not dry_run:
@@ -408,6 +416,73 @@ def _reuse(token: str, row: dict):
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         print(f"[queue] {token} recap cũ méo ({exc}) -> làm lại recap")
         return t, None
+
+
+# Tối đa bao nhiêu người được mượn token để tra lại người dự. Mỗi người là một
+# chuỗi hàng chục lời gọi API, nhưng thử người thứ hai là ĐÁNG: chuỗi tra dùng
+# lịch RIÊNG của người cho mượn token (`calendar_primary`), nên người không phải
+# chủ toạ có thể không thấy sự kiện trong khi chủ toạ thì thấy.
+RERESOLVE_MAX_READERS = 2
+
+# Nguồn người dự coi là ĐÃ TRA ĐƯỢC. Mọi giá trị khác — `agenda_failed`,
+# `no_match`, `no_calendar_event`, `no_event_in_window`, `no_start_time`, và cả
+# `… -> fallback:owner` — đều là "chưa biết ai dự".
+_SOURCE_RESOLVED = "calendar["
+
+
+def _needs_reresolve(source: str) -> bool:
+    return not (source or "").startswith(_SOURCE_RESOLVED)
+
+
+def _maybe_reresolve(meta: MeetingMeta, *, dry_run: bool) -> MeetingMeta:
+    """Tra lại người dự nếu lần trước không ra. Trả meta dùng để phát.
+
+    Vì sao cần (02/08/2026): `resolve_participants` chạy đúng MỘT lần, trong
+    `enqueue_minute`, rồi kết quả nằm im trong `meta_json`. Một cú `LarkError`
+    thoáng qua ở `calendar_events` là `agenda_failed` -> `FALLBACK_TO_OWNER` ->
+    job giữ danh sách sai mãi mãi, không có đường tra lại kể cả bằng tay.
+
+    Vì sao đặt ĐÚNG ở đây, ngay trước lúc phát: giữa `enqueue` và chỗ này là cả
+    bước phiên âm — hàng chục phút với whisper CPU. Một sự cố mạng thoáng qua đã
+    có thừa thời gian tự khỏi, và `resolve_participants` cũng đã qua hẳn cửa sổ
+    `SETTLE_MINUTES` nên Lark đã liên kết xong bản ghi với cuộc họp.
+
+    FAIL-CLOSED, và đây là phần dễ làm hỏng nhất: tra lại mà vẫn không ra thì
+    GIỮ NGUYÊN meta cũ. `resolve_participants` sửa đối tượng TẠI CHỖ và xoá
+    trắng `attendees` khi thất bại, nên phải chạy trên một BẢN SAO — làm thẳng
+    trên `meta` là một lần tra hỏng sẽ xoá mất cả danh sách `fallback:owner`
+    đang có, tức tra lại làm mọi thứ TỆ ĐI.
+    """
+    if not _needs_reresolve(meta.participants_source):
+        return meta
+
+    fresh = jobstore.meta_from_json(jobstore.meta_to_json(meta))
+    tried = 0
+    for oid in pipeline._reader_candidates(meta):
+        if tried >= RERESOLVE_MAX_READERS:
+            break
+        try:
+            token = tokenstore.get_access_token(oid)
+        except tokenstore.TokenError:
+            continue                     # chưa enroll / token chết: không tính lượt
+        tried += 1
+        try:
+            meetings.resolve_participants(token, fresh)
+        except Exception as exc:         # noqa: BLE001 — tra lại hỏng không được làm hỏng việc phát
+            print(f"[reresolve] {meta.minute_token} mượn {oid[:12]}… hỏng: {exc}")
+            continue
+        if not _needs_reresolve(fresh.participants_source):
+            print(f"[reresolve] {meta.minute_token}: "
+                  f"{meta.participants_source!r} -> "
+                  f"{fresh.participants_source!r} "
+                  f"({len(fresh.attendees)} người dự)")
+            if not dry_run:
+                jobstore.update_meta(meta.minute_token, fresh)
+            return fresh
+
+    print(f"[reresolve] {meta.minute_token} vẫn không tra được người dự "
+          f"({meta.participants_source!r}, đã thử {tried} người) — giữ nguyên")
+    return meta
 
 
 def _recipients(meta: MeetingMeta) -> tuple[list[str], int]:

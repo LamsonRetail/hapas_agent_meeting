@@ -137,7 +137,8 @@ def cmd_gate(args) -> None:
         _init()
         try:
             out = gate.check(args.union_id, args.user_id, args.name,
-                             send=not args.no_send)
+                             send=not args.no_send,
+                             chat_type=args.chat_type)
         except Exception as exc:                      # noqa: BLE001
             # Cửa đóng khi hỏng: thà bot im còn hơn mở cho người chưa cấp quyền.
             out = {"decision": "wait", "reason": f"gate lỗi: {exc}"}
@@ -475,6 +476,11 @@ def main() -> None:
     g.add_argument("--union-id", default="", help="SessionSource.user_id_alt")
     g.add_argument("--user-id", default="", help="chỉ để đọc log")
     g.add_argument("--name", default="")
+    g.add_argument("--chat-type", default="",
+                   help="SessionSource.chat_type: dm | group | channel | "
+                        "thread. Chỉ `dm` được trả lời — trong phòng nhiều "
+                        "người thì câu trả lời lọt sang người không có quyền "
+                        "xem. Trống = plugin đời cũ, cho đi tiếp + cảnh báo")
     g.add_argument("--no-send", action="store_true",
                    help="chỉ tra, không nhắn ai (để thử)")
     g.set_defaults(fn=cmd_gate)

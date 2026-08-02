@@ -2738,3 +2738,115 @@ hai repo, từ trước 02/08. Ghép với §28.1 (Base đang `tenant_readable`)
 đọc được repo là có sẵn đường đọc toàn bộ nội dung họp**. Đó là hệ quả trực tiếp
 và đã biết của quyết định để Base mở — không phải lỗ mới, đừng báo lại như phát
 hiện mới. Nếu sau này siết Base về `closed` thì điều này tự hết.
+
+---
+
+## 30. Hai lỗ còn lại sau vòng rà 02/08/2026
+
+### 30.1 Bot CHỈ trả lời chat 1-1
+
+**Lý do KHÔNG phải cái tôi nêu lúc đầu — ghi lại để không ai đi vá lỗ không có
+thật.** Tôi từng nói: plugin chèn `[V2-ASKER: …]` vào nội dung tin, nên trong
+group chat ngữ cảnh agent sẽ tích vé của nhiều người và nó có thể trả lời B bằng
+danh tính A. **Sai.** Hermes để `group_sessions_per_user: true` (đo trong
+`%LOCALAPPDATA%\hermes\config.yaml`, mặc định của `gateway/session.py` cũng là
+`True`), nên mỗi người trong group đã là một session riêng.
+
+**Lý do thật, và không cấu hình nào chặn được:** `qa._may_see` cấp quyền cho
+**người HỎI**, không cấp cho **người ĐỌC**. A hỏi trong group, bot trả lời vào
+phòng, cả phòng đọc được biên bản mà chỉ A có quyền xem. Im lặng, không lỗi.
+
+Trước bản này có hai lớp chặn, **cả hai đều nằm ngoài repo**:
+`FEISHU_GROUP_POLICY=allowlist` (không có `ALLOWED_GROUPS`) trong `.env` của
+Hermes, và không ai thêm bot vào group. Đúng loại phụ thuộc mà §28.1/§29 đã dạy:
+thứ chỉ được giữ bởi một dòng cấu hình ngoài repo thì không ai biết khi nó đổi.
+
+**Đã làm** — hai lớp, lớp trong repo là lớp có test:
+- `gate._refuse_group()` + tham số `chat_type` cho `gate.check()`,
+  `v2 gate --chat-type`, và tham số thứ tư của `v2-gate.bat`. Chặn **trước** khi
+  tra `tokens` và **trước** khi cấp vé: trong phòng nhiều người thì ngay cả câu
+  "bạn chưa cấp quyền, bấm link này" cũng không nên phát ra giữa phòng.
+- Plugin `v2-enroll-gate` bỏ tin group ngay, khỏi tốn một tiến trình con.
+
+`chat_type` rỗng → **cho đi tiếp** + cảnh báo. Có chủ ý: `v2-gate.bat` spawn
+Python mới nên ăn code mới ngay, còn plugin phải `hermes gateway restart` mới cập
+nhật (§20). Đóng ở đây là bot câm với TẤT CẢ trong khoảng giữa hai lần đó.
+
+Giá trị Hermes dùng: `dm` cho 1-1, `group`/`channel`/`thread` cho phần còn lại
+(`_map_chat_type`: `"dm" if chat_type == "p2p" else "group"`). V2 nhận cả `p2p`
+để gọi tay từ terminal.
+
+### 30.2 `lark_api` không có một dòng retry nào
+
+Tra người dự cho MỘT cuộc họp tốn hàng chục lời gọi: tới `MAX_EVENTS_TO_CHECK`
+(12) sự kiện × (`event_get` + `list_by_no` + tới 5 lần `recording`) + 2 lần
+`event_attendees` + `vc_meeting_participants`. Một cú 429/502 lẻ ở giữa chuỗi đó
+không làm job hỏng — nó `continue` hoặc trả `agenda_failed`, rồi job mang danh
+sách người dự SAI. Lỗi im lặng.
+
+**Đã làm:** `_RetryTransport` ở tầng transport của httpx (không bọc từng lời gọi
+— file có 35 chỗ gọi `_http()`, sửa từng chỗ là chắc chắn sót, và chỗ sót sẽ là
+chỗ im lặng). 429/5xx → thử lại tối đa `_RETRY_CALLS`=3 lần, tôn trọng
+`Retry-After` của Lark, có **trần** `_RETRY_CAP_S`=8s để một header hỏng
+(`Retry-After: 3600`) không treo vòng `run`. Thêm `retries=2` của httpx cho lỗi
+BẮT TAY kết nối — an toàn cho mọi method vì request chưa rời máy.
+
+⚠️ **CHỈ ĐỌC.** POST không được thử lại: trong file này POST gồm cả
+`im_send_card`/`im_send_file`, và phát biên bản hai lần cho cả phòng họp là thứ
+ai cũng nhìn thấy. Ba endpoint đọc-nhưng-là-POST theo thiết kế của Lark
+(`minutes/search`, `calendars/primary`, `mget_instance_relation_info`) tự khai
+bằng header `lark_api.READ_ONLY`; transport đọc cờ rồi **bỏ header đi** trước khi
+gửi ra ngoài.
+
+### 30.3 `meta` đông cứng lúc enqueue
+
+`resolve_participants` chạy đúng MỘT lần, trong `enqueue_minute`, rồi kết quả nằm
+im trong `meta_json`. Một cú `LarkError` thoáng qua ở `calendar_events` là
+`agenda_failed` → `FALLBACK_TO_OWNER` → job giữ danh sách sai **vĩnh viễn**,
+không lệnh nào và không vòng nào tra lại.
+
+**Đã làm:** `orchestrator._maybe_reresolve()`, gọi **ngay trước khi phát**. Đặt
+đúng chỗ đó vì giữa `enqueue` và lúc phát là cả bước phiên âm — hàng chục phút
+với whisper CPU, thừa thời gian cho một sự cố mạng tự khỏi. Thử tối đa
+`RERESOLVE_MAX_READERS`=2 người cho mượn token: chuỗi tra dùng lịch RIÊNG của
+người cho mượn (`calendar_primary`), nên người không phải chủ toạ có thể không
+thấy sự kiện trong khi chủ toạ thì thấy. Kết quả tốt hơn thì ghi lại bằng
+`jobstore.update_meta()`.
+
+⚠️ **Phần dễ làm hỏng nhất, có `check()` riêng chặn:** `resolve_participants` sửa
+đối tượng **TẠI CHỖ** và **xoá trắng** `attendees` khi thất bại. Làm thẳng trên
+`meta` là một lần tra hỏng sẽ xoá mất cả danh sách `fallback:owner` đang có — tức
+tra lại làm mọi thứ TỆ ĐI. Phải chạy trên BẢN SAO và chỉ nhận kết quả khi nguồn
+mới bắt đầu bằng `calendar[`.
+
+### Kiểm
+
+```bash
+python -m v2 selftest           # nhóm 26-28, tổng 175 phép kiểm
+python -m v2 gate --union-id <on_...> --chat-type group --no-send   # phải != allow
+python -m v2 gate --union-id <on_...> --chat-type dm    --no-send   # phải allow
+python -m v2 doctor && python -m v2 scan   # lời gọi thật vẫn chạy qua transport mới
+```
+
+Đã đo 02/08/2026: cả ba đường `v2-gate.bat` đúng (group bị chặn, dm được vé, và
+gọi với BA tham số kiểu plugin đời cũ vẫn `allow`); `doctor` + `scan` chạy thật
+qua transport mới không lỗi.
+
+### Sau khi cập nhật PHẢI làm
+
+```bash
+hermes\install-plugin.bat     # đồng bộ plugin sang %LOCALAPPDATA%
+hermes gateway restart        # nạp plugin mới
+```
+Rồi khởi động lại tiến trình `run` (cho `_maybe_reresolve` + transport mới).
+
+Hai điều đã gặp khi làm bước này, để lần sau khỏi hoảng:
+- `install-plugin.bat` in **"Access is denied"** ở bước copy `plugin.yaml`. Vô
+  hại **nếu** nội dung đã giống nhau — kiểm bằng `diff`, đừng đoán.
+- `hermes gateway restart` mất tới **~70 giây** mới ghi dòng khởi động đầu tiên.
+  Trong khoảng đó `gateway.log` dừng ở "Gateway stopped" và trông như chết. Chờ,
+  rồi tìm `Feishu] Connected in websocket mode`.
+- Đếm tiến trình để kiểm "có hai gateway không" thì **PHẢI lọc
+  `Name -eq 'python.exe'`**. Lọc mỗi `CommandLine -match 'gateway run'` là chính
+  lệnh PowerShell đang lọc cũng khớp với nó — tôi đã tưởng có 6 gateway và suýt
+  đi giết nhầm. Đúng cái bẫy `run-v2-auto.bat` đã ghi cho `v2 run`.

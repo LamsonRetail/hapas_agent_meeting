@@ -65,9 +65,61 @@ def _enrolled(union_id: str) -> dict | None:
     return None
 
 
+# Loại phòng chat được phép hỏi bot. Hermes dùng "dm" cho 1-1
+# (`_map_chat_type`: `"dm" if chat_type == "p2p" else "group"`); nhận luôn "p2p"
+# để gọi thẳng từ terminal cho tiện.
+_P2P = {"dm", "p2p"}
+
+
+def _refuse_group(chat_type: str) -> dict[str, Any] | None:
+    """Chặn mọi phòng KHÔNG phải 1-1. None = được đi tiếp.
+
+    Vì sao phải chặn, và vì sao lý do KHÔNG phải cái tôi tưởng lúc đầu
+    (02/08/2026): bộ lọc `qa._may_see` cấp quyền cho **người HỎI**, không cấp
+    cho **người ĐỌC**. Trong group, A hỏi và bot trả lời vào phòng — cả phòng
+    đọc được biên bản mà chỉ A có quyền xem. Không cấu hình nào chặn việc đó,
+    và nó im lặng.
+
+    Chuyện tôi tưởng lúc đầu — ngữ cảnh agent lẫn vé của nhiều người rồi trả
+    lời B bằng danh tính A — thì **đã bị chặn sẵn**: Hermes để
+    `group_sessions_per_user: true`, mỗi người trong group là một session
+    riêng. Ghi lại để không ai đi vá một lỗ không tồn tại.
+
+    Hôm nay còn HAI lớp chặn nữa ở ngoài repo (`FEISHU_GROUP_POLICY=allowlist`
+    không có `ALLOWED_GROUPS`, và plugin `v2-enroll-gate` tự bỏ tin group).
+    Lớp này là lớp duy nhất nằm TRONG repo và có test — đúng bài học §28.1/§29:
+    thứ chỉ được giữ bởi một dòng cấu hình ngoài repo thì không ai biết khi nó
+    đổi.
+
+    `chat_type` rỗng = plugin đời cũ chưa gửi trường này -> CHO ĐI TIẾP, và nói
+    to. Chọn vậy có chủ ý: `v2-gate.bat` spawn Python mới nên ăn code mới ngay,
+    còn plugin thì phải `hermes gateway restart` mới cập nhật (§20). Đóng ở đây
+    là bot câm với TẤT CẢ mọi người trong khoảng giữa hai lần đó, để chữa một lỗ
+    mà hai lớp ngoài kia đang chặn rồi.
+    """
+    ct = (chat_type or "").strip().lower()
+    if not ct:
+        print("[gate] CẢNH BÁO: không biết loại phòng chat (plugin đời cũ?) — "
+              "cho đi tiếp. Chạy hermes/install-plugin.bat rồi "
+              "`hermes gateway restart` để bật lớp chặn group trong V2.")
+        return None
+    if ct in _P2P:
+        return None
+    return {"decision": "wait",
+            "reason": f"chỉ trả lời trong chat 1-1, không trả lời trong "
+                      f"{ct} (biên bản chỉ hiện cho người có dự)"}
+
+
 def check(union_id: str, user_id: str = "", name: str = "",
-          *, send: bool = True) -> dict[str, Any]:
+          *, send: bool = True, chat_type: str = "") -> dict[str, Any]:
     """Quyết định cho vào hay không. `send=False` để thử mà không nhắn ai."""
+    # TRƯỚC mọi thứ khác, kể cả trước khi tra `tokens`: trong phòng nhiều người
+    # thì ngay cả câu "bạn chưa cấp quyền, bấm link này" cũng không nên phát ra
+    # giữa phòng, và ta cũng không muốn cấp vé phiên cho một ngữ cảnh mà câu trả
+    # lời sẽ bị người khác đọc.
+    if (no := _refuse_group(chat_type)) is not None:
+        return no
+
     if not union_id:
         # Không có union_id thì không định danh được -> đóng.
         return {"decision": "wait", "reason": "thiếu union_id"}

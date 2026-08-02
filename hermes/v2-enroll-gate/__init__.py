@@ -23,6 +23,12 @@ duy nhất), không phải ở đây. Chặn ở đây nữa thì bot im mà kh�
 trong gateway/session.py) — đó cũng là khoá V2 lưu trong bảng `tokens`, nên khớp
 được mà không phải tra danh bạ.
 
+CHỈ CHAT 1-1 (thêm 02/08/2026): tin trong group/channel/thread bị bỏ. Lý do
+không phải "sợ agent lẫn vé của hai người" — Hermes để
+`group_sessions_per_user: true` nên mỗi người trong group đã là một session
+riêng. Lý do thật: bộ lọc của V2 cấp quyền cho **người HỎI**, còn câu trả lời
+thì **cả phòng đọc được**, kể cả người không có trong danh sách người dự.
+
 FAIL-CLOSED: gọi V2 hỏng, hết thời gian, JSON xấu -> `skip`. Bot im lặng an toàn
 hơn bot trả lời người chưa cấp quyền. Log ở %LOCALAPPDATA%\\hermes\\logs\\gateway.log.
 """
@@ -45,11 +51,12 @@ PLATFORM = "feishu"
 TIMEOUT_S = float(os.environ.get("V2_GATE_TIMEOUT", "25"))
 
 
-def _ask_v2(union_id: str, user_id: str, name: str) -> dict:
+def _ask_v2(union_id: str, user_id: str, name: str,
+            chat_type: str = "") -> dict:
     """Gọi v2-gate.bat, đọc một dòng JSON ở stdout."""
     try:
         proc = subprocess.run(
-            [GATE_BAT, union_id, user_id, name],
+            [GATE_BAT, union_id, user_id, name, chat_type],
             capture_output=True, text=True, timeout=TIMEOUT_S,
             encoding="utf-8", errors="replace", shell=False,
         )
@@ -83,8 +90,23 @@ def _on_pre_dispatch(**kwargs):
     union_id = (getattr(source, "user_id_alt", "") or "").strip()
     user_id = (getattr(source, "user_id", "") or "").strip()
     name = (getattr(source, "user_name", "") or "").strip()
+    chat_type = (getattr(source, "chat_type", "") or "").strip().lower()
 
-    res = _ask_v2(union_id, user_id, name)
+    # CHỈ chat 1-1. Chặn ngay ở đây, không phiền tới V2: trong phòng nhiều
+    # người, bộ lọc của V2 cấp quyền cho NGƯỜI HỎI nhưng câu trả lời thì cả
+    # phòng đọc — kể cả người không có trong danh sách người dự. V2 cũng chặn
+    # lần nữa (`gate._refuse_group`), đó mới là lớp có test; lớp này chỉ để
+    # khỏi tốn một tiến trình con cho tin chắc chắn bị bỏ.
+    #
+    # `chat_type` rỗng thì ĐỪNG tự suy: để V2 quyết (nó cảnh báo rồi cho đi
+    # tiếp). Đoán "rỗng nghĩa là dm" ở đây là dựng một luật thứ hai song song
+    # với luật của V2, và hai luật phân quyền lệch nhau thì cái lỏng hơn thắng.
+    if chat_type and chat_type != "dm":
+        logger.info("[v2-gate] bỏ tin trong %s (%s) — bot chỉ trả lời chat 1-1",
+                    chat_type, getattr(source, "chat_id", ""))
+        return {"action": "skip", "reason": "v2: chi tra loi chat 1-1"}
+
+    res = _ask_v2(union_id, user_id, name, chat_type)
     decision = res.get("decision")
 
     if decision == "allow":

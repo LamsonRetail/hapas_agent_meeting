@@ -40,6 +40,12 @@ def _meta_to_json(meta: MeetingMeta) -> str:
     }, ensure_ascii=False)
 
 
+def meta_to_json(meta: MeetingMeta) -> str:
+    """Công khai `_meta_to_json` — `orchestrator._maybe_reresolve` cần nó để
+    nhân bản meta (serialize rồi parse lại) trước khi tra lại người dự."""
+    return _meta_to_json(meta)
+
+
 def meta_from_json(s: str) -> MeetingMeta:
     d = json.loads(s)
     m = MeetingMeta(
@@ -84,6 +90,24 @@ def set_status(minute_token: str, status: str, *, error: str | None = None,
     with db.tx() as c:
         c.execute(f"UPDATE jobs SET {', '.join(cols)} WHERE minute_token=?",
                   vals)
+
+
+def update_meta(minute_token: str, meta: MeetingMeta) -> None:
+    """Ghi đè `meta_json` (+ `invitee_count`) của một job đã tồn tại.
+
+    Chỉ có MỘT chỗ gọi: `orchestrator._maybe_reresolve`. Trước 02/08/2026 không
+    có hàm này, và đó chính là vấn đề: `meta` được chốt đúng một lần lúc
+    `enqueue_minute` rồi đông cứng. Một cú `LarkError` thoáng qua khi đọc lịch
+    là job mang danh sách người dự sai VĨNH VIỄN — không lệnh nào, không vòng
+    nào tra lại.
+
+    KHÔNG đụng `status`/`attempts`: đây là sửa DỮ LIỆU của job, không phải một
+    bước trong máy trạng thái.
+    """
+    with db.tx() as c:
+        c.execute("UPDATE jobs SET meta_json=?, invitee_count=? "
+                  "WHERE minute_token=?",
+                  (_meta_to_json(meta), meta.invitee_count, minute_token))
 
 
 def bump_attempts(minute_token: str) -> int:

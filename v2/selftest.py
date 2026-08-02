@@ -965,6 +965,199 @@ def _main() -> int:
     summarize.summarize, _bt.update_recap = keep8
 
     # =================================================================
+    part("26. Bot CHỈ trả lời chat 1-1, không trả lời trong group")
+    # =================================================================
+    # Lý do KHÔNG phải "agent lẫn vé của hai người" — Hermes để
+    # `group_sessions_per_user: true` nên mỗi người trong group đã là một
+    # session riêng. Lý do thật: `qa._may_see` cấp quyền cho NGƯỜI HỎI, còn câu
+    # trả lời thì CẢ PHÒNG đọc được. Hôm nay còn hai lớp chặn ngoài repo
+    # (FEISHU_GROUP_POLICY, plugin); đây là lớp duy nhất có test.
+    add_user("ou_g1", "on_g1", "Nguoi Trong Group")
+    for ct in ("group", "channel", "thread", "GROUP"):
+        r = gate.check("on_g1", name="x", send=False, chat_type=ct)
+        check(f"chat_type={ct!r} -> KHÔNG cho vào",
+              r["decision"] != "allow", str(r))
+    for ct in ("dm", "p2p", "DM"):
+        r = gate.check("on_g1", name="x", send=False, chat_type=ct)
+        check(f"chat_type={ct!r} -> cho vào bình thường",
+              r["decision"] == "allow", str(r))
+    # Plugin đời cũ chưa gửi trường này. CHO ĐI TIẾP có chủ ý: `v2-gate.bat`
+    # spawn Python mới nên ăn code mới ngay, còn plugin phải restart gateway
+    # mới cập nhật — đóng ở đây là bot câm với TẤT CẢ trong khoảng giữa.
+    r = gate.check("on_g1", name="x", send=False)
+    check("chat_type rỗng (plugin đời cũ) -> vẫn cho vào",
+          r["decision"] == "allow", str(r))
+    # Chặn phải xảy ra TRƯỚC khi cấp vé: vé cấp ra cho một ngữ cảnh mà câu trả
+    # lời sẽ bị người khác đọc là đã hỏng rồi, dù sau đó có chặn.
+    r = gate.check("on_g1", name="x", send=False, chat_type="group")
+    check("chặn group thì KHÔNG cấp vé phiên", not r.get("asker_token"), str(r))
+    # Người CHƯA enroll nhắn trong group: không được gửi link vào phòng chung.
+    r = gate.check("on_chua_enroll", name="y", send=False, chat_type="group")
+    check("người chưa enroll trong group -> không mời, không nhắn",
+          r["decision"] == "wait" and "nonce" not in r, str(r))
+
+    # =================================================================
+    part("27. Thử lại khi Lark chập — CHỈ cho lời gọi ĐỌC")
+    # =================================================================
+    # Trước 02/08/2026 không có một dòng retry nào. Mà tra người dự cho MỘT
+    # cuộc họp tốn hàng chục lời gọi, và một cú 429 lẻ ở giữa là danh sách
+    # người nhận sai — im lặng.
+    import httpx as _httpx
+
+    seen: list[tuple[str, str]] = []
+
+    class _FakeTransport(lark_api._RetryTransport):
+        """Đếm số lần gọi thật. `codes` là chuỗi mã trả về lần lượt."""
+
+        def __init__(self, codes):
+            super().__init__()
+            self.codes = list(codes)
+
+        def _send_single_request(self, request):    # noqa: D401
+            raise AssertionError("khong duoc goi toi mang")
+
+        def handle_request(self, request):
+            # Chặn ở lớp dưới cùng: gọi lại logic thử lại của lớp cha nhưng
+            # thay phần đi mạng bằng response giả.
+            return lark_api._RetryTransport.handle_request(self, request)
+
+    def _fake_super(codes):
+        """Giả `httpx.HTTPTransport.handle_request` -> tuần tự các mã trong codes."""
+        box = {"i": 0}
+
+        def fn(self, request):
+            seen.append((request.method, request.headers.get("x-v2-read", "-")))
+            i = min(box["i"], len(codes) - 1)
+            box["i"] += 1
+            return _httpx.Response(codes[i], content=b"{}", request=request)
+        return fn
+
+    keep9 = (_httpx.HTTPTransport.handle_request, time.sleep)
+    time.sleep = lambda s: None                     # đừng chờ thật trong test
+
+    def run_case(method, codes, headers=None):
+        seen.clear()
+        _httpx.HTTPTransport.handle_request = _fake_super(codes)
+        t = lark_api._RetryTransport()
+        req = _httpx.Request(method, "https://x/y", headers=headers or {})
+        resp = t.handle_request(req)
+        return resp, len(seen)
+
+    _, n = run_case("GET", [429, 429, 200])
+    check("GET gặp 429 -> thử lại tới khi được", n == 3, f"{n} lần gọi")
+    _, n = run_case("GET", [500, 200])
+    check("GET gặp 500 -> thử lại", n == 2, f"{n} lần gọi")
+    resp, n = run_case("GET", [503, 503, 503])
+    check("GET hỏng mãi -> dừng đúng _RETRY_CALLS, trả response cuối",
+          n == lark_api._RETRY_CALLS and resp.status_code == 503, f"{n} lần gọi")
+    _, n = run_case("GET", [404])
+    check("GET 404 -> KHÔNG thử lại (lỗi của ta, không phải của Lark)", n == 1)
+    # QUAN TRỌNG NHẤT: POST thường không được thử lại. `im_send_card` là POST,
+    # và phát biên bản hai lần cho cả phòng họp là thứ ai cũng nhìn thấy.
+    _, n = run_case("POST", [429, 200])
+    check("POST 429 -> KHÔNG thử lại (rủi ro gửi TRÙNG)", n == 1, f"{n} lần gọi")
+    _, n = run_case("POST", [429, 200], headers=dict(lark_api.READ_ONLY))
+    check("POST tự khai chỉ-đọc -> ĐƯỢC thử lại", n == 2, f"{n} lần gọi")
+    check("header nội bộ x-v2-read KHÔNG bị gửi ra ngoài",
+          all(h == "-" for _, h in seen), str(seen))
+
+    # `Retry-After` của Lark được tôn trọng, nhưng có TRẦN: một header hỏng
+    # (`Retry-After: 3600`) không được treo cả vòng run.
+    r429 = _httpx.Response(429, headers={"retry-after": "2"},
+                           request=_httpx.Request("GET", "https://x"))
+    check("tôn trọng Retry-After", lark_api._retry_after_s(r429, 0) == 2.0)
+    rbig = _httpx.Response(429, headers={"retry-after": "3600"},
+                           request=_httpx.Request("GET", "https://x"))
+    check("Retry-After quá lớn bị chặn trần",
+          lark_api._retry_after_s(rbig, 0) == lark_api._RETRY_CAP_S)
+    rno = _httpx.Response(429, request=_httpx.Request("GET", "https://x"))
+    check("không có Retry-After -> lùi theo cấp số nhân",
+          lark_api._retry_after_s(rno, 0) < lark_api._retry_after_s(rno, 2))
+
+    _httpx.HTTPTransport.handle_request, time.sleep = keep9
+
+    # =================================================================
+    part("28. Tra LẠI người dự khi lần đầu thất bại")
+    # =================================================================
+    # `meta` chốt đúng một lần lúc enqueue rồi đông cứng: một cú LarkError
+    # thoáng qua ở calendar là job mang danh sách sai VĨNH VIỄN.
+    check("nguồn đã tra được -> không tra lại",
+          not orchestrator._needs_reresolve("calendar[verified]:Hop tuan +vc3"))
+    for src in ("agenda_failed", "no_match", "no_calendar_event",
+                "no_event_in_window", "no_start_time",
+                "no_calendar_event -> fallback:owner"):
+        check(f"nguồn {src!r} -> phải tra lại",
+              orchestrator._needs_reresolve(src))
+
+    add_user("ou_rr", "on_rr", "Nguoi Cho Muon Token")
+    keep10 = (meetings.resolve_participants, tokenstore.get_access_token)
+    tokenstore.get_access_token = lambda oid: "tok"
+
+    m_bad = meta(minute_token="obsgRR00000000000000001",
+                 owner_open_id="ou_rr",
+                 participants_source="agenda_failed")
+    m_bad.attendees = [Attendee(open_id="ou_rr", union_id="on_rr")]
+    jobstore.create(m_bad)
+
+    def _ok(tokn, mm):
+        mm.attendees = [Attendee(open_id="ou_rr", union_id="on_rr"),
+                        Attendee(open_id="ou_x2", union_id="on_x2")]
+        mm.participants_source = "calendar[verified]:Hop tuan"
+        return mm
+    meetings.resolve_participants = _ok
+    got = orchestrator._maybe_reresolve(m_bad, dry_run=False)
+    check("tra lại thành công -> dùng danh sách mới",
+          got.participants_source.startswith("calendar[")
+          and len(got.attendees) == 2, got.participants_source)
+    saved = jobstore.meta_from_json(
+        jobstore.get("obsgRR00000000000000001")["meta_json"])
+    check("kết quả tra lại được LƯU vào job",
+          len(saved.attendees) == 2, str(len(saved.attendees)))
+
+    # Nhánh nguy hiểm nhất: tra lại HỎNG thì phải giữ nguyên cái đang có.
+    # `resolve_participants` sửa TẠI CHỖ và xoá trắng attendees khi thất bại,
+    # nên làm thẳng trên meta là tra lại khiến mọi thứ TỆ ĐI.
+    m_fb = meta(minute_token="obsgRR00000000000000002", owner_open_id="ou_rr",
+                participants_source="no_calendar_event -> fallback:owner")
+    m_fb.attendees = [Attendee(open_id="ou_rr", union_id="on_rr")]
+    jobstore.create(m_fb)
+
+    def _fail(tokn, mm):
+        mm.attendees = []
+        mm.participants_source = "agenda_failed"
+        return mm
+    meetings.resolve_participants = _fail
+    got = orchestrator._maybe_reresolve(m_fb, dry_run=False)
+    check("tra lại thất bại -> GIỮ NGUYÊN người dự cũ, không xoá trắng",
+          len(got.attendees) == 1
+          and got.participants_source == "no_calendar_event -> fallback:owner",
+          f"{len(got.attendees)} người, {got.participants_source!r}")
+    still = jobstore.meta_from_json(
+        jobstore.get("obsgRR00000000000000002")["meta_json"])
+    check("thất bại thì KHÔNG ghi đè meta trong DB", len(still.attendees) == 1)
+
+    # dry-run: được phép tra (chỉ đọc) nhưng KHÔNG được ghi.
+    m_dry = meta(minute_token="obsgRR00000000000000003", owner_open_id="ou_rr",
+                 participants_source="agenda_failed")
+    m_dry.attendees = [Attendee(open_id="ou_rr", union_id="on_rr")]
+    jobstore.create(m_dry)
+    meetings.resolve_participants = _ok
+    orchestrator._maybe_reresolve(m_dry, dry_run=True)
+    dry_saved = jobstore.meta_from_json(
+        jobstore.get("obsgRR00000000000000003")["meta_json"])
+    check("dry-run KHÔNG ghi meta mới vào DB", len(dry_saved.attendees) == 1,
+          str(len(dry_saved.attendees)))
+
+    # Không mượn được token của ai thì im lặng đi tiếp, đừng ném.
+    tokenstore.get_access_token = lambda oid: (_ for _ in ()).throw(
+        tokenstore.TokenError("chua enroll"))
+    got = orchestrator._maybe_reresolve(m_fb, dry_run=False)
+    check("không ai cho mượn token -> giữ nguyên, không ném",
+          len(got.attendees) == 1)
+
+    meetings.resolve_participants, tokenstore.get_access_token = keep10
+
+    # =================================================================
     print("\n" + "=" * 66)
     print(f"selftest: PASS {len(ok)}   FAIL {len(bad)}")
     for f in bad:
