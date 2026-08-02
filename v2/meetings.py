@@ -234,7 +234,24 @@ def _attendee_ids(items: list[dict]) -> tuple[list[str], int]:
     không dự — họp nội bộ hầu như không ai bấm. Chỉ `decline` mới là lời từ chối
     tường minh, và chỉ nó mới đủ cơ sở để cắt người ra khỏi danh sách.
     """
-    keep, dropped = [], 0
+    keep, dropped = _attendee_map(items)
+    return list(keep.values()), dropped
+
+
+def _attendee_map(items: list[dict]) -> tuple[dict[str, str], int]:
+    """({attendee_id: user_id} còn hiệu lực, số người ĐÃ TỪ CHỐI bị loại).
+
+    `attendee_id` là khoá ghép giữa hai lời gọi `event_attendees` khác
+    `user_id_type` — đo thật 02/08/2026 trên sự kiện 11 người: cùng một người
+    có `attendee_id` GIỐNG HỆT ở cả lời gọi `union_id` lẫn `open_id`
+    (`user_7534535284232880160`), chỉ `user_id` là đổi dạng. Trước đó code ghép
+    hai danh sách THEO THỨ TỰ, mà Lark không hứa gì về thứ tự.
+
+    Lọc `type != "user"` ở đây cũng là chỗ loại phòng họp (`resource_…`) và
+    group chat — cùng lý do làm `event_attendees` trả 11 item cho 10 người.
+    """
+    keep: dict[str, str] = {}
+    dropped = 0
     for a in items:
         if a.get("type") != "user":
             continue
@@ -242,8 +259,11 @@ def _attendee_ids(items: list[dict]) -> tuple[list[str], int]:
             dropped += 1
             continue
         uid = a.get("user_id") or ""
-        if uid:
-            keep.append(uid)
+        if not uid:
+            continue
+        # Không có `attendee_id` thì tự chế một khoá không đụng ai: thà mất
+        # cặp union/open của riêng người đó còn hơn ghép nhầm sang người khác.
+        keep[str(a.get("attendee_id") or f"_noid:{uid}")] = uid
     return keep, dropped
 
 
@@ -416,8 +436,9 @@ def resolve_participants(access_token: str, meta: MeetingMeta) -> MeetingMeta:
                                                  id_type="open_id")
         except lark_api.LarkError:
             continue
-        unions, declined = _attendee_ids(atts)
-        opens, _ = _attendee_ids(atts_open)
+        umap, declined = _attendee_map(atts)
+        omap, _ = _attendee_map(atts_open)
+        unions, opens = list(umap.values()), list(omap.values())
 
         # Người thật sự vào phòng họp, gộp thêm vào người được mời. Chỉ làm
         # được khi đã xác minh (`verified`) vì chỉ khi đó ta mới có meeting_id
@@ -429,20 +450,21 @@ def resolve_participants(access_token: str, meta: MeetingMeta) -> MeetingMeta:
         if not (unions or opens or extra):
             continue
 
-        if len(unions) == len(opens):
-            # Ghép theo thứ tự trả về từ cùng sự kiện (mục 11b vẫn còn mở).
-            attendees = [Attendee(open_id=opens[i], union_id=unions[i])
-                         for i in range(len(unions))]
-        else:
-            # Hai lời gọi trả số người KHÁC nhau -> ghép theo thứ tự là ghép
-            # BỪA, và nó gán danh tính sai một cách im lặng. Thà để mỗi id đứng
-            # riêng: mọi chỗ dùng danh sách này đều dùng nó như một TẬP id (phát
-            # theo union_id; `qa.viewers_index` hợp cả hai loại), nên tách ra
-            # không mất gì cả.
-            print(f"[meetings] {event_id}: union={len(unions)} "
-                  f"open={len(opens)} lệch nhau -> KHÔNG ghép cặp theo thứ tự")
-            attendees = ([Attendee(union_id=u) for u in unions]
-                         + [Attendee(open_id=o) for o in opens])
+        # Ghép theo `attendee_id`, KHÔNG theo thứ tự (mục 11b — đóng
+        # 02/08/2026). Lark không hứa hai lời gọi trả cùng thứ tự; hôm nay
+        # chúng trùng nhau nên lỗi này vô hình, và nó sẽ chỉ lộ ra vào đúng
+        # ngày ai đó ghép hai id thành MỘT người rồi gửi nhầm.
+        attendees = [Attendee(open_id=omap.get(k, ""), union_id=u)
+                     for k, u in umap.items()]
+        # Người chỉ xuất hiện ở lời gọi open_id: giữ lại, đứng riêng. Không có
+        # union_id thì không gửi được, nhưng `_reader_candidates` vẫn mượn được
+        # token của họ để tải bản ghi.
+        le = [Attendee(open_id=o) for k, o in omap.items() if k not in umap]
+        if le:
+            print(f"[meetings] {event_id}: {len(le)} người chỉ có ở lời gọi "
+                  f"open_id (union={len(umap)} open={len(omap)}) — giữ riêng, "
+                  f"không ghép bừa")
+            attendees += le
 
         attendees += [Attendee(union_id=u) for u in extra]
 

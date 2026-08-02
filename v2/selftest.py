@@ -438,6 +438,53 @@ def _main() -> int:
     check("bỏ phòng họp (resource) và group chat (chat)",
           "phong-hop" not in keep6 and "oc_group" not in keep6)
 
+    # Ghép union_id <-> open_id theo `attendee_id`, KHÔNG theo thứ tự trả về.
+    # Đo 02/08/2026 trên sự kiện thật 11 người: cùng một người có `attendee_id`
+    # giống hệt ở cả hai lời gọi, chỉ `user_id` đổi dạng. Lark không hứa hai
+    # lời gọi cùng thứ tự — và ghép lệch là gán danh tính sai, im lặng.
+    keep6b = (lark_api.calendar_primary, lark_api.calendar_events,
+              lark_api.event_meeting_ids, lark_api.event_attendees,
+              meetings._meeting_ids_via_no)
+    _t6 = 1_785_600_000
+    lark_api.calendar_primary = lambda tok: "cal1"
+    lark_api.calendar_events = lambda tok, cal, lo, hi: [
+        {"event_id": "ev1", "summary": "Hop tuan",
+         "start_time": {"timestamp": str(_t6)}}]
+    lark_api.event_meeting_ids = lambda tok, cal, ids: {}
+    meetings._meeting_ids_via_no = lambda tok, cal, ev: []
+    # THỨ TỰ NGƯỢC NHAU có chủ ý giữa hai lời gọi.
+    lark_api.event_attendees = lambda tok, cal, eid, id_type="union_id", **k: (
+        [{"type": "user", "attendee_id": "a1", "user_id": "on_A"},
+         {"type": "user", "attendee_id": "a2", "user_id": "on_B"}]
+        if id_type == "union_id" else
+        [{"type": "user", "attendee_id": "a2", "user_id": "ou_B"},
+         {"type": "user", "attendee_id": "a1", "user_id": "ou_A"}])
+    m6 = meta(minute_token="obsgPAIR0000000000001", title="Hop tuan")
+    m6.start = _t6
+    m6.attendees = []
+    meetings.resolve_participants("tok", m6)
+    pairs6 = sorted((a.union_id, a.open_id) for a in m6.attendees)
+    check("ghép cặp theo attendee_id dù hai lời gọi trả NGƯỢC thứ tự",
+          pairs6 == [("on_A", "ou_A"), ("on_B", "ou_B")],
+          f"thực tế: {pairs6} (nguồn={m6.participants_source})")
+
+    # Người chỉ có ở một phía: giữ lại, đứng riêng, KHÔNG ghép bừa.
+    lark_api.event_attendees = lambda tok, cal, eid, id_type="union_id", **k: (
+        [{"type": "user", "attendee_id": "a1", "user_id": "on_A"}]
+        if id_type == "union_id" else
+        [{"type": "user", "attendee_id": "a1", "user_id": "ou_A"},
+         {"type": "user", "attendee_id": "a9", "user_id": "ou_LE"}])
+    m6b = meta(minute_token="obsgPAIR0000000000002", title="Hop tuan")
+    m6b.start = _t6
+    m6b.attendees = []
+    meetings.resolve_participants("tok", m6b)
+    pairs6b = sorted((a.union_id, a.open_id) for a in m6b.attendees)
+    check("hai lời gọi lệch nhau -> ghép được ai thì ghép, phần dư đứng riêng",
+          pairs6b == [("", "ou_LE"), ("on_A", "ou_A")], f"thực tế: {pairs6b}")
+    (lark_api.calendar_primary, lark_api.calendar_events,
+     lark_api.event_meeting_ids, lark_api.event_attendees,
+     meetings._meeting_ids_via_no) = keep6b
+
     keep7 = lark_api.vc_meeting_participants
     lark_api.vc_meeting_participants = lambda tok, mid, id_type="union_id": [
         {"id": "on_1", "user_type": 1, "is_external": False},
@@ -1275,6 +1322,88 @@ def _main() -> int:
           "rỗng" in (kinds30.get("full", {})["error"] or "")
           if "full" in kinds30 else False)
     pipeline.write_txt, lark_api.im_upload_file, lark_api.im_send_card = keep30b
+
+    # =================================================================
+    part("33. Một người token chập không được làm mù cả vòng quét")
+    # =================================================================
+    # `get_access_token` gọi `refresh_user_token` (POST, KHÔNG có retry). Một cú
+    # 429 khi làm mới token của người thứ nhất từng bay thẳng ra khỏi vòng
+    # `for u in users` -> hai người còn lại không được quét gì trong vòng đó.
+    with db.tx() as c:
+        c.execute("DELETE FROM tokens")
+    add_user("ou_CHAP", "on_CHAP", "Token chap")
+    add_user("ou_LANH", "on_LANH", "Binh thuong")
+    keep33 = (tokenstore.get_access_token, lark_api.minutes_list)
+    seen33: list = []
+
+    def _gat33(oid):
+        if oid == "ou_CHAP":
+            raise lark_api.LarkError(429, "too many requests", "oauth/token")
+        return "tok"
+
+    tokenstore.get_access_token = _gat33
+    lark_api.minutes_list = lambda tok, s, e, oid: (seen33.append(oid), [])[1]
+    orchestrator.scan_once()
+    check("người sau VẪN được quét dù người trước lỗi token",
+          seen33 == ["ou_LANH"], f"đã quét: {seen33}")
+    tokenstore.get_access_token, lark_api.minutes_list = keep33
+    with db.tx() as c:
+        c.execute("DELETE FROM tokens")
+
+    # =================================================================
+    part("32. Gửi hỏng MỘT PHẦN phải được gửi bù, và chỉ cho đúng người")
+    # =================================================================
+    # `_deliver_now` chỉ giữ `queued` khi hỏng với TẤT CẢ (`failed and not
+    # sent`). Hỏng một phần -> job `delivered` -> người đó mất biên bản vĩnh
+    # viễn dù dòng ok=0 nằm sẵn trong `deliveries`. Base và recap đều đã có
+    # đường vá cho hình dạng lỗi này; việc PHÁT thì chưa, mà nó là bước duy
+    # nhất người dùng thật sự nhìn thấy.
+    import json as _j32
+    _tok32 = "obsgBF00000000000000001"
+    wipe_jobs()
+    with db.tx() as c:
+        c.execute("DELETE FROM deliveries")
+    mk_job(_tok32, attempts=0)
+    _tp32 = config.TRANSCRIPT_DIR / "backfill-deliveries.json"
+    _tp32.write_text(_j32.dumps(Transcript(
+        minute_token=_tok32, lang="vi", duration=10, engine="t",
+        segments=[Segment(0, 10, "noi dung that")]).to_json()), encoding="utf-8")
+    jobstore.set_status(_tok32, "delivered", transcript_path=str(_tp32),
+                        recap_json=_j32.dumps({"summary": "tom tat that",
+                                               "decisions": [],
+                                               "action_items": []}))
+    jobstore.record_delivery(_tok32, "on_OK", "recap", True)
+    jobstore.record_delivery(_tok32, "on_OKSAU", "recap", False, "429")
+    jobstore.record_delivery(_tok32, "on_OKSAU", "recap", True)      # rồi được
+    jobstore.record_delivery(_tok32, "on_HONG", "recap", False, "429")
+    for _ in range(3):                                               # quá hạn mức
+        jobstore.record_delivery(_tok32, "on_BOCUOC", "recap", False, "230013")
+
+    _pend32 = jobstore.pending_recipients(_tok32, "recap", 3)
+    check("người đã nhận được -> KHÔNG gửi lại", "on_OK" not in _pend32)
+    check("hỏng rồi sau đó nhận được -> KHÔNG gửi lại", "on_OKSAU" not in _pend32)
+    check("hỏng và chưa lần nào nhận được -> có trong danh sách gửi bù",
+          "on_HONG" in _pend32, str(_pend32))
+    check("quá 3 lần thử -> thôi, không thử mãi", "on_BOCUOC" not in _pend32)
+
+    keep32 = pipeline.deliver
+    got32: list = []
+    pipeline.deliver = lambda m, r, t, recips, **k: (got32.extend(recips),
+                                                     (recips, []))[1]
+    orchestrator._backfill_deliveries()
+    check("gửi bù CHỈ cho người chưa nhận được, không phát lại cả phòng",
+          got32 == ["on_HONG"], f"thực tế gửi cho: {got32}")
+
+    # Job mà mọi người hỏng đều đã quá hạn mức: không được gọi gửi nữa.
+    got32.clear()
+    with db.tx() as c:
+        c.execute("DELETE FROM deliveries WHERE recipient <> 'on_BOCUOC'")
+    orchestrator._backfill_deliveries()
+    check("hết lượt thử -> KHÔNG gọi gửi nữa (khỏi đốt API mỗi vòng)",
+          got32 == [], f"vẫn gọi cho: {got32}")
+    pipeline.deliver = keep32
+    with db.tx() as c:
+        c.execute("DELETE FROM deliveries")
 
     # =================================================================
     part("31. `.bat` chạy nền: `timeout` KHÔNG thay được `ping`")

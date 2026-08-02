@@ -92,6 +92,16 @@ def scan_once() -> int:
         except tokenstore.TokenError as exc:
             print(f"[scan] {u['name'] or oid}: {exc}")
             continue
+        except Exception as exc:         # noqa: BLE001 — xem dưới
+            # KHÔNG chỉ bắt TokenError (sửa 02/08/2026): `get_access_token` gọi
+            # `refresh_user_token` khi access sắp hết hạn, và lời gọi đó là POST
+            # nên KHÔNG có retry — một cú 429/5xx/mạng chớp là `LarkError` bay
+            # thẳng ra khỏi vòng `for u in users`, tức những người CÒN LẠI không
+            # được quét gì trong vòng đó. Một người có token chập không được
+            # phép làm mù cả hệ thống.
+            print(f"[scan] {u['name'] or oid}: lỗi khi lấy token, bỏ qua người "
+                  f"này trong vòng này: {exc}")
+            continue
         # Lọc theo chính người này: minute nào họ có dự thì họ có quyền đọc.
         items = lark_api.minutes_list(token, start, end, oid)
         for it in items:
@@ -271,6 +281,12 @@ def _process_queue(dry_run: bool | None = None) -> None:
             _backfill_recaps()
         except Exception as exc:         # noqa: BLE001 — cùng lý lẽ _backfill_base
             print(f"[recap] thử làm lại tóm tắt hỏng (bỏ qua): {exc}")
+        # Gửi bù SAU khi làm lại recap: người chưa nhận được lần nào thì nên
+        # nhận bản tóm tắt thật, đừng nhận bản giữ chỗ rồi thôi.
+        try:
+            _backfill_deliveries()
+        except Exception as exc:         # noqa: BLE001 — cùng lý lẽ _backfill_base
+            print(f"[deliver] thử gửi bù hỏng (bỏ qua): {exc}")
         _backfill_base()
 
 
@@ -377,6 +393,58 @@ def _backfill_recaps() -> None:
         print(f"[recap] {token} ({meta.title!r}) đã có tóm tắt thật sau khi "
               f"LLM sống lại — người dự KHÔNG nhận thêm tin, chỉ Base đổi")
         bitable.update_recap(token, new)
+
+
+# Tối đa bao nhiêu JOB được gửi bù trong MỘT vòng, và mỗi người được thử lại
+# mấy lần trước khi thôi. Cả hai đều nhỏ có chủ ý: gửi bù là hành động HƯỚNG RA
+# NGOÀI (tin vào chat người thật), nên thà chậm còn hơn ồn.
+BACKFILL_DELIVERIES_PER_ROUND = 2
+DELIVERY_MAX_TRIES = 3
+
+
+def _backfill_deliveries() -> None:
+    """Gửi lại cho người mà lần phát trước hỏng, và CHỈ người đó.
+
+    Vì sao cần (02/08/2026): xem docstring `jobstore.pending_recipients`. Job
+    hỏng một phần vẫn thành `delivered`, nên không vòng nào nhặt lại — người bị
+    429 hay mạng chớp mất biên bản vĩnh viễn, dù dòng `ok=0` nằm sẵn trong DB.
+
+    KHÔNG gửi cho cả danh sách: người đã nhận rồi mà nhận lại là tin trùng cho
+    cùng một cuộc họp. `pending_recipients` lọc đúng người chưa từng nhận được.
+
+    Bỏ cuộc sau `DELIVERY_MAX_TRIES` lần: 230013 (app chưa phát hành cho người
+    đó) không tự khỏi, thử mãi là mỗi vòng một lần gọi API vô ích. Lúc bỏ cuộc
+    thì NÓI TO — im lặng ở đây là quay lại đúng cái lỗi đang sửa.
+    """
+    done = 0
+    for row in jobstore.by_status("delivered"):
+        if done >= BACKFILL_DELIVERIES_PER_ROUND:
+            return
+        token = row["minute_token"]
+        pend = jobstore.pending_recipients(token, "recap", DELIVERY_MAX_TRIES)
+        if not pend:
+            # Đã hết lượt thử mà vẫn chưa ai nhận được -> nói một câu rõ ràng.
+            stuck = jobstore.pending_recipients(token, "recap", 10_000)
+            if stuck:
+                print(f"[deliver] {token} BỎ CUỘC với {len(stuck)} người sau "
+                      f"{DELIVERY_MAX_TRIES} lần thử: {[x[:16] for x in stuck]} "
+                      f"— xem `deliveries.error`, nhiều khả năng 230013 "
+                      f"(app chưa phát hành cho họ)")
+            continue
+        got = _reuse(token, row)
+        if not got:
+            continue                       # không dựng lại được nội dung
+        t, recap = got
+        if recap is None:
+            continue                       # chưa có tóm tắt thì chờ vòng recap
+        try:
+            meta = jobstore.meta_from_json(row["meta_json"])
+        except Exception as exc:           # noqa: BLE001 — job cũ méo dữ liệu
+            print(f"[deliver] {token} meta_json méo, bỏ qua: {exc}")
+            continue
+        done += 1
+        print(f"[deliver] {token} gửi BÙ cho {len(pend)} người lần trước hỏng")
+        pipeline.deliver(meta, recap, t, pend, dry_run=False)
 
 
 def _backfill_base() -> None:

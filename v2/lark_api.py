@@ -462,14 +462,38 @@ def vc_meetings_by_no(access_token: str, meeting_no: str,
 
 
 def event_attendees(access_token: str, calendar_id: str, event_id: str,
-                    id_type: str = "union_id") -> list[dict[str, Any]]:
-    """Danh sách người được mời của một sự kiện."""
-    resp = _http().get(
-        f"/open-apis/calendar/v4/calendars/{calendar_id}/events/{event_id}/attendees",
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={"user_id_type": id_type, "page_size": 100},
-    )
-    return _check(resp, "event_attendees").get("data", {}).get("items", [])
+                    id_type: str = "union_id",
+                    max_pages: int = 10) -> list[dict[str, Any]]:
+    """Danh sách người được mời của một sự kiện. CÓ phân trang.
+
+    Trước 02/08/2026 hàm này gửi `page_size=100` rồi lấy trang đầu và thôi —
+    cuộc họp đông hơn 100 người bị cắt IM LẶNG, không lỗi, không cảnh báo, và
+    hệ quả rơi đúng vào chỗ nguy hiểm nhất: danh sách người dự. Đã có cuộc 30
+    người thật (`Workforce AI Weekly`) nên ngưỡng 100 không còn xa.
+
+    `max_pages` là chốt chặn vòng lặp vô hạn nếu Lark trả `has_more` mãi —
+    1.000 người là quá đủ cho một sự kiện lịch.
+    """
+    items: list[dict[str, Any]] = []
+    page_token = ""
+    for _ in range(max_pages):
+        params: dict[str, Any] = {"user_id_type": id_type, "page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        resp = _http().get(
+            f"/open-apis/calendar/v4/calendars/{calendar_id}/events/{event_id}/attendees",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+        )
+        data = _check(resp, "event_attendees").get("data", {})
+        items.extend(data.get("items") or [])
+        page_token = data.get("page_token") or ""
+        if not data.get("has_more") or not page_token:
+            break
+    else:
+        print(f"[lark_api] event_attendees {event_id}: còn trang sau khi đã lấy "
+              f"{max_pages} trang ({len(items)} người) — danh sách CÓ THỂ thiếu")
+    return items
 
 
 # =====================================================================

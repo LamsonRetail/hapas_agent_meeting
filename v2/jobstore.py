@@ -194,6 +194,30 @@ def delivery_counts(minute_token: str, kind: str = "recap") -> tuple[int, int]:
     return ok, len(rows) - ok
 
 
+def pending_recipients(minute_token: str, kind: str = "recap",
+                       max_tries: int = 3) -> list[str]:
+    """Người mà MỌI lần gửi `kind` đều hỏng, và chưa quá `max_tries` lần thử.
+
+    Vì sao cần (02/08/2026): `_deliver_now` chỉ giữ job ở `queued` khi gửi hỏng
+    cho TẤT CẢ (`failed and not sent`). Hỏng MỘT PHẦN — 3 người nhận được, 1
+    người 429 — thì job vẫn thành `delivered` và người đó KHÔNG BAO GIỜ nhận
+    được biên bản, dù dòng `ok=0` nằm sẵn trong bảng này. Base và recap đều đã
+    có đường vá cho "bước phụ hỏng mà việc chính vẫn xong"; riêng việc PHÁT thì
+    chưa, và nó là bước duy nhất người dùng thật sự nhìn thấy.
+
+    `MAX(ok)=0` = chưa lần nào thành công. Có một dòng `ok=1` là thôi, kể cả khi
+    trước đó hỏng vài lần — đã tới tay rồi thì không gửi lại (tin trùng).
+    """
+    rows = db.conn().execute(
+        """SELECT recipient, COUNT(*) AS tries
+             FROM deliveries
+            WHERE minute_token = ? AND kind = ?
+         GROUP BY recipient
+           HAVING MAX(ok) = 0 AND tries < ?""",
+        (minute_token, kind, max_tries)).fetchall()
+    return [r["recipient"] for r in rows]
+
+
 def record_delivery(minute_token: str, recipient: str, kind: str,
                     ok: bool, error: str = "") -> None:
     with db.tx() as c:

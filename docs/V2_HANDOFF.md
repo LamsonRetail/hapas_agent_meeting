@@ -73,8 +73,11 @@ có `v2 action`. Bỏ theo yêu cầu user 30/07.
 - **`process --send` — đã chạy THẬT 31/07**, cả 2 job `delivered`, bảng
   `deliveries` có 4 dòng `ok=1` (mỗi job 1 tin `recap` + 1 file `full`). NHƯNG
   user chọn **chỉ gửi cho chính mình**: danh sách người nhận bị thu về 1 người
-  trước khi gửi rồi trả lại nguyên trạng. Nên phần **dùng lại `file_key` cho
-  người thứ hai vẫn CHƯA có bằng chứng thật** — vẫn chỉ mock. Lưu ý khi đọc DB:
+  trước khi gửi rồi trả lại nguyên trạng. ~~Nên phần dùng lại `file_key` cho
+  người thứ hai vẫn CHƯA có bằng chứng thật.~~ — **ĐÃ CHẠY THẬT, phát hiện
+  02/08/2026 khi soi `deliveries`**: hai cuộc họp (`obsg23lsr…`, `obsg3q5tb…`)
+  mỗi cuộc có **2 người nhận đủ cả `recap` lẫn `full`**. Mục này coi như đóng,
+  xem V2_MAINTENANCE §31. Lưu ý khi đọc DB:
   `meta_json.attendees` = người *phát hiện được* (2 người), `deliveries.recipient`
   = người *thực sự nhận* (1 người). Hai con số khác nhau là có chủ ý.
 - ~~**Nối Feishu cho Hermes.**~~ XONG 30/07 — đã nhắn thật trong Lark, bot gọi
@@ -288,10 +291,11 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
    nên phần gộp VC ở trên vẫn có giá trị dù không còn phát rộng.
    Hệ quả: đường dùng lại `file_key` cho người thứ 2+ vẫn sẽ chạy thật ở cuộc
    họp đầu tiên có ≥2 người enroll cùng dự (§3), chỉ là quy mô nhỏ hơn nhiều.
-   **(b) CÒN MỞ:** vẫn ghép `union_id`/`open_id` theo THỨ TỰ khi hai lời gọi
-   trả cùng số lượng (Lark không hứa cùng thứ tự). Hôm nay vô hại vì mọi chỗ
-   dùng danh sách này như một TẬP id — thành lỗ ngay khi có code ghép hai id đó
-   thành một người. `event_attendees` cũng vẫn chưa phân trang (`page_size=100`).
+   ~~**(b) CÒN MỞ:** vẫn ghép `union_id`/`open_id` theo THỨ TỰ… và
+   `event_attendees` chưa phân trang.~~ — **CẢ HAI SỬA XONG 02/08/2026**,
+   V2_MAINTENANCE **§31.6** và **§31.5**. Ghép bằng `attendee_id` (đo thật:
+   cùng một người có `attendee_id` giống hệt ở cả hai lời gọi, chỉ `user_id`
+   đổi dạng); `event_attendees` nay phân trang thật.
 6. ~~**Cửa vào tự phục vụ (§14) còn một khâu chưa đo:** một người THỨ HAI nhắn
    bot rồi nhận được link.~~ — **ĐÃ XẢY RA THẬT 31/07/2026 16:15**: Nguyễn Thùy
    Chi enroll thành công qua cửa tự phục vụ. Luồng chạy đúng.
@@ -365,6 +369,26 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
 
    ⚠️ Cần `hermes\install-plugin.bat` + `hermes gateway restart` + khởi động
    lại `run`. `selftest` 142 → **180**.
+
+---
+
+16. **Vòng gỡ lỗi tối 02/08/2026 — bảy phát hiện, chi tiết ở V2_MAINTENANCE §31.**
+   Vòng này bắt đầu từ **log của hệ thống đang chạy**, không phải từ đọc code:
+   - `timeout /t` trong `.bat` chạy nền **không chờ giây nào** (đo: 0,098s) —
+     `run-v2-auto` đã bật lại orchestrator 17 lần trong 0,93 giây. Đổi sang
+     `ping`. §31.1
+   - Nguyên nhân các lần chết: **máy tự ngủ** (Kernel-Power ID 42 khớp từng
+     giây với mã thoát `-1073741205`). **User chọn KHÔNG đổi cấu hình nguồn**,
+     để lúc đổi hạ tầng máy. §31.2
+   - **Transcript rỗng đi qua như thành công** — job `delivered`, `error=NULL`,
+     nhưng file 0 byte và không ai được báo. Thêm `EmptyTranscript`. §31.3
+   - **Gửi hỏng một phần thì không ai thử lại** — thêm `_backfill_deliveries`.
+     §31.4
+   - `event_attendees` **cắt im lặng ở người thứ 100**. §31.5
+   - Ghép `union_id`/`open_id` theo thứ tự → nay theo `attendee_id`. §31.6
+   - Một người token chập **làm mù cả vòng quét**. §31.7
+
+   `selftest` **180 → 201**. ⚠️ Phải khởi động lại `run` mới nạp.
 
 ---
 

@@ -2877,3 +2877,128 @@ Hai điều đã gặp khi làm bước này, để lần sau khỏi hoảng:
   `Name -eq 'python.exe'`**. Lọc mỗi `CommandLine -match 'gateway run'` là chính
   lệnh PowerShell đang lọc cũng khớp với nó — tôi đã tưởng có 6 gateway và suýt
   đi giết nhầm. Đúng cái bẫy `run-v2-auto.bat` đã ghi cho `v2 run`.
+
+---
+
+## 31. Vòng gỡ lỗi 02/08/2026 (tối) — bốn lỗ nữa cùng một họ
+
+Vòng này bắt đầu từ **log của hệ thống đang chạy**, không phải từ đọc code. Ba
+lỗi đầu lộ ra trong 30 phút đọc `v2\data\logs\v2-2026-08-02.log`; bốn cái sau ra
+từ việc đi soi đúng những chỗ mà lỗi đầu gợi ý.
+
+### 31.1 `timeout /t` trong `.bat` chạy nền KHÔNG chờ một giây nào
+
+Đo trên chính máy này:
+
+| Lệnh | Thời gian thật |
+|---|---|
+| `timeout /t 5` | **0,098s** + `ERROR: Input redirection is not supported` |
+| `ping -n 6 127.0.0.1` | 5,14s |
+
+`timeout` tự chết ngay khi stdin không phải console — đúng cảnh `.bat` chạy từ
+Task Scheduler / Startup. Hậu quả trong log: `run-v2-auto` bật lại orchestrator
+**17 lần trong 0,93 giây** (13:36:55), rồi 4 lần nữa (19:30:47). Cái trễ 120s ghi
+trong chính comment của nó **chưa bao giờ tồn tại**.
+
+Đã đổi 4 chỗ sang `ping -n N+1 127.0.0.1`. `start-v2.bat` **giữ nguyên** —
+nó chạy có console nên `timeout` vẫn đúng. `selftest` nhóm 31 chặn việc quay lại.
+
+⚠️ Ở `hermes-watchdog.bat` lỗi này là **tiềm ẩn**, không phải đang cắn: log cho
+thấy nó vẫn đo đúng nhịp 60s vì instance hiện tại được bật từ chỗ có console.
+
+### 31.2 Vì sao orchestrator chết: MÁY TỰ NGỦ
+
+Mã thoát `-1073741205` = `STATUS_DLL_INIT_FAILED_LOGOFF`, và nó là lỗi lúc
+**KHỞI ĐỘNG** python chứ không phải lúc chạy. Event Log khớp từng giây:
+
+| Kernel-Power | Log V2 |
+|---|---|
+| 13:37:01 — ID 42 *vào chế độ ngủ* | 13:36:55 — `orchestrator thoat (ma -1073741205)` |
+| 19:30:52 — ID 42 | 19:30:47 — cùng mã |
+| ID 107 *thức lại* 1–2 giây sau | |
+
+`standby-timeout-ac` = 600s, Modern Standby (S0). Trong lúc ngủ **không có vòng
+quét nào chạy**. Cách chẩn: `Get-WinEvent -FilterHashtable @{LogName='System';
+Id=42,107}`. **User chọn KHÔNG đổi cấu hình nguồn (02/08/2026)** — sẽ xử lý khi
+đổi hạ tầng máy. Bản sửa 31.1 đủ để hệ thống tự vượt qua: máy thức lại sau 1–2s
+nên lần thử cách 120s luôn thành công.
+
+### 31.3 Transcript RỖNG đi qua như một thành công hoàn hảo
+
+Job `test` (`obsg22ct6md6ogbe3hi1i782`): whisper trả 1 segment `text: ""` cho
+61,7s audio.
+
+| Nơi | Nói gì |
+|---|---|
+| file `.txt` | 0 byte → `im_upload` **234010** |
+| Base attachment | `base_media_upload` **1061002** |
+| `jobs` | `delivered`, `error=NULL`, `recap_fails=0` |
+| `deliveries` | chỉ có dòng `recap` — không dòng nào nói transcript trượt |
+
+`word_count` có sẵn trong model nhưng **chỉ được dùng để in log**. Nay có
+`pipeline.EmptyTranscript` — cùng họ "không tự khỏi" với `MediaDenied` nên
+`failed` NGAY (để `alerts._check_failed_jobs` nhìn thấy → có DM), và **không lưu
+`transcript_path`** để `_reuse` không nạp lại bản rỗng rồi phát mãi.
+
+### 31.4 Gửi hỏng MỘT PHẦN thì không ai thử lại
+
+`_deliver_now` chỉ giữ `queued` khi hỏng với **tất cả** (`failed and not sent`).
+Hỏng một phần — 3 người nhận được, 1 người 429 — thì job vẫn `delivered` và
+người đó mất biên bản vĩnh viễn, dù dòng `ok=0` nằm sẵn trong `deliveries`.
+
+Nay có `orchestrator._backfill_deliveries` + `jobstore.pending_recipients`, cùng
+khuôn với `retry_missing_records`: chỉ gửi cho người **chưa lần nào** nhận được
+(`MAX(ok)=0`), tối đa `DELIVERY_MAX_TRIES=3` lần mỗi người,
+`BACKFILL_DELIVERIES_PER_ROUND=2` job mỗi vòng. Hết lượt thì **nói to** trong
+log — 230013 (app chưa phát hành cho người đó) không tự khỏi.
+
+### 31.5 `event_attendees` cắt im lặng ở người thứ 100
+
+Gửi `page_size=100` rồi lấy trang đầu và thôi, không đọc `has_more`/`page_token`.
+Đã có cuộc 30 người thật nên ngưỡng đó không còn xa. Nay phân trang thật,
+`max_pages=10`, và in cảnh báo nếu vẫn còn trang.
+
+### 31.6 Ghép `union_id` ↔ `open_id` theo THỨ TỰ (mục 11b) — ĐÓNG
+
+Đo thật trên sự kiện 11 người (`ĐÀO TẠO BUỔI 1`): mỗi item có `attendee_id`
+**giống hệt nhau ở cả hai lời gọi**, chỉ `user_id` đổi dạng:
+
+```
+attendee_id "user_7534535284232880160"
+  gọi union_id -> user_id "on_6d0c40c8e2cd8ee7717a9c3bc4c087b5"
+  gọi open_id  -> user_id "ou_897b4439dc2bfaaa5171f569d365694f"
+```
+
+Nay ghép bằng `attendee_id` (`meetings._attendee_map`), không theo thứ tự nữa,
+và bỏ luôn nhánh "lệch số lượng thì không ghép gì cả" — ghép được ai thì ghép,
+phần dư đứng riêng.
+
+Hai điều đo được kèm theo, đáng nhớ: item **không có `user_id`** khi
+`type != "user"` (phòng họp `resource_…`) — đó là lý do sự kiện 11 item chỉ có
+10 người; và thứ tự hai lời gọi **hôm nay** trùng nhau, tức lỗi này vô hình cho
+tới đúng ngày nó không trùng.
+
+### 31.7 Một người token chập làm mù cả vòng quét
+
+`get_access_token` gọi `refresh_user_token` (POST → **không** có retry của mục
+30). `scan_once` chỉ bắt `tokenstore.TokenError`, nên một cú 429 khi làm mới
+token của người thứ nhất bay thẳng ra khỏi vòng `for u in users` — hai người còn
+lại không được quét gì trong vòng đó. Nay bắt cả `Exception` cho từng người.
+
+### Kết quả
+
+`selftest` **180 → 201**. Nhóm mới: 31 (`.bat`), 32 (gửi bù), 33 (token chập);
+nhóm 10 thêm 2 phép kiểm ghép cặp; nhóm 4/5 thêm `EmptyTranscript`.
+
+### Một điều tra ra mà KHÔNG phải lỗi: `file_key` dùng lại ĐÃ chạy thật
+
+V2_HANDOFF §3 ghi "dùng lại `file_key` cho người thứ hai vẫn chỉ là mock". Không
+còn đúng — `deliveries` cho thấy hai cuộc họp mỗi cuộc **2 người nhận đủ cả
+`recap` lẫn `full`**:
+
+```
+obsg23lsr45qp273r1m6i8nc  on_1f34d05d…  recap,full
+obsg23lsr45qp273r1m6i8nc  on_a505446a…  recap,full
+obsg3q5tb1w9i1v6q368gj1y  on_1f34d05d…  recap,full
+obsg3q5tb1w9i1v6q368gj1y  on_a505446a…  recap,full
+```
