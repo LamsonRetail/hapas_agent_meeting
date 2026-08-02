@@ -2638,3 +2638,103 @@ Chưa restart thì trạng thái là: task `V2_Alerts` chạy nhưng `run_heartb
 bao giờ được ghi, nên `_check_run_stale` **im** (không có mốc thì không kết luận
 gì — fail-safe, không phải fail-noisy). Nhớ **luật 6** khi kill: liệt kê PID
 trước, đừng `Stop-Process` theo chuỗi rộng.
+
+---
+
+## 29. Hai repo, hai lịch sử — cách đồng bộ (02/08/2026)
+
+### Vì sao có hai, và vì sao KHÔNG bao giờ được force-push
+
+| Repo | Vai trò |
+|---|---|
+| `tientham2005/MeetingxLark` (`origin`) | repo làm việc. History **có** `v1/config.bat` đang tracked với app secret Lark **đang dùng thật** + `OPENAI_API_KEY`, và ~35 MB bản ghi họp (`Web scraper.mp4` 30,3 MB) |
+| `LamsonRetail/meetingxlark` (`lamson`) | bản cho công ty. Lập ra **sạch có chủ ý** — commit gốc `23fa136` ghi thẳng "khoi tao sach, khong mang history cu" |
+
+Hai lịch sử **không liên quan** (unrelated histories). Nên `git push lamson main`
+sẽ bị TỪ CHỐI, và gợi ý đầu tiên ai cũng gặp là `--force`.
+
+> **ĐỪNG. `--force` sang `lamson` là ghi đè bản sạch bằng đúng cái history mà nó
+> được lập ra để tránh** — đẩy app secret đang sống và 35 MB bản ghi họp thật vào
+> repo của công ty. Người khác trong org fetch rồi thì không lùi lại được, kể cả
+> khi xoá commit: object vẫn nằm trong bản clone của họ.
+
+Điều này đúng **cho tới khi** Việc 3 (rotate secret + `git filter-repo`) được làm.
+Chưa làm thì luật trên là tuyệt đối.
+
+### Quy trình đồng bộ (đã chạy thật 02/08/2026 -> `91add5d`)
+
+Đồng bộ **NỘI DUNG**, không merge history: tạo một commit nằm **trên** đầu
+`lamson/main`. Làm trong **worktree riêng** để không đụng thư mục mà tiến trình
+`run` đang chạy — đổi file `.py` dưới chân một tiến trình đang sống là tự chuốc
+lấy một lỗi không tái hiện được.
+
+```bash
+# 0. remote (một lần)
+git remote add lamson https://github.com/LamsonRetail/meetingxlark.git
+git fetch lamson main
+
+# 1. worktree tách hẳn, đứng tại đầu bên lamson
+WT=/c/Users/HIWIND~1/AppData/Local/Temp/claude/lamson-sync   # chỗ nào cũng được, NGOÀI repo
+git worktree add --detach "$WT" lamson/main
+
+# 2. đổ nội dung hiện tại lên, rồi BỎ file secret
+git -C "$WT" checkout main -- .
+git -C "$WT" rm -f v1/config.bat
+
+# 3. BA phép kiểm bắt buộc trước khi commit
+git -C "$WT" ls-files v1/config.bat            # phải RỖNG
+git -C "$WT" ls-files v1/config.bat.example    # phải CÒN (file của họ)
+git -C "$WT" grep -nIE "s[k]-proj|sk-[A-Za-z0-9]{20}|APP_SECRET=[A-Za-z0-9]{10}|FERNET_KEY=[A-Za-z0-9+/=]{20}" -- .
+                                                # phải KHÔNG khớp gì
+
+# 4. commit + push (fast-forward, KHÔNG --force)
+git -C "$WT" commit -m "sync: dong bo noi dung tu repo goc ..."
+git -C "$WT" push lamson HEAD:main
+
+# 5. dọn
+git worktree remove "$WT" --force
+```
+
+⚠️ **Dấu ngoặc vuông trong mẫu đầu tiên là CÓ CHỦ Ý — đừng "dọn" nó đi.** Chính
+dòng lệnh này nằm trong file đang đọc, nên viết tiền tố khoá OpenAI dạng thẳng sẽ
+làm mẫu khớp với **chính nó**. Đã dính đúng vậy HAI lần ngày 02/08/2026: lần đầu
+ở dòng lệnh, lần sau ở chính câu giải thích này (nên câu này cũng không được phép
+chứa tiền tố đó dạng thẳng). Một phép kiểm lúc nào cũng ra "hit" giả là một phép
+kiểm sẽ bị bỏ qua — rồi tới lần có secret thật cũng không ai nhìn.
+
+`s[k]` khớp `sk` bình thường, nhưng bản thân chuỗi `s[k]` thì không khớp mẫu. Ba
+mẫu còn lại không cần mẹo này: sau dấu `=` chúng đòi ký tự chữ-số, mà trong dòng
+lệnh là dấu `[`.
+
+Xác nhận sau khi push:
+
+```bash
+gh api repos/LamsonRetail/meetingxlark/git/trees/main?recursive=1 \
+  --jq '.tree[].path' | grep -iE "^v1/config\.bat$|^v2/\.env$|minutes/|\.mp4$"
+# không ra gì = đúng
+```
+
+### Cái bẫy mà bước 2 KHÔNG bắt được
+
+`git checkout main -- .` chỉ **thêm/ghi đè**, nó **không xoá** file đã bị bỏ ở
+`origin` nhưng còn tồn tại bên `lamson`. Chạy nhiều lần thì hai cây lệch dần một
+cách im lặng. So danh sách trước khi commit:
+
+```bash
+git ls-tree -r main --name-only | sort > /tmp/here.txt
+git -C "$WT" ls-files | sort > /tmp/there.txt
+comm -13 /tmp/here.txt /tmp/there.txt      # có bên kia, không còn bên này -> cân nhắc xoá
+```
+
+02/08/2026 phép so này ra đúng **một** dòng và nó là chủ ý: `v1/config.bat.example`
+— bản đã làm sạch do chính repo `lamson` tạo lúc khởi tạo. **Giữ.** Hệ quả là bên
+đó có hai file mẫu gần giống nhau (`v1/config.example.bat` từ repo này và
+`v1/config.bat.example` của họ); cả hai đều rỗng giá trị secret nên vô hại.
+
+### Một thứ đã có sẵn ở CẢ HAI repo, nêu để không ai tưởng là mới
+
+Token Base `OuQ1b3f3…` nằm trong chính file này (`docs/V2_MAINTENANCE.md`) ở cả
+hai repo, từ trước 02/08. Ghép với §28.1 (Base đang `tenant_readable`) thì **ai
+đọc được repo là có sẵn đường đọc toàn bộ nội dung họp**. Đó là hệ quả trực tiếp
+và đã biết của quyết định để Base mở — không phải lỗ mới, đừng báo lại như phát
+hiện mới. Nếu sau này siết Base về `closed` thì điều này tự hết.

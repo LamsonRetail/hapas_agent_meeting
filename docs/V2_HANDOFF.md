@@ -344,6 +344,16 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
 
 ---
 
+14. **Có HAI repo, và chúng có lịch sử khác nhau vĩnh viễn — V2_MAINTENANCE §29.**
+   `origin` = `tientham2005/MeetingxLark` (repo làm việc, history CÓ app secret
+   đang dùng thật + 35 MB bản ghi họp). `lamson` = `LamsonRetail/meetingxlark`
+   (bản cho công ty, lập ra SẠCH có chủ ý). `git push lamson main` sẽ bị từ chối
+   và **`--force` là điều tuyệt đối không được làm** — nó đẩy secret sống vào
+   repo công ty, không lùi lại được. Đồng bộ bằng quy trình worktree ở §29 (đã
+   chạy thật 02/08 → `91add5d`).
+
+---
+
 ## 5. Ba điều KHÔNG được làm sai
 
 1. **Đừng chạy `run --ws` khi Hermes đang chạy.** Hermes dùng CÙNG `app_id`.
