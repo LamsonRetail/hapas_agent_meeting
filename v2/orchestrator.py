@@ -445,6 +445,19 @@ def _backfill_deliveries() -> None:
         except Exception as exc:           # noqa: BLE001 — job cũ méo dữ liệu
             print(f"[deliver] {token} meta_json méo, bỏ qua: {exc}")
             continue
+
+        # Transcript rỗng thì KHÔNG có gì để gửi bù, và phải loại ở ĐÂY chứ
+        # không phải để `deliver_file` từ chối (sửa 02/08/2026, thấy trong log
+        # production 5 phút sau khi bản vá chạy): nó cố ý không ghi lần thử nào
+        # cho ca rỗng, nên vòng sau `pending_file_recipients` lại trả đúng người
+        # đó — một dòng log mỗi 5 phút MÃI MÃI, và mỗi vòng chiếm một suất
+        # trong `BACKFILL_DELIVERIES_PER_ROUND`. Job có transcript rỗng đã được
+        # `EmptyTranscript` chặn từ đầu vào; đây là dọn cho dữ liệu CŨ.
+        if pend_file and t.word_count == 0:
+            pend_file = []
+        if not (pend or pend_file):
+            continue
+
         done += 1
         if pend:
             print(f"[deliver] {token} gửi BÙ (thẻ+file) cho {len(pend)} người "
@@ -763,11 +776,23 @@ def run() -> None:
                   f"{'BẬT (không phát nữa)' if config.PAUSED else 'TẮT (phát lại)'}")
             print("!" * 60)
 
+        # Enroll tự phục vụ TRƯỚC khi quét: người vừa bấm Đồng ý thì vòng này
+        # đã coi họ là người dự hợp lệ, không phải chờ thêm một vòng. Chạy cả
+        # khi PAUSED — cấp quyền không phải là "phát biên bản".
+        #
+        # Khối try RIÊNG (sửa 02/08/2026, thấy trong log lúc mạng rớt): hộp thư
+        # nằm trên VERCEL, còn quét/xử lý nói chuyện với LARK. Để chung một try
+        # thì Vercel không gọi được là `scan_once` + `process_queue` KHÔNG CHẠY
+        # vòng đó, dù Lark vẫn sống — cùng hình dạng với lỗi "một người token
+        # chập làm mù cả vòng quét". Log thật:
+        #   [enroll] không đọc được hộp thư: [Errno 11001] getaddrinfo failed
+        #   [loop] lỗi vòng lặp: [Errno 11001] getaddrinfo failed
         try:
-            # Enroll tự phục vụ TRƯỚC khi quét: người vừa bấm Đồng ý thì vòng
-            # này đã coi họ là người dự hợp lệ, không phải chờ thêm một vòng.
-            # Chạy cả khi PAUSED — cấp quyền không phải là "phát biên bản".
             oauth.poll_pending()
+        except Exception as exc:         # noqa: BLE001 — xem trên
+            print(f"[enroll] hộp thư hỏng (bỏ qua, vẫn quét họp): {exc}")
+
+        try:
             if not config.PAUSED:
                 scan_once()
                 process_queue()

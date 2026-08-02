@@ -2964,6 +2964,39 @@ dòng `full` nào", vì dữ liệu trước 02/08 không ghi dòng nào để �
 Transcript rỗng thì `deliver_file` **không ghi lần thử nào**: thử lại một thứ
 không tồn tại chỉ làm `deliveries` nói dối là đã cố.
 
+⚠️ **Và chính câu trên đẻ ra một lỗi, thấy trong log production 5 phút sau khi
+vá.** Không ghi lần thử nghĩa là bộ đếm không bao giờ tới hạn, nên vòng sau
+`pending_file_recipients` lại trả đúng người đó:
+
+```
+[deliver] obsg22ct… gửi bù file: transcript rỗng (0 byte) — không có gì để gửi
+```
+
+Một dòng như vậy **mỗi 5 phút mãi mãi**, và mỗi vòng chiếm một suất trong
+`BACKFILL_DELIVERIES_PER_ROUND`. Nay `_backfill_deliveries` loại job có
+`t.word_count == 0` ra khỏi đường gửi bù file **trước** khi gọi, chứ không để
+`deliver_file` từ chối. Bài học lặp lại lần thứ ba trong ngày: **"không tự khỏi"
+và "không ghi lại" đi cùng nhau thì thành vòng lặp im lặng** — phải chặn ở chỗ
+CHỌN việc, không phải ở chỗ LÀM việc.
+
+### 31.9 Hộp thư enroll hỏng làm chết cả vòng quét
+
+Cũng lộ ra từ log, lúc mạng rớt thật:
+
+```
+[enroll] không đọc được hộp thư: [Errno 11001] getaddrinfo failed
+[loop]   lỗi vòng lặp:          [Errno 11001] getaddrinfo failed
+```
+
+`oauth.poll_pending()` nằm CHUNG khối `try` với `scan_once()` + `process_queue()`.
+Hộp thư ở trên **Vercel**, còn quét/xử lý nói chuyện với **Lark** — hai hạ tầng
+khác nhau. Vercel không gọi được (DNS, Vercel sập, đổi domain) là vòng đó không
+quét họp, không xử lý job, dù Lark vẫn sống. Cùng hình dạng với §31.7.
+
+Nay `poll_pending` có khối `try` riêng. `selftest` nhóm 33 kiểm bằng **cấu trúc
+nguồn** (`inspect.getsource`) vì `run()` là vòng lặp vô hạn, không gọi một lượt
+được.
+
 ### 31.5 `event_attendees` cắt im lặng ở người thứ 100
 
 Gửi `page_size=100` rồi lấy trang đầu và thôi, không đọc `has_more`/`page_token`.
@@ -3020,7 +3053,7 @@ biến mất trong im lặng.
 
 ### Kết quả
 
-`selftest` **180 → 213**. Nhóm mới: 31 (`.bat`), 32 (gửi bù, cả hai nửa),
+`selftest` **180 → 215**. Nhóm mới: 31 (`.bat`), 32 (gửi bù, cả hai nửa),
 33 (token chập), 34 (lưới chặn mạng); nhóm 10 thêm 2 phép kiểm ghép cặp;
 nhóm 4/5 thêm `EmptyTranscript`.
 

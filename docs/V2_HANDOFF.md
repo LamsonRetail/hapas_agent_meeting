@@ -390,8 +390,10 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
    - Một người token chập **làm mù cả vòng quét**. §31.7
    - **`selftest` đã gọi MẠNG THẬT** (quên stub một hàm) — nay `lark_api._http`
      bị thay bằng hàm ném lỗi, quên stub là FAIL ngay. §31.8
+   - **Hộp thư enroll (Vercel) hỏng làm chết cả vòng quét (Lark)** — tách khối
+     `try` riêng. §31.9
 
-   `selftest` **180 → 213**. ⚠️ Phải khởi động lại `run` mới nạp.
+   `selftest` **180 → 215**. ⚠️ Phải khởi động lại `run` mới nạp.
 
 ---
 

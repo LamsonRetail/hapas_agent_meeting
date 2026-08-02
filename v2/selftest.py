@@ -1368,6 +1368,22 @@ def _main() -> int:
     with db.tx() as c:
         c.execute("DELETE FROM tokens")
 
+    # Cùng hình dạng, tầng khác: hộp thư enroll nằm trên VERCEL còn quét/xử lý
+    # nói chuyện với LARK. Để chung một khối `try` thì Vercel không gọi được là
+    # `scan_once` + `process_queue` không chạy vòng đó, dù Lark vẫn sống. Đã
+    # thấy thật trong log lúc mạng rớt:
+    #   [enroll] không đọc được hộp thư: [Errno 11001] getaddrinfo failed
+    #   [loop] lỗi vòng lặp: [Errno 11001] getaddrinfo failed
+    # Kiểm bằng cấu trúc nguồn vì `run()` là vòng lặp vô hạn, không gọi thẳng
+    # một lượt được.
+    import inspect as _inspect
+    _src = _inspect.getsource(orchestrator.run).splitlines()
+    _i_poll = next(i for i, l in enumerate(_src) if "oauth.poll_pending()" in l)
+    _i_scan = next(i for i, l in enumerate(_src) if "scan_once()" in l)
+    check("hộp thư enroll và vòng quét KHÔNG chung một khối try",
+          "except" in "\n".join(_src[_i_poll:_i_scan]),
+          "poll_pending hỏng sẽ kéo theo scan_once + process_queue")
+
     # =================================================================
     part("32. Gửi hỏng MỘT PHẦN phải được gửi bù, và chỉ cho đúng người")
     # =================================================================
@@ -1460,8 +1476,26 @@ def _main() -> int:
     check("người chưa nhận thẻ vẫn đi đường thẻ+file",
           got32 == ["on_CHUATHE"], f"thực tế: {got32}")
 
-    # Transcript rỗng: KHÔNG gọi API, và KHÔNG ghi thêm lần thử nào — thử lại
-    # mãi một thứ không tồn tại chỉ làm bảng `deliveries` nói dối là đã cố.
+    # Job có transcript RỖNG: không được gọi gửi bù file, VÀ không được lặp
+    # mỗi vòng. Thấy trong log production 5 phút sau khi bản vá đầu chạy:
+    # `deliver_file` cố ý không ghi lần thử nào cho ca rỗng, nên vòng sau lại
+    # trả đúng người đó — dòng log mỗi 5 phút mãi mãi + chiếm một suất gửi bù.
+    with db.tx() as c:
+        c.execute("DELETE FROM deliveries")
+    jobstore.record_delivery(_tok32, "on_CHUAFILE", "recap", True)
+    _tpe32 = config.TRANSCRIPT_DIR / "backfill-rong.json"
+    _tpe32.write_text(_j32.dumps(Transcript(
+        minute_token=_tok32, lang="vi", duration=61.7, engine="t",
+        segments=[Segment(0, 61.7, "")]).to_json()), encoding="utf-8")
+    jobstore.set_status(_tok32, "delivered", transcript_path=str(_tpe32))
+    file32.clear()
+    orchestrator._backfill_deliveries()
+    check("job transcript RỖNG -> KHÔNG gọi gửi bù file (khỏi lặp mỗi vòng)",
+          file32 == [], f"vẫn gọi cho: {file32}")
+    jobstore.set_status(_tok32, "delivered", transcript_path=str(_tp32))
+
+    # Transcript rỗng ở tầng dưới: KHÔNG gọi API, và KHÔNG ghi thêm lần thử —
+    # thử lại một thứ không tồn tại chỉ làm `deliveries` nói dối là đã cố.
     # Từ đây chạy hàm THẬT (bỏ stub), nên phải chặn ở tầng lark_api bên dưới.
     pipeline.deliver_file = keep32[1]
     keep32c = (pipeline.write_txt, lark_api.im_upload_file)
