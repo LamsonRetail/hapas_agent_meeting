@@ -26,9 +26,8 @@ set HEALTH=http://localhost:8000/health
 set LOGDIR=%~dp0v2\data\logs
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
 
-REM Ten log theo ngay: v2-2026-07-31.log
-for /f "tokens=1-3 delims=/-. " %%a in ("%DATE%") do set TODAY=%%c-%%b-%%a
-set LOG=%LOGDIR%\v2-%TODAY%.log
+REM Ten log theo ngay: v2-2026-07-31.log. Tinh LAI moi vong (xem :setlog).
+call :setlog
 
 call :log "================ khoi dong run-v2-auto ================"
 
@@ -90,6 +89,12 @@ REM -1073741205 = STATUS_DLL_INIT_FAILED_LOGOFF) va vong nay bat lai 17 lan
 REM trong 0,93 giay - tuc cai tre 120s ghi o tren CHUA BAO GIO ton tai, va lop
 REM chong "quay vong dot khi cau hinh sai" cung vay.
 :loop
+REM Tinh lai ten file log TRUOC moi lan chay: wrapper nay song qua nhieu ngay,
+REM ma truoc 03/08/2026 `LOG` chi duoc tinh MOT lan luc khoi dong. Hau qua: log
+REM cua ngay 03/08 nam trong file v2-2026-08-02.log. Khong mat du lieu, nhung
+REM lan sau ai do chan loi "hom 5/8 co gi" se mo v2-2026-08-05.log, thay file
+REM TRONG, roi ket luan he thong khong chay - dung kieu doc sai nguy hiem nhat.
+call :setlog
 call :log "[*] python -m v2 run --send"
 python -m v2 run --send >> "%LOG%" 2>&1
 call :log "[!] orchestrator thoat (ma %errorlevel%) - bat lai sau 120s"
@@ -99,4 +104,15 @@ goto loop
 :log
 echo [%DATE% %TIME%] %~1
 echo [%DATE% %TIME%] %~1 >> "%LOG%"
+exit /b 0
+
+REM GIOI HAN CON LAI, phai biet: chuyen huong `>> "%LOG%"` duoc chot luc PHONG
+REM tien trinh python, nen mot tien trinh song qua nua dem van ghi tiep vao file
+REM cua ngay hom truoc cho toi khi no chet va vong lap phong lai. Thuc te may nay
+REM khoi dong lai vai lan moi ngay (ngu / loi 31.2) nen sai lech chi con vai
+REM tieng thay vi vai ngay. Muon dung tuyet doi thi phai cho chinh Python tu mo
+REM file log theo ngay, khong dung chuyen huong cua cmd nua.
+:setlog
+for /f "tokens=1-3 delims=/-. " %%a in ("%DATE%") do set TODAY=%%c-%%b-%%a
+set LOG=%LOGDIR%\v2-%TODAY%.log
 exit /b 0

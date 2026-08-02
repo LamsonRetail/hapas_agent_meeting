@@ -1535,6 +1535,20 @@ def _main() -> int:
         check(f"{_b}: không còn `timeout /t` nào chạy thật",
               not _live, "; ".join(_live))
 
+    # Tên file log phải được tính LẠI mỗi vòng. Trước 03/08/2026 nó tính một
+    # lần lúc khởi động, nên wrapper sống qua nửa đêm là log ngày mới chui vào
+    # file ngày cũ — rồi lần sau ai đó mở `v2-<hôm đó>.log` thấy file TRỐNG và
+    # kết luận hệ thống không chạy. Đọc sai kiểu đó nguy hiểm hơn là thiếu log.
+    _auto = (_root / "run-v2-auto.bat").read_text(encoding="ascii",
+                                                  errors="replace").splitlines()
+    _i_loop = next(i for i, l in enumerate(_auto) if l.strip() == ":loop")
+    _i_py = next(i for i, l in enumerate(_auto)
+                 if i > _i_loop and "python -m v2 run" in l and
+                 not l.strip().upper().startswith("REM"))
+    check("run-v2-auto.bat: tính lại tên file log TRONG vòng lặp",
+          any("call :setlog" in l for l in _auto[_i_loop:_i_py]),
+          "LOG chỉ tính một lần -> log ngày mới ghi vào file ngày cũ")
+
     # =================================================================
     part("35. Không đốt hạn mức Vercel Blob khi không có việc")
     # =================================================================

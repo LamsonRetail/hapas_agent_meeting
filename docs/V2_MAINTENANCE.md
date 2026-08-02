@@ -2979,6 +2979,26 @@ Một dòng như vậy **mỗi 5 phút mãi mãi**, và mỗi vòng chiếm mộ
 và "không ghi lại" đi cùng nhau thì thành vòng lặp im lặng** — phải chặn ở chỗ
 CHỌN việc, không phải ở chỗ LÀM việc.
 
+### 31.10 Log ngày mới ghi vào file ngày cũ
+
+`run-v2-auto.bat` tính `LOG=v2-<ngày>.log` **một lần lúc khởi động**, mà wrapper
+sống qua nhiều ngày. Thấy 03/08: dòng `[00:03:05] scan xong` nằm trong
+`v2-2026-08-02.log`.
+
+Không mất dữ liệu, nhưng nó tạo ra kiểu đọc sai nguy hiểm nhất: lần sau ai đó
+chẩn lỗi "hôm 5/8 có gì" sẽ mở `v2-2026-08-05.log`, thấy **file trống**, rồi kết
+luận hệ thống không chạy hôm đó.
+
+Nay có `:setlog`, gọi lại ở đầu mỗi vòng `:loop`. `selftest` nhóm 31 kiểm rằng
+`call :setlog` nằm giữa nhãn `:loop` và dòng chạy python.
+
+⚠️ **Giới hạn còn lại, phải biết:** chuyển hướng `>> "%LOG%"` được chốt lúc
+PHÓNG tiến trình python, nên một tiến trình sống qua nửa đêm vẫn ghi tiếp vào
+file hôm trước cho tới khi nó chết và vòng lặp phóng lại. Thực tế máy này khởi
+động lại vài lần mỗi ngày (ngủ — §31.2) nên sai lệch còn vài tiếng thay vì vài
+ngày. Muốn đúng tuyệt đối thì phải cho chính Python tự mở file log theo ngày,
+không dùng chuyển hướng của cmd nữa.
+
 ### 31.9 Hộp thư enroll hỏng làm chết cả vòng quét
 
 Cũng lộ ra từ log, lúc mạng rớt thật:
