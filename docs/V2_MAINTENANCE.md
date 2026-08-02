@@ -3107,13 +3107,23 @@ cửa vào thì có.
    không có nonce hoặc nonce hết hạn, nên code nằm đó lúc không có nonce sống
    thì đọc về cũng không dùng được. `v2 enroll-poll` truyền `force=True` vì
    người gõ lệnh đó chính là để kiểm hộp thư. **−100 ops/ngày.**
-2. **`STATUS_PUSH_EVERY` mặc định 0 → 1800**, và khởi động không còn đẩy hai
+2. **`STATUS_PUSH_EVERY` mặc định 0 → 7200 (2 giờ)**, và khởi động không còn đẩy hai
    lần (`last_push` đặt theo cú đẩy lúc khởi động thay vì `0.0` — đo trong log:
    23:17:50 rồi 23:17:59; máy ngủ nên khởi động lại nhiều lần mỗi ngày).
    `0` nghĩa là đẩy mỗi vòng
    `POLL_INTERVAL`. Không mất khả năng phát hiện "run đã chết": việc đó do
    `alerts._check_run_stale` + Scheduled Task `V2_Alerts` lo, chạy từ NGOÀI và
-   không đụng Vercel. **109 → ~18 lần đẩy/ngày.**
+   không đụng Vercel. **109 → ~4-5 lần đẩy/ngày.**
+
+   ⚠️ **Đừng nhầm biến này là nhịp BÁO LỖI** — hiểu nhầm đó dẫn thẳng tới kết
+   luận "không dám giảm kẻo mất cảnh báo", trong khi thứ bị hy sinh chỉ là độ
+   tươi của một trang web. Cảnh báo đi bằng DM Lark từ `alerts.py`, hai đường
+   song song và không đụng Vercel: `alerts.check_all()` mỗi vòng `run`
+   (5 phút), và Scheduled Task `V2_Alerts` mỗi 15 phút chạy TỪ NGOÀI.
+   `selftest` nhóm 35 chốt bất biến này bằng cách soi nguồn `alerts.py`.
+
+   Chọn 7200 chứ không phải 21600 (chốt với chủ hệ thống 02/08): 6 tiếng thì
+   lúc cần nhìn lại phải chờ quá lâu.
 3. **`api/status.js` ghi đè MỘT pathname** thay vì mỗi snapshot một file +
    `list`+`del` để dọn. POST còn **1 thao tác**. Đây là đảo lại quyết định
    30/07 (§ ghi chú đầu file đó) một cách có ý thức: giá phải trả là trang có
@@ -3123,10 +3133,17 @@ cửa vào thì có.
 
 ### Kết quả
 
-| | Trước | Sau (1+2) | Sau (1+2+3) |
-|---|---|---|---|
-| ops/ngày | ~427 | ~54 | ~18 |
-| ops/tháng | ~12.800 | ~1.600 | ~540 |
+| | Trước | Sau (1+2+3) |
+|---|---|---|
+| ops/ngày | ~427 | **~9** |
+| ops/tháng | ~12.800 | **~270** |
+
+Số đọc trên dashboard Vercel tối 02/08: **1.643/2.000 (82%)**, và cả 1.643 bị
+đốt gọn trong 4 ngày (Jul 30 → Aug 2) — tức ~410/ngày, khớp với phép đo từ log.
+Còn **357 thao tác** cho phần còn lại của chu kỳ; ở mức ~9/ngày thì đủ ~40 ngày.
+
+**Phép thử thật là cột ngày HÔM SAU** trên biểu đồ Blob Advanced Operations:
+bản vá vào lúc gần nửa đêm nên cột 02/08 hầu như toàn số liệu trước khi vá.
 
 Duty cycle thật của máy là ~38% (109/288 vòng), đã tính vào các số trên.
 

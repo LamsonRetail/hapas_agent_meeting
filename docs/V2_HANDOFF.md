@@ -403,9 +403,15 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
    100 = **~427/ngày**, cạn trong ~4,7 ngày. Cạn = **hộp thư OAuth chết = không
    ai enroll được**, chỉ để lại một dòng log.
    Đã: (1) chỉ đọc hộp thư khi có nonce còn sống; (2) `STATUS_PUSH_EVERY`
-   0 → 1800; (3) `api/status.js` ghi đè một pathname (3 → 1 thao tác).
-   ⇒ ~427 → **~18 ops/ngày**.
-   ⚠️ **(3) cần deploy Vercel mới ăn** — chưa deploy thì đang ở ~54/ngày.
+   0 → **7200**; (3) `api/status.js` ghi đè một pathname (3 → 1 thao tác),
+   **đã deploy thật** (`dpl_3EJGFqjUe7r94BomFEiZCBSaxfjM`, Ready).
+   ⇒ ~427 → **~9 ops/ngày**.
+   Số thật trên dashboard tối 02/08: **1.643/2.000 (82%)**, còn 357 thao tác —
+   ở mức mới thì đủ ~40 ngày.
+   ⚠️ **`STATUS_PUSH_EVERY` KHÔNG phải nhịp báo lỗi.** Cảnh báo đi bằng DM Lark
+   (`alerts.check_all` mỗi 5 phút + Task `V2_Alerts` mỗi 15 phút), không đụng
+   Vercel. Nhầm chỗ này dẫn tới "không dám giảm kẻo mất cảnh báo".
+   Ba cái bẫy khi deploy Vercel: `v2/vercel-oauth/README.md`.
 
 ---
 

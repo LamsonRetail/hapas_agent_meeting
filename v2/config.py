@@ -354,17 +354,26 @@ OAUTH_PULL_URL = _get(
 )
 # Giãn cách tối thiểu giữa 2 lần đẩy trong vòng run() (giây). 0 = mỗi vòng.
 #
-# Mặc định 1800 chứ KHÔNG phải 0 (đổi 02/08/2026): mỗi lần đẩy là một thao tác
+# Mặc định 7200 chứ KHÔNG phải 0 (đổi 02/08/2026): mỗi lần đẩy là một thao tác
 # ghi Vercel Blob, tính vào hạn mức "Advanced Requests" — **2.000 thao
 # tác/THÁNG** ở gói free. Với 0 thì đẩy mỗi vòng `POLL_INTERVAL`; đo từ log là
-# 109 lần/ngày, và Vercel đã gửi thư báo dùng hết 75% sau ~3,5 ngày. Cạn hạn
-# mức thì hộp thư OAuth chết theo, tức KHÔNG AI ENROLL ĐƯỢC — mất thứ quan
-# trọng hơn hẳn cái dashboard.
+# 109 lần/ngày, và Vercel đã gửi thư báo dùng hết 75% sau ~3,5 ngày (đọc trên
+# dashboard ngày 02/08: 1.643/2.000, toàn bộ đốt trong 4 ngày). Cạn hạn mức thì
+# hộp thư OAuth chết theo, tức KHÔNG AI ENROLL ĐƯỢC — mất thứ quan trọng hơn
+# hẳn cái dashboard.
 #
-# 1800s không làm mất khả năng phát hiện "run đã chết": việc đó do
-# `alerts._check_run_stale` + Scheduled Task `V2_Alerts` (15 phút/lần) lo, chạy
-# từ NGOÀI và không đụng Vercel. Dashboard chỉ để người nhìn.
-STATUS_PUSH_EVERY = _get_int("STATUS_PUSH_EVERY", 1800)
+# ⚠️ Biến này KHÔNG liên quan gì tới việc báo lỗi. Nhầm chỗ này là nhầm nguy
+# hiểm, vì nó dẫn tới "đừng giảm kẻo mất cảnh báo". Cảnh báo đi bằng DM Lark từ
+# `alerts.py`, hai đường song song và KHÔNG đụng Vercel:
+#     alerts.check_all() trong vòng `run`  -> mỗi POLL_INTERVAL (5 phút)
+#     Scheduled Task `V2_Alerts`           -> mỗi 15 phút, chạy TỪ NGOÀI
+# `STATUS_PUSH_EVERY` chỉ quyết định trang dashboard cũ bao nhiêu.
+#
+# Vì sao 7200 mà không phải 21600 (chốt với chủ hệ thống 02/08): 6 tiếng thì
+# lúc cần nhìn lại phải chờ quá lâu. 2 tiếng ra ~4-5 lần đẩy/ngày (máy ngủ nên
+# duty cycle chỉ ~38%), tức ~9 ops/ngày kể cả các lần khởi động lại — 357 thao
+# tác còn lại của chu kỳ đủ dùng ~40 ngày.
+STATUS_PUSH_EVERY = _get_int("STATUS_PUSH_EVERY", 7200)
 
 
 # ----------------------------------------------------------------- helpers

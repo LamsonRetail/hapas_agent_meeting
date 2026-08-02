@@ -1567,6 +1567,21 @@ def _main() -> int:
     check("nhịp đẩy status mặc định KHÔNG còn là 'mỗi vòng'",
           config.STATUS_PUSH_EVERY >= 900, str(config.STATUS_PUSH_EVERY))
 
+    # BẤT BIẾN chống một hiểu nhầm đắt: `STATUS_PUSH_EVERY` KHÔNG phải nhịp báo
+    # lỗi. Nhầm nó ra "giảm nhịp đẩy = ít cảnh báo hơn" sẽ dẫn tới quyết định
+    # giữ nhịp cao để giữ an toàn — trong khi thứ thật sự bị hy sinh chỉ là độ
+    # tươi của một trang web, còn quota Blob thì cạn và kéo sập cửa enroll.
+    # Cảnh báo đi bằng DM Lark (`lark_api.im_send_text`), hai đường song song:
+    # `alerts.check_all()` mỗi vòng run, và Scheduled Task `V2_Alerts` từ ngoài.
+    _asrc = _inspect.getsource(alerts)
+    _leak = [w for w in ("status_push.heartbeat(", "STATUS_PUSH_EVERY",
+                         "STATUS_PUSH_URL", "OAUTH_PULL_URL")
+             if w in _asrc]
+    check("alerts KHÔNG phụ thuộc đường Vercel — Vercel chết vẫn báo được",
+          not _leak, f"alerts.py có nhắc tới: {_leak}")
+    check("alerts gửi bằng DM Lark, không qua HTTP nào của Vercel",
+          "im_send_text" in _asrc)
+
     # Khởi động KHÔNG được đẩy hai lần. Với `last_push = 0.0` thì điều kiện
     # `now - last_push >= STATUS_PUSH_EVERY` đúng ngay vòng đầu, nên cú đẩy lúc
     # khởi động bị lặp lại sau vài giây — đo trong log: 23:17:50 và 23:17:59.
