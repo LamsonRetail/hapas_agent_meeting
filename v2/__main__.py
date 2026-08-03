@@ -281,6 +281,29 @@ def cmd_alerts(args) -> None:
         print("Không có gì để báo (hoặc đã báo rồi — xem bảng alert_state).")
 
 
+def cmd_glossary_digest(_) -> None:
+    """Gửi digest tuần: thuật ngữ chờ duyệt -> DM admin (Task Scheduler gọi tuần).
+
+    In ra danh sách dù không gửi được (chưa cấu hình người nhận) để chạy tay vẫn
+    thấy có gì đang chờ.
+    """
+    _init()
+    from . import config, glossary
+    if not config.GLOSSARY_ENABLED:
+        print("V2_GLOSSARY_ENABLED=0 -> glossary đang TẮT.", file=sys.stderr)
+        return
+    body = glossary.digest_body(config.GLOSSARY_MIN_COUNT)
+    if not body:
+        print(f"Không có thuật ngữ nào chờ duyệt (gặp >= "
+              f"{config.GLOSSARY_MIN_COUNT} cuộc).")
+        return
+    print(body)
+    print("-" * 40)
+    n = glossary.send_digest(config.GLOSSARY_MIN_COUNT, config.ALERT_UNION_IDS)
+    print(f"[glossary] đã DM {n} admin" if n else
+          "[glossary] KHÔNG gửi: ALERT_UNION_IDS trống — đặt trong v2/.env.")
+
+
 def cmd_scan(_) -> None:
     _init()
     orchestrator.scan_once()
@@ -562,6 +585,10 @@ def main() -> None:
     al.add_argument("--dry-run", action="store_true",
                     help="chỉ in cái sắp gửi, không gửi, không ghi mốc")
     al.set_defaults(fn=cmd_alerts)
+
+    sub.add_parser("glossary-digest",
+                   help="DM admin thuật ngữ chờ duyệt (Task Scheduler gọi tuần)")\
+        .set_defaults(fn=cmd_glossary_digest)
 
     sub.add_parser("scan").set_defaults(fn=cmd_scan)
 

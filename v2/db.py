@@ -172,6 +172,21 @@ CREATE TABLE IF NOT EXISTS transcript_requests (
     requested_at INTEGER,
     PRIMARY KEY (minute_token, requester)
 );
+
+-- Thuật ngữ/tên riêng ứng viên cho glossary whisper (part B, 03/08/2026).
+-- Hermes trích sau mỗi cuộc -> pending; admin duyệt qua bot -> approved; từ
+-- approved được nhồi ĐỘNG vào initial_prompt (KHÔNG ghi vi-prompt.txt server).
+-- Khoá theo `term_key` (chữ thường, khử dấu cách) để 'MCP'/'mcp' không tách đôi;
+-- `term` giữ chính tả hiển thị. `count` = số cuộc gặp (nguồn lọc nhiễu digest).
+CREATE TABLE IF NOT EXISTS glossary_candidates (
+    term_key   TEXT PRIMARY KEY,     -- lower(strip(term)) — khoá so khớp
+    term       TEXT,                 -- chính tả hiển thị (giữ hoa/thường)
+    count      INTEGER DEFAULT 1,    -- số cuộc gặp
+    example    TEXT,                 -- ví dụ ngữ cảnh gần nhất
+    status     TEXT DEFAULT 'pending',   -- pending | approved | rejected
+    first_seen INTEGER,
+    last_seen  INTEGER
+);
 """
 
 _local = threading.local()
@@ -370,3 +385,75 @@ def clear_transcript_requests(minute_token: str) -> None:
     with tx() as c:
         c.execute("DELETE FROM transcript_requests WHERE minute_token=?",
                   (minute_token,))
+
+
+# --- Glossary ứng viên (part B: whisper tự cải thiện) ---------------
+
+def _term_key(term: str) -> str:
+    """Khoá so khớp: chữ thường + gộp khoảng trắng. 'MCP' và ' mcp ' cùng khoá."""
+    return " ".join((term or "").lower().split())
+
+
+def glossary_add_candidate(term: str, example: str = "") -> None:
+    """Ghi/tăng đếm một ứng viên. Gặp lại -> count+1, cập nhật ví dụ + last_seen.
+
+    KHÔNG hồi sinh từ đã `rejected`: admin đã bảo không thì đừng nhét lại vào
+    digest. `approved` gặp lại vẫn tăng count (vô hại) nhưng giữ nguyên status.
+    """
+    term = (term or "").strip()
+    key = _term_key(term)
+    if not key:
+        return
+    now = _now_ms()
+    with tx() as c:
+        row = c.execute(
+            "SELECT status FROM glossary_candidates WHERE term_key=?", (key,)
+        ).fetchone()
+        if row is None:
+            c.execute(
+                "INSERT INTO glossary_candidates"
+                "(term_key, term, count, example, status, first_seen, last_seen)"
+                " VALUES (?,?,1,?,'pending',?,?)",
+                (key, term, example, now, now))
+        elif row["status"] == "rejected":
+            return                       # đã bị bỏ: không đếm lại, không nổi lại
+        else:
+            c.execute(
+                "UPDATE glossary_candidates SET count=count+1, "
+                "example=COALESCE(NULLIF(?,''), example), last_seen=? "
+                "WHERE term_key=?", (example, now, key))
+
+
+def glossary_list(status: str = "", min_count: int = 0) -> list[dict]:
+    """Ứng viên theo status (rỗng = mọi status) và count tối thiểu, nhiều-cuộc trước."""
+    q = "SELECT term, count, example, status FROM glossary_candidates WHERE count>=?"
+    args: list = [min_count]
+    if status:
+        q += " AND status=?"
+        args.append(status)
+    q += " ORDER BY count DESC, last_seen DESC"
+    return [dict(r) for r in conn().execute(q, args).fetchall()]
+
+
+def glossary_approved_terms(limit: int = 1000) -> list[str]:
+    """Các từ đã duyệt (chính tả hiển thị), nhồi vào prompt whisper."""
+    rows = conn().execute(
+        "SELECT term FROM glossary_candidates WHERE status='approved' "
+        "ORDER BY count DESC, last_seen DESC LIMIT ?", (limit,)).fetchall()
+    return [r["term"] for r in rows]
+
+
+def glossary_set_status(term: str, status: str) -> str:
+    """Đổi status theo khoá so khớp. Trả chính tả hiển thị nếu thấy, '' nếu không."""
+    key = _term_key(term)
+    if not key:
+        return ""
+    with tx() as c:
+        row = c.execute(
+            "SELECT term FROM glossary_candidates WHERE term_key=?", (key,)
+        ).fetchone()
+        if row is None:
+            return ""
+        c.execute("UPDATE glossary_candidates SET status=? WHERE term_key=?",
+                  (status, key))
+        return row["term"]

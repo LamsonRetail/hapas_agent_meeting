@@ -292,6 +292,19 @@ QA_ADMIN_UNION_IDS = [s.strip() for s in
 # đây là "im lặng bao lâu thì phải xin vé mới", không phải giới hạn hội thoại.
 QA_TOKEN_TTL = _get_int("QA_TOKEN_TTL", 900)
 
+# ------------------------------------------ glossary tự cải thiện (part B)
+#
+# Thuật ngữ/tên riêng đã DUYỆT được nhồi vào initial_prompt whisper — gửi ĐỘNG
+# qua form `prompt` (cùng đường tên người dự, part A), KHÔNG ghi vào vi-prompt.txt
+# của server: file đó chỉ đọc lúc startup nên ghi vào sẽ phải restart mỗi lần
+# duyệt. Ứng viên do Hermes trích sau mỗi cuộc, admin duyệt QUA BOT (nhắn 'duyệt
+# <từ>'). Người duyệt = QA_ADMIN_UNION_IDS; digest tuần gửi tới ALERT_UNION_IDS.
+GLOSSARY_ENABLED = _get_bool("V2_GLOSSARY_ENABLED", True)
+# Chỉ nổi ứng viên gặp >= ngần này CUỘC trong digest (cắt nhiễu nghe-nhầm một lần).
+GLOSSARY_MIN_COUNT = _get_int("V2_GLOSSARY_MIN_COUNT", 2)
+# Cắt số thuật ngữ đã duyệt nhồi vào prompt (server còn cắt theo token thật nữa).
+GLOSSARY_MAX_TERMS = _get_int("V2_GLOSSARY_MAX_TERMS", 60)
+
 # Whisper phải gọi KHÔNG được liên tục ngần này phút thì mới báo. Vì sao không
 # báo ngay lần đầu: restart whisper hay một cú timeout lẻ là chuyện thường; báo
 # ngay thì cảnh báo mất giá trị và người ta bắt đầu bỏ qua nó — lúc hỏng thật

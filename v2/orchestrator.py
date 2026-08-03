@@ -387,6 +387,11 @@ def _process_queue(dry_run: bool | None = None) -> None:
         # Không còn broadcast recap+transcript cho mọi người dự nữa. `recap` từ
         # `_reuse` (nếu có) bỏ qua: người hỏi transcript thì nhận transcript.
         _ = recap
+        # Trích thuật ngữ ứng viên cho glossary (part B). Best-effort, chỉ khi
+        # bật + chạy thật: không được làm hỏng phát/held. Chạy TRƯỚC nhánh rẽ để
+        # cả cuộc held lẫn cuộc có người hỏi đều góp từ.
+        if config.GLOSSARY_ENABLED and not dry_run:
+            _collect_glossary(t, meta)
         if priority >= 2:
             _deliver_requested(meta, t, dry_run=dry_run)
         elif dry_run:
@@ -848,6 +853,29 @@ def _base_record_held(token: str, meta: MeetingMeta) -> None:
         bitable.write_draft(meta, recap, 0)
     except Exception as exc:              # noqa: BLE001 — ghi Base là việc phụ
         print(f"[base] {token} ghi record (held) hỏng (bỏ qua): {exc}")
+
+
+def _collect_glossary(t, meta: MeetingMeta) -> None:
+    """Trích thuật ngữ ứng viên từ transcript -> bảng chờ duyệt (part B).
+
+    BEST-EFFORT: Hermes đọc bản ghi (có thể méo) và đề xuất danh từ riêng/thuật
+    ngữ nó tự tin. Ghi pending; admin duyệt qua bot rồi từ mới vào prompt cuộc
+    sau. Hỏng ở bất kỳ đâu -> bỏ qua, KHÔNG làm hỏng phát/held.
+    """
+    try:
+        terms = summarize.extract_glossary(t.text, meta.title)
+    except Exception as exc:              # noqa: BLE001 — bước phụ
+        print(f"[glossary] {meta.minute_token} trích hỏng (bỏ qua): {exc}")
+        return
+    added = 0
+    for term in terms:
+        try:
+            db.glossary_add_candidate(term, example=meta.title)
+            added += 1
+        except Exception as exc:          # noqa: BLE001
+            print(f"[glossary] ghi ứng viên {term!r} hỏng: {exc}")
+    if added:
+        print(f"[glossary] {meta.minute_token} +{added} ứng viên: {terms[:8]}")
 
 
 def _deliver_requested(meta: MeetingMeta, t, *, dry_run: bool) -> None:

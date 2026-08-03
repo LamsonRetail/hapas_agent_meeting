@@ -2048,6 +2048,71 @@ def _main() -> int:
           "Base" not in _bit.ST_HELD and "held" not in _bit.ST_HELD)
 
     # =================================================================
+    part("40. Glossary tự cải thiện (part B): ứng viên, duyệt, tiêm prompt")
+    # =================================================================
+    from v2 import glossary
+    with db.tx() as _c:
+        _c.execute("DELETE FROM glossary_candidates")   # sạch trước khi kiểm
+
+    # (a) gộp theo khoá chữ-thường: 'MCP' và 'mcp' là MỘT, count cộng dồn
+    db.glossary_add_candidate("MCP", "Cuộc A")
+    db.glossary_add_candidate("mcp", "Cuộc B")
+    db.glossary_add_candidate("BookFood", "Cuộc A")
+    _p2 = db.glossary_list("pending", 2)
+    check("ứng viên gộp theo khoá chữ-thường (MCP+mcp -> count 2)",
+          len(_p2) == 1 and _p2[0]["term"] == "MCP" and _p2[0]["count"] == 2,
+          str(_p2))
+    check("min_count lọc bỏ ứng viên gặp 1 cuộc (BookFood)",
+          all(r["term"] != "BookFood" for r in _p2))
+
+    # (b) admin gating — CƯỠNG CHẾ bằng code, không bằng mô tả tool
+    _notadmin = {"union_id": "u_x", "admin": False}
+    _admin = {"union_id": "u_a", "admin": True}
+    check("người thường KHÔNG duyệt được (trả NOT_ADMIN)",
+          glossary.approve(_notadmin, "MCP") == glossary.NOT_ADMIN)
+    check("người thường KHÔNG xem được danh sách chờ",
+          glossary.pending(_notadmin) == glossary.NOT_ADMIN)
+    check("who=None -> từ chối",
+          glossary.approve(None, "MCP") == glossary.NOT_ADMIN)
+
+    # (c) admin duyệt -> approved, vào được prompt
+    _msg = glossary.approve(_admin, "mcp")             # khớp không phân biệt hoa
+    check("admin duyệt được (khớp không phân biệt hoa/thường)",
+          "Đã duyệt: MCP" in _msg, _msg)
+    check("từ đã duyệt vào glossary_approved_terms",
+          db.glossary_approved_terms() == ["MCP"])
+
+    # (d) từ đã DUYỆT được nhồi vào prompt whisper (cùng đường tên người dự)
+    _hint = transcribe._prompt_hint("Weekly", ["An"], db.glossary_approved_terms())
+    check("prompt hint chứa CẢ thuật ngữ duyệt LẪN tên người dự",
+          "Thuật ngữ: MCP" in _hint and "An" in _hint, _hint)
+
+    # (e) bỏ + KHÔNG hồi sinh: rejected gặp lại không đếm lại, không nổi lại
+    db.glossary_add_candidate("Anthropic", "Cuộc A")
+    db.glossary_add_candidate("Anthropic", "Cuộc B")   # count 2
+    check("admin bỏ được từ", "Đã bỏ: Anthropic" in glossary.reject(_admin, "anthropic"))
+    db.glossary_add_candidate("Anthropic", "Cuộc C")   # đã rejected
+    _anth = [r for r in db.glossary_list() if r["term"] == "Anthropic"][0]
+    check("từ đã bỏ KHÔNG hồi sinh khi gặp lại (giữ rejected, count không tăng)",
+          _anth["status"] == "rejected" and _anth["count"] == 2, str(_anth))
+
+    # (f) duyệt từ KHÔNG có trong danh sách -> báo không thấy, không tạo bừa
+    check("duyệt từ lạ -> báo không thấy",
+          "Không thấy" in glossary.approve(_admin, "TuKhongCoThat"))
+    check("từ lạ KHÔNG bị tạo trong bảng",
+          all(r["term"] != "TuKhongCoThat" for r in db.glossary_list()))
+
+    # (g) digest body: có pending>=2 thì liệt kê; hết thì rỗng
+    with db.tx() as _c:
+        _c.execute("DELETE FROM glossary_candidates")
+    db.glossary_add_candidate("Vercel", "Cuộc A")
+    db.glossary_add_candidate("Vercel", "Cuộc B")
+    check("digest body liệt kê từ chờ duyệt gặp >=2 cuộc",
+          "Vercel" in glossary.digest_body(2) and "duyệt" in glossary.digest_body(2))
+    check("digest body RỖNG khi không có gì chờ (>= min_count)",
+          glossary.digest_body(5) == "")
+
+    # =================================================================
     part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")
     # =================================================================
     # Nhiều nhóm ở trên lưu-rồi-trả-lại thuộc tính của `lark_api`. Một cái trả

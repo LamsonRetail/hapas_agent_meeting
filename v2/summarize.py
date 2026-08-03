@@ -123,6 +123,61 @@ def _call_llm(transcript_text: str, title: str) -> str | None:
         raise RecapUnavailable(str(exc)) from exc
 
 
+_GLOSSARY_SYSTEM = (
+    "Bạn trích thuật ngữ cho một hệ thống phiên âm. Đọc bản ghi cuộc họp tiếng "
+    "Việt (máy phiên âm, có thể sai chính tả) và liệt kê DANH TỪ RIÊNG / THUẬT "
+    "NGỮ KỸ THUẬT / TÊN SẢN PHẨM / VIẾT TẮT đáng đưa vào từ điển gợi ý để lần sau "
+    "máy viết ĐÚNG. CHỈ nêu từ bạn TỰ TIN về chính tả đúng; bỏ từ thường, từ nghe "
+    'không rõ. Trả JSON: {"terms": ["...", ...]}. Rỗng nếu không có gì chắc.'
+)
+
+
+def extract_glossary(text: str, title: str = "") -> list[str]:
+    """Trích thuật ngữ ứng viên từ bản ghi. [] nếu thiếu key / gọi hỏng / rỗng.
+
+    BEST-EFFORT, KHÔNG ném: đây là bước phụ (part B). Hỏng thì trả [] — luồng
+    chính (phiên âm/recap/phát) không được phụ thuộc nó.
+    """
+    if not config.LLM_API_KEY or not (text or "").strip():
+        return []
+    body = {
+        "model": config.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": _GLOSSARY_SYSTEM},
+            {"role": "user", "content": f"Tiêu đề: {title}\n\n{text[:60000]}"},
+        ],
+        "temperature": 0.0,
+    }
+    if config.LLM_JSON_MODE:
+        body["response_format"] = {"type": "json_object"}
+    try:
+        raw = _post(body)
+    except httpx.HTTPStatusError as exc:
+        if config.LLM_JSON_MODE and exc.response.status_code in (400, 404, 422):
+            body.pop("response_format", None)
+            try:
+                raw = _post(body)
+            except Exception:                 # noqa: BLE001 — bước phụ, nuốt
+                return []
+        else:
+            return []
+    except Exception:                         # noqa: BLE001 — bước phụ, nuốt
+        return []
+    try:
+        d = json.loads(_json_block(raw) or raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    terms = d.get("terms") if isinstance(d, dict) else None
+    if not isinstance(terms, list):
+        return []
+    out: list[str] = []
+    for t in terms:
+        t = str(t).strip()
+        if t and len(t) <= 40 and t not in out:   # bỏ rỗng / cả câu / trùng
+            out.append(t)
+    return out[:30]
+
+
 def _json_block(raw: str) -> str | None:
     """Rút khối JSON ra khỏi câu trả lời có kèm văn xuôi / ```json.
 

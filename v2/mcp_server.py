@@ -116,6 +116,32 @@ def _tool_create_task(a: dict[str, Any]) -> str:
         due=str(a.get("due") or ""), note=str(a.get("note") or ""))
 
 
+def _terms_arg(a: dict[str, Any]) -> list[str]:
+    """`terms` nhận list HOẶC chuỗi 'A, B' (agent hay gửi văn xuôi) -> list."""
+    v = a.get("terms")
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    return str(v or "").split(",")
+
+
+def _tool_glossary_pending(a: dict[str, Any]) -> str:
+    """ĐỌC danh sách chờ duyệt — nhưng admin-only, cưỡng chế ở `glossary.py`."""
+    from . import glossary
+    return glossary.pending(_who(a))
+
+
+def _tool_glossary_approve(a: dict[str, Any]) -> str:
+    """GHI: duyệt từ. Admin-only, ràng buộc ở `glossary.py` không ở mô tả tool."""
+    from . import glossary
+    return glossary.approve(_who(a), _terms_arg(a))
+
+
+def _tool_glossary_reject(a: dict[str, Any]) -> str:
+    """GHI: bỏ từ. Admin-only, ràng buộc ở `glossary.py`."""
+    from . import glossary
+    return glossary.reject(_who(a), _terms_arg(a))
+
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_meetings",
@@ -267,6 +293,57 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["asker_token", "minute_token", "summary"],
         },
         "_fn": _tool_create_task,
+    },
+    {
+        "name": "glossary_pending",
+        "description": (
+            "CHỈ ADMIN. Liệt kê thuật ngữ/tên riêng đang CHỜ DUYỆT cho từ điển "
+            "phiên âm whisper. Dùng khi admin hỏi 'có từ nào chờ duyệt', 'xem "
+            "glossary'. Người thường gọi sẽ bị từ chối — đừng gọi cho họ."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+            },
+            "required": ["asker_token"],
+        },
+        "_fn": _tool_glossary_pending,
+    },
+    {
+        "name": "glossary_approve",
+        "description": (
+            "CHỈ ADMIN. DUYỆT một/nhiều thuật ngữ vào từ điển phiên âm — cuộc họp "
+            "sau whisper sẽ ưu tiên viết đúng chính tả các từ này. Dùng khi admin "
+            "nhắn 'duyệt MCP', 'duyệt MCP, Anthropic'. `terms` là danh sách từ (hoặc "
+            "chuỗi cách nhau dấu phẩy). Chỉ duyệt được từ ĐANG chờ (do hệ thống đề "
+            "xuất), không tạo từ mới tuỳ ý. Người thường gọi sẽ bị từ chối."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+                "terms": {"type": "array", "items": {"type": "string"},
+                          "description": "các từ cần duyệt, đúng chính tả"},
+            },
+            "required": ["asker_token", "terms"],
+        },
+        "_fn": _tool_glossary_approve,
+    },
+    {
+        "name": "glossary_reject",
+        "description": (
+            "CHỈ ADMIN. BỎ một/nhiều thuật ngữ khỏi danh sách chờ (không đưa vào từ "
+            "điển, và không đề xuất lại). Dùng khi admin nhắn 'bỏ <từ>'. `terms` như "
+            "glossary_approve. Người thường gọi sẽ bị từ chối."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+                "terms": {"type": "array", "items": {"type": "string"},
+                          "description": "các từ cần bỏ"},
+            },
+            "required": ["asker_token", "terms"],
+        },
+        "_fn": _tool_glossary_reject,
     },
 ]
 

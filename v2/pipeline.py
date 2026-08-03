@@ -248,9 +248,14 @@ def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Path]:
     # Tên người dự -> initial_prompt của whisper (bias viết đúng chính tả tên).
     # Dữ liệu chuẩn có sẵn từ resolve_participants, không phải đoán từ audio méo.
     names = [a.name for a in meta.attendees if (getattr(a, "name", "") or "").strip()]
+    # Thuật ngữ đã DUYỆT (part B) cũng nhồi vào prompt — cùng đường tên người dự.
+    from . import db as _db
+    gloss = (_db.glossary_approved_terms(config.GLOSSARY_MAX_TERMS)
+             if config.GLOSSARY_ENABLED else [])
     t = transcribe.transcribe(audio, meta.minute_token,
                               meeting_title=meta.title,
-                              attendee_names=names)
+                              attendee_names=names,
+                              glossary_terms=gloss)
     whisper_sec = time.time() - t0
     try:
         audio.unlink()

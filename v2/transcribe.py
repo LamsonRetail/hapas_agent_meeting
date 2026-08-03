@@ -87,18 +87,26 @@ def _parse_segments(transcript_text: str, duration: float) -> list[Segment]:
     return segs
 
 
-def _prompt_hint(title: str, attendee_names: list[str] | None) -> str:
-    """Câu gợi ý ngữ cảnh cho whisper: tiêu đề + tên người dự (khử trùng, giữ thứ
-    tự). Văn xuôi tự nhiên vì `initial_prompt` là văn bản dẫn, không phải danh
-    sách. Cắt sớm ~40 tên để cuộc đông người không nuốt hết ngân sách; server còn
-    cắt lần nữa theo token thật.
+def _prompt_hint(title: str, attendee_names: list[str] | None,
+                 glossary_terms: list[str] | None = None) -> str:
+    """Câu gợi ý ngữ cảnh cho whisper: thuật ngữ đã duyệt + tiêu đề + tên người dự
+    (khử trùng, giữ thứ tự). Văn xuôi tự nhiên vì `initial_prompt` là văn bản dẫn,
+    không phải danh sách. Cắt sớm ~40 tên/thuật ngữ để không nuốt hết ngân sách;
+    server còn cắt lần nữa theo token thật (`_build_prompt`).
     """
-    names: list[str] = []
-    for n in (attendee_names or []):
-        n = (n or "").strip()
-        if n and n not in names:
-            names.append(n)
+    def _dedup(xs: list[str] | None) -> list[str]:
+        out: list[str] = []
+        for x in (xs or []):
+            x = (x or "").strip()
+            if x and x not in out:
+                out.append(x)
+        return out
+
+    names = _dedup(attendee_names)
+    terms = _dedup(glossary_terms)
     parts: list[str] = []
+    if terms:
+        parts.append("Thuật ngữ: " + ", ".join(terms[:40]) + ".")
     if (title or "").strip():
         parts.append(f"Cuộc họp: {title.strip()}.")
     if names:
@@ -110,6 +118,7 @@ def transcribe(audio_path: Path, minute_token: str,
                lang: str | None = None,
                meeting_title: str = "",
                attendee_names: list[str] | None = None,
+               glossary_terms: list[str] | None = None,
                poll_interval: float = 5.0,
                timeout_sec: float = 6 * 3600) -> Transcript:
     """Phiên âm một file audio. Đồng bộ, có thể chậm (chờ cả hàng đợi GPU).
@@ -130,7 +139,7 @@ def transcribe(audio_path: Path, minute_token: str,
             data["language"] = lang
         if meeting_title:
             data["meeting_title"] = meeting_title   # server bỏ qua nếu không dùng
-        hint = _prompt_hint(meeting_title, attendee_names)
+        hint = _prompt_hint(meeting_title, attendee_names, glossary_terms)
         if hint:
             data["prompt"] = hint
         try:
