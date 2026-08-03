@@ -126,10 +126,11 @@ def complete(code: str, state: str) -> dict:
 def short_link(url: str) -> str:
     """Đẩy `url` lên Vercel, trả link ngắn dạng `<gốc>/e/<code>`. "" nếu không được.
 
-    Vì sao cần: URL authorize nay dài ~3.800 ký tự (xin trọn họ scope). Dán vào
-    chat Lark là hay bị xuống dòng làm gãy link, và người nhận nhìn một chuỗi
-    dài như vậy thì ngại bấm. Đã gặp thật: Chi báo lỗi mà không rõ vì link gãy
-    hay vì lý do khác.
+    Vì sao cần: URL authorize dài ~700 ký tự (18 scope, đo 03/08/2026). Dán vào
+    chat Lark vẫn hay bị xuống dòng làm gãy link, và chuỗi dài thì người nhận
+    ngại bấm. Đã gặp thật: Chi báo lỗi mà không rõ vì link gãy hay vì lý do khác.
+    (Trước 01/08/2026 xin trọn họ scope thì URL tận ~3.800 ký tự; đã siết
+    124 -> 18 scope, xem config.OAUTH_SCOPES §22.)
 
     Không dùng bit.ly/tinyurl: link enroll không nên đi qua bên thứ ba. Ở đây nó
     nằm trên chính hạ tầng dự án, cùng bearer với dashboard.
