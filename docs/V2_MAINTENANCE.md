@@ -3758,3 +3758,82 @@ biên bản**, và hoàn tác phải qua chu kỳ admin duyệt.
 
 ⇒ Thứ tự đúng: **xoay secret trước, cắt Console sau (nếu vẫn muốn)** — lúc đó nó
 là dọn dẹp, không phải vá lỗ.
+
+## 38. Whisper: tối ưu tốc độ + glossary tự cải thiện (03/08/2026)
+
+Ba việc nối nhau: (1) sửa cấu hình whisper cho nhanh, (2) nhồi tên người dự vào
+prompt để viết đúng tên (part A), (3) vòng học glossary có cửa người (part B).
+Server whisper ở `D:\whisper\` **NGOÀI repo** (server V1 riêng) — các sửa
+`server.py`/`run-server.bat`/`vi-prompt.txt` không vào commit/sync nào.
+
+### 38.1 Cấu hình whisper (đo thật, không đoán)
+
+Máy 14700K = 8 P-core + 12 E-core. Chẩn cũ: một file 6 phút phiên âm rất chậm.
+Nguyên nhân cộng dồn, sửa trong `run-server.bat` + `server.py`:
+
+| Tham số | Cũ | Mới | Vì sao |
+|---|---|---|---|
+| `cpu_threads` | 28 (auto = logical core) | **8** (P-core) | 0 = lấy hết 28 luồng, kéo E-core vào GEMM đồng bộ, 8 P-core phải chờ → chậm hơn chỉ dùng 8 P-core (bẫy hybrid) |
+| `beam_size` | 5 | **1** | mỗi bậc beam nhân thẳng thời gian decode trên CPU |
+| `no_repeat_ngram_size` | — | **3** | beam=1/greedy dễ lặp vô hạn; chặn 3-gram vừa GIẢM lặp vừa NHANH hơn (không kẹt decode lại đoạn lặp) |
+| `condition_on_previous_text` | True | **False** | audio mic xa dễ tạo vòng lặp lặp chữ |
+| `temperature` | 6 bậc 0→1 | **[0, 0.2]** | mỗi bậc là một lần decode lại đoạn khó |
+| `compute_type` | — | int8 (đã đúng) | fp16 trên CPU âm thầm convert lên fp32, mất AVX-VNNI |
+
+Đo: file 377s → **RTF ~6.6x** (dịch ~57s), không còn vòng lặp vô hạn. ⚠️ Chất
+lượng chữ vẫn bị trần bởi chất lượng audio — RTF không nói lên độ chính xác.
+
+Bẫy đã dính và cách thoát: bản "nhanh tối đa" đầu (beam=1 + cắt temperature) gây
+**lặp vô hạn** trên đoạn ít tiếng. `no_repeat_ngram_size=3` trị trúng — đo trước
+khi chốt (ratio lặp 3.3→2.2, từ lặp liên tiếp dài nhất = 2). Đừng bỏ nó khi chỉnh
+beam. Model `medium` giữ nguyên: nút thắt là CONFIG, không phải cỡ model — đổi
+`small` chỉ nhanh thêm mà tụt chất lượng tiếng Việt.
+
+### 38.2 Part A — nhồi tên người dự vào `initial_prompt` (chắc)
+
+`initial_prompt` của whisper *bias* decoder viết đúng chính tả những từ trong đó.
+Tên người dự là **dữ liệu chuẩn có sẵn** (`resolve_participants`), không phải đoán
+từ audio méo → nhồi vào là cú nhảy chất lượng chắc nhất cho tên riêng (giảm mạnh
+gọi sai tên, **không tuyệt đối 100%** — audio quá méo vẫn trượt).
+
+Đường đi: `pipeline.run_transcription` gom `attendee_names` → `transcribe()` dựng
+`_prompt_hint` (văn xuôi: "Thuật ngữ:… Cuộc họp:… Người tham dự:…") → gửi qua form
+`prompt` mới của server → `server._build_prompt` gộp glossary nền (`vi-prompt.txt`)
++ hint, cắt theo ngân sách ~180 từ (dưới trần ~224 token của `initial_prompt`),
+**giữ phần cuối** (tên) khi tràn. Caller cũ không gửi `prompt` vẫn chạy.
+
+### 38.3 Part B — glossary tự cải thiện, có CỬA NGƯỜI
+
+Hai bẫy của bản ngây thơ "Hermes cứ thêm từ vào `vi-prompt.txt`":
+1. **Trần token** ~224: thêm mãi thì tràn (từ cũ rớt) + prompt phình gây ảo giác.
+2. **Tự đầu độc**: whisper nghe "MCP"→"mo cp", Hermes đọc "mo cp" không suy ra
+   được chữ đúng; đoán sai → bias whisper về chữ sai → lỗi tự khuếch đại.
+
+Thiết kế đã chọn:
+- **Trích**: sau mỗi cuộc, `summarize.extract_glossary` (Hermes) đề xuất danh từ
+  riêng/thuật ngữ → bảng `glossary_candidates` (pending). Best-effort, không làm
+  hỏng phát/held. Khoá theo chữ-thường (MCP=mcp); count = số cuộc gặp.
+- **Digest tuần**: `v2 glossary-digest` (`run-v2-glossary.bat` + Task Scheduler
+  WEEKLY) DM `ALERT_UNION_IDS` các từ chờ gặp ≥ `V2_GLOSSARY_MIN_COUNT` (=2) cuộc.
+- **Duyệt QUA BOT**: `glossary.py` (cửa ghi admin-only, khuôn `tasks.py`/
+  `sendfile.py`) + 3 tool MCP `glossary_pending/approve/reject`. Admin nhắn
+  "duyệt MCP, Anthropic" / "bỏ <từ>". **Admin cưỡng chế bằng CODE** (`QA_ADMIN_
+  UNION_IDS`), không bằng mô tả tool — từ duyệt vào prompt của MỌI cuộc sau nên
+  đây là cửa toàn hệ thống. Chỉ đổi status ứng viên ĐÃ CÓ, không tạo từ tuỳ ý;
+  `rejected` không hồi sinh.
+
+⚠️ **Quyết định kiến trúc then chốt**: từ đã duyệt lưu **DB + gửi ĐỘNG** qua field
+`prompt` (cùng đường part A), **KHÔNG ghi `vi-prompt.txt`** của server. Vì server
+chỉ đọc `vi-prompt.txt` **một lần lúc startup** — ghi vào đó thì phải restart mỗi
+lần duyệt. DB + gửi động ⇒ duyệt xong là cuộc kế có ngay.
+
+Cửa người là chốt chống tự-đầu-độc: không từ nào vào prompt nếu admin chưa gật.
+Part B là "bắt thêm"; part A mới là phần chắc. `V2_GLOSSARY_ENABLED` mặc định bật.
+
+### 38.4 Bật lên (sau khi kéo code)
+
+1. Restart whisper server `D:\whisper\run-server.bat` (lấy no_repeat + param `prompt`).
+2. Restart `v2 run` (code part A+B) và Hermes gateway (thấy 3 tool mới).
+3. Task Scheduler tuần cho `run-v2-glossary.bat` (lệnh `schtasks` trong comment file đó).
+
+selftest: +14 (part A held/None-safe) +14 (part B) → tổng PASS 309.
