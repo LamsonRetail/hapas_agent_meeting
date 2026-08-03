@@ -23,6 +23,7 @@ REM ============================================================
 
 set PYTHONUNBUFFERED=1
 set PYTHONIOENCODING=utf-8
+set PY=C:\Users\PC\AppData\Local\Programs\Python\Python312\python.exe
 
 set LOGDIR=%~dp0v2\data\logs
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
@@ -34,6 +35,6 @@ REM nguoi ta doc de lan lai mot cuoc hop, tron them mot dong moi 15 phut
 REM vao do lam no kho doc. Va khi `run` chet thi day la file duy nhat con
 REM moi - nhin ngay tao file la biet canh bao con chay hay khong.
 echo [%DATE% %TIME%] --- v2 alerts >> "%LOG%"
-python -m v2 alerts >> "%LOG%" 2>&1
+"%PY%" -m v2 alerts >> "%LOG%" 2>&1
 if errorlevel 1 echo [%DATE% %TIME%] [x] v2 alerts thoat voi loi >> "%LOG%"
 exit /b 0

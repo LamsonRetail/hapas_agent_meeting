@@ -1798,6 +1798,12 @@ trước khi sửa**, không phải trạng thái nửa vời gãy.
 | Toolset (`platform_toolsets.feishu`) | bỏ hẳn `memory`, `session_search`, `todo` | cùng file |
 | CODE (`v2/tasks.py`, `v2/qa.py`) | task phải gắn cuộc họp có thật; chỉ đọc/ghi cuộc họp mình dự | repo |
 
+> ⚠️ **SỬA 03/08/2026 — đoạn ngay dưới đây SAI, xem §33.2.** `feishu_doc` /
+> `feishu_drive` / `kanban` **bỏ được thật** bằng `agent.disabled_toolsets`
+> (chạy sau khối "recover", `tools_config.py` ~2392). Toolset feishu nay đúng
+> `['clarify', 'meetings']` — tầng 2 giờ cưỡng chế được, không chỉ tầng 3.
+> Giữ nguyên đoạn cũ để thấy kết luận sai đã sống ở đâu.
+
 Chỉ tầng 3 là bảo đảm. Tầng 1 có thể bị nội dung họp lái đi (input không tin
 cậy), tầng 2 thì Hermes **luôn thêm lại** `feishu_doc` / `feishu_drive` /
 `kanban` bất kể config — đo bằng chính resolver của nó:
@@ -1813,6 +1819,8 @@ print(sorted(_get_platform_tools(load_config(),'feishu')))
 
 Kết quả hiện tại: `['clarify', 'feishu_doc', 'feishu_drive', 'kanban', 'meetings']`.
 Ba cái giữa **không bỏ được**, nên prompt phải cấm chúng bằng lời.
+*(→ hết đúng từ 03/08/2026: nay ra `['clarify', 'meetings']`, xem §33.2. Prompt
+vẫn giữ đoạn cấm — cố ý, làm lưới đỡ nếu `config.yaml` bị ghi đè.)*
 
 ### `platform_hints` — cơ chế đúng, không phải sửa SOUL.md
 
@@ -3173,3 +3181,580 @@ Một vòng lặp gọi dịch vụ ngoài **mỗi nhịp, bất kể có việc
 đồng hồ đang chạy ngược. Chỗ đúng để hỏi "có việc không" là ở phía mình
 (`state.db` biết có nonce nào sống), không phải để dịch vụ ngoài trả lời "rỗng"
 2.000 lần một tháng.
+
+---
+
+## 33. Dọn rác trong chat + soát lại "scope" theo cả BA nghĩa (03/08/2026)
+
+Bắt đầu từ một ảnh chụp màn hình chat Lark: một câu hỏi của người dùng kéo theo
+ba dòng không ai cần đọc. Gỡ xong thì lộ ra chuyện lớn hơn ở §33.3.
+
+### 33.1 Hai nguồn rác, hai chỗ sửa khác nhau
+
+**Rác 1 — `📬 No home channel is set for Feishu…`**
+
+`gateway/run.py` ~16499: ở tin nhắn ĐẦU của mỗi phiên (`not history`), nếu
+`FEISHU_HOME_CHANNEL` rỗng thì Hermes gửi thẳng vào chat của người dùng lời mời
+gõ `/sethome`. Không có công tắc config nào tắt riêng nó — điều kiện duy nhất là
+biến đó có giá trị.
+
+Đã đặt trong `%LOCALAPPDATA%\hermes\.env`:
+
+```
+FEISHU_HOME_CHANNEL=oc_ae202bd98346c79fc3a160ee33652758   # DM cua Tham
+```
+
+Chọn DM của admin, **đã xác minh chứ không đoán** — `GET im/v1/chats/{id}/members`
+trả đúng một người: `Nguyễn Tiến Thẩm` (`ou_903ab…`, khớp `FEISHU_ALLOWED_USERS`).
+Chat còn lại trong `channel_directory.json` (`oc_2cd97…`) là DM của Lê Quý Thiện —
+đặt nhầm vào đó thì kết quả cron của Hermes sẽ chảy sang người khác.
+
+Tác dụng phụ đã cân: home channel là nơi Hermes đổ kết quả **cron job**. Hiện
+`%LOCALAPPDATA%\hermes\cron\` **không có job nào** (`executions.db` rỗng), nên
+biến này thực tế chỉ làm đúng một việc: câm cái thông báo.
+
+⚠️ Đây là rác **cho mọi người dùng, mỗi phiên mới** — không phải chỉ lần đầu cài.
+Đọc kỹ điều kiện: `not history`, không phải `has_any_sessions()`.
+
+**Rác 2 — `⚙ tool_describe: "mcp__meetings__list_meetings"` + dòng `(Đã chỉnh sửa)`**
+
+Đó là bong bóng tiến trình gọi tool. `display.tool_progress: all` đang bật toàn
+cục. Tắt riêng cho feishu, giữ nguyên cho CLI:
+
+```yaml
+display:
+  platforms:
+    feishu:
+      tool_progress: 'off'
+```
+
+🪤 **PHẢI để `'off'` trong nháy.** YAML đọc `off` trần thành boolean `False`, mà
+`gateway/run.py` ~23220 tính `progress_mode = _resolved_tp or _env_tp or "all"` —
+`False` là falsy nên rơi thẳng xuống `"all"`. Viết không nháy = tưởng đã tắt mà
+vẫn hiện y nguyên, và không có lỗi nào báo.
+
+Cố ý **KHÔNG** tắt `long_running_notifications`: khi `tool_progress` đã off, đó là
+tín hiệu duy nhất còn lại cho người dùng biết bot chưa chết trong lúc chờ.
+
+### 33.2 "Không bỏ được `feishu_doc`/`feishu_drive`/`kanban`" — §21 SAI, bỏ được thật
+
+§21 (và comment đầu `hermes/feishu-config.yaml`) chốt rằng ba toolset đó Hermes
+"luôn thêm lại bất kể config", nên chỉ cấm được bằng lời trong prompt. Đúng một
+nửa, và cái nửa sai là cái đắt.
+
+Đúng: khối *"Recover non-configurable platform toolsets"*
+(`hermes_cli/tools_config.py` ~2283) thêm lại chúng vì chúng thuộc composite
+`hermes-feishu`, nên **`platform_toolsets` không đụng tới được**.
+
+Sai: có một cửa chạy **SAU** khối đó, ~2392, trừ thẳng vào kết quả cuối:
+
+```yaml
+agent:
+  disabled_toolsets: [feishu_doc, feishu_drive, kanban]
+```
+
+Đo bằng chính resolver của Hermes (lệnh ở §21):
+
+| | feishu | cli |
+|---|---|---|
+| Trước | `clarify, feishu_doc, feishu_drive, kanban, meetings` | 15 toolset |
+| Sau | **`clarify, meetings`** | 14 toolset (mất `kanban`) |
+
+`disabled_toolsets` là **TOÀN CỤC**, nên phải kiểm cả bề mặt CLI trước khi dùng:
+`feishu_doc`/`feishu_drive` vốn chỉ tồn tại ở feishu (CLI không mất gì), còn
+`kanban` thì CLI mất thật — chấp nhận vì `kanban.db` rỗng (8 bảng, 0 dòng).
+
+Ý nghĩa: phạm vi bot vừa **lên một tầng cưỡng chế**. Trước đây "bot không đọc
+Drive công ty" là một câu trong prompt, tức phụ thuộc vào model có nghe hay không
+và có thể bị nội dung transcript lái đi (§21, tầng 1). Nay tool đó **không nằm
+trong payload gửi cho model**.
+
+Prompt vẫn giữ nguyên đoạn cấm ba tool đó — **cố ý**. `disabled_toolsets` nằm
+trong `config.yaml`, mà file đó Hermes tự ghi đè (`hermes tools`, update). Ngày
+nó bị xoá thì prompt là hàng rào duy nhất còn lại.
+
+### 33.3 Chữ "scope" có BA nghĩa, và chỉ hai cái đã siết
+
+Câu hỏi "scope đã đủ hẹp cho một agent meeting chưa" trả lời được ba lần khác nhau:
+
+| Nghĩa | Trạng thái | Đo bằng |
+|---|---|---|
+| 1. Tool agent được cầm | ✅ `clarify` + `meetings` (4 tool MCP) | resolver §21 |
+| 2. Scope XIN người dùng khi enroll | ✅ **18**, `config.OAUTH_SCOPES` ≡ `scopecheck.SCOPES_NEEDED` | `v2 scopes --print-all` |
+| 3. Scope Console ĐÃ DUYỆT cho app | ❌ **867 entry / 496 tên, tất cả `grant_status=1`** | `GET application/v6/scopes` |
+
+Nghĩa 3 là cái chưa ai nhìn, và nó **đang đi ngược**: §4.1 đo 30/07 ra
+**376 entry / 301 tên**; đo lại 03/08 ra **867 / 496**. Ai đó đã thêm gần gấp đôi
+trong bốn ngày.
+
+Trong 496 tên có **165 cái không dính gì tới họp**: cả họ `directory` (87),
+`mail` (22), `admin` (12), `security_and_compliance` (10), `approval`,
+`attendance`, `okr`, `moments`, `passport`, `helpdesk`. Và **72 scope GHI**
+(`:write` / `readwrite`), gồm `base:table:delete`, `approval:instance:write`,
+`admin:app.enable:write`.
+
+**Vì sao `OAUTH_SCOPES=18` KHÔNG che được chuyện này.** Hai loại token khác nhau:
+
+- **User token** — chỉ có những gì đã xin ⇒ 18. Màn hình Đồng ý của người mới
+  sạch. Phần này ổn.
+- **Tenant token** (`lark_api.tenant_token()`) — **không xin gì cả**, nó mang
+  nguyên 457 scope `tenant` mà Console đã duyệt. V2 dùng nó cho Base, gửi tin
+  IM, upload file, `contact_batch`. Hermes gateway dùng chung app.
+
+Cộng với một chuyện đã biết: **app secret nằm trong history của repo `origin`**
+(§29 + handoff §14). Ai có repo đó là mint được tenant token — và cái token ấy
+hiện đọc được thư công ty, cây tổ chức, luồng duyệt, dữ liệu chấm công. Đó là
+khoảng cách giữa "một bot biên bản họp bị lộ khoá" và "một app quản trị bị lộ
+khoá".
+
+**Việc cần người làm** (Console, không có API — duyệt scope là thao tác tay +
+admin duyệt): app `cli_aae288361ef89eed` → bỏ scope tới khi còn xấp xỉ:
+
+- *user*: đúng 18 cái trong `scopecheck.SCOPES_NEEDED`.
+- *tenant*: `im:message`, `im:message:send_as_bot`, `im:resource`, `im:chat`,
+  `contact:user.base:readonly`, `contact:user.id:readonly`, quyền Base/bitable
+  mà `v2/bitable.py` thật sự gọi, và `docs:document.media:upload`.
+
+🪤 Cắt xong **phải chạy lại `python -m v2 scopes`** rồi nhắn thử bot: cắt hụt một
+cái mà đường đi bằng tenant token thì Lark trả `99991672`/`permission denied` ở
+đúng lúc phát biên bản, không phải lúc cắt.
+
+Chưa cắt thì đừng coi §22 là "đã siết xong scope" — §22 siết đúng **nghĩa 2**.
+
+### Áp lại từ đầu nếu mất máy
+
+Cấu hình gốc version-control ở `hermes/feishu-config.yaml` (nay có cả khối
+`agent:` và `display:`). `FEISHU_HOME_CHANNEL` là env, nằm trong
+`%LOCALAPPDATA%\hermes\.env`, không có trong repo — xem comment đầu file đó.
+Đổi xong: `hermes gateway restart` (đã chạy 03/08, feishu `connected`,
+`v2-enroll-gate` vẫn `enabled`).
+
+---
+
+## 34. `get_transcript` — nguyên văn whisper qua đường hỏi đáp (03/08/2026)
+
+### Lỗ hổng: transcript được PHÁT nhưng không ai HỎI lại được
+
+User hỏi "sao ở đây ko có transcript của whisper?" khi bot trả lời về một cuộc
+họp cũ. Soi ra: transcript có, và đã đi tới tay người dự — chỉ là đường hỏi đáp
+không có cửa nào tới nó.
+
+Bằng chứng cho đúng cuộc họp trong ảnh (`obsg3q5tb1w9i1v6q368gj1y`):
+
+| | |
+|---|---|
+| File trên đĩa | `v2/data/transcripts/test luồng tự động-…json`, 1.548 byte, 5 đoạn, 757 ký tự |
+| Bảng `deliveries` | 4 dòng — 2 người × (`recap` + `full`), tất cả `ok=1` |
+| Trên Base | cột `File transcript` có attachment |
+| Trong câu trả lời của bot | **không có gì** |
+
+`qa.fmt_record` liệt kê tường minh các trường được ra: tiêu đề, thời gian, trạng
+thái, số người nhận, nguồn, tóm tắt, quyết định, việc cần làm, `Link Minutes`,
+`minute_token`. Không có `F_TRANSCRIPT`. Và bot cũng không có tool nào gửi file —
+toolset feishu là `clarify` + `meetings`, mọi tool MCP đều trả text.
+
+🪤 **`Link Minutes` KHÔNG phải transcript của mình.** Đó là bản Lark tự sinh. Bot
+in nó ra kèm chữ "nguyên văn", Lark thì unfurl thành thẻ video — nên người dùng
+thấy một thứ trông đúng là cái họ hỏi mà không phải. Prompt nay bắt bot nói rõ
+hai thứ đó khác nhau.
+
+### Đã cân bốn cách, chọn tool riêng
+
+| Cách | Bỏ vì |
+|---|---|
+| Nhét nguyên văn vào `get_meeting` | mỗi câu hỏi vặt cũng kéo hàng chục nghìn ký tự vào prompt |
+| Trả link attachment trên Base | Base đang `tenant_readable` (§28.1) — câu trả lời thành đường vòng qua chính §20 |
+| Gửi lại file | cần đường cho agent kích hoạt việc GỬI, mà `qa.py` có bất biến chỉ-đọc |
+| **Tool riêng `get_transcript`** ✅ | giữ được `_may_see`, chỉ tốn context khi thật sự cần |
+
+### Hợp đồng
+
+`qa.get_transcript(who, query, part=1)` → `mcp_server` tool `get_transcript`
+(server nay **5 tool**), và `python -m v2 transcript <token|tên> [--as ID] [--part N]`
+để thử ở terminal không cần Lark.
+
+- **Tra trên `jobs`, không trên Base.** Transcript thuộc về job, và có job phiên
+  âm xong mà chưa lên được Base — tra theo Base thì đúng những cuộc đó lại nói
+  "không tìm thấy" trong khi file đang nằm trên đĩa.
+- **Quyền: đúng `_may_see`, không có luật thứ hai.** Hai luật song song sẽ lệch
+  và cái lỏng hơn thắng (bài học §21 mục 2).
+- **Cắt phần** `TRANSCRIPT_PART_CHARS = 6000`, không cắt giữa một đoạn nói. Mỗi
+  phần có header riêng + `Phần k/n`; phần chưa cuối mời gọi `part=k+1`, phần
+  cuối **không** mời (agent tin lời đó rồi gọi thừa một vòng).
+- **Mốc `[mm:ss]` mỗi đoạn** để lần lại chỗ nói trong bản ghi.
+- **Nói rõ là bản máy nghe** ngay trong header và trong mô tả tool: whisper CPU
+  nghe nhầm tên riêng và thuật ngữ rất nhiều (xem chính transcript ở bảng trên:
+  "chestcript", "asian system"). Agent trích dẫn mà không nói thì thành gán lời
+  cho người ta.
+
+Bốn nhánh từ chối, mỗi nhánh nói ĐÚNG nguyên nhân — không gộp thành "không có":
+
+| Tình huống | Trả về |
+|---|---|
+| `who=None` | `NO_ASKER` |
+| Không có trong danh sách người dự | "CÓ trong hệ thống nhưng bạn không có trong danh sách người dự" (cùng câu với `get_meeting`) |
+| Job chưa có `transcript_path` | tình trạng job theo `_TINH_TRANG` + lỗi nếu có |
+| File hỏng / đọc không ra | nói rõ **lỗi hệ thống**, không phải cuộc họp thiếu dữ liệu |
+| Transcript rỗng 0 chữ | nói rõ rỗng (ca `EmptyTranscript`, §31.3) |
+
+### Đo thật (03/08/2026)
+
+Trên dữ liệu thật, bằng `python -m v2 transcript`:
+
+| Phép thử | Kết quả |
+|---|---|
+| `obsg3q5tb1w9i1v6q368gj1y` | Phần 1/1, 5 đoạn, có `[00:00]`…`[02:05]` |
+| `obsg23lsr45qp273r1m6i8nc` (5.297 ký tự) | cắt **2 phần**, phần 2 không mời đọc tiếp |
+| `--part 9` | "chỉ có 2 phần, không có phần 9" |
+| `obsg22ct6md6ogbe3hi1i782` (file 0 chữ) | "có file nguyên văn nhưng KHÔNG có chữ nào" |
+| job `discarded` | nói tình trạng + lỗi `2091005`, không bịa |
+| tìm theo tên khớp 2 cuộc | liệt kê kèm `minute_token`, đòi gọi lại |
+| **`--as` Chi (không dự Web scraper)** | **bị chặn, không lộ chữ nào** |
+| **`--as` Thiện (có dự)** | đọc được |
+
+`hermes mcp test meetings` → **5 tool**. `selftest` **224 → 240** (nhóm 36 mới,
+16 phép kiểm, gồm "người KHÔNG dự bị chặn và không lộ một chữ nào" và "mọi tool
+MCP đều BẮT BUỘC `asker_token`" — quên `required` ở tool mới là mở toang).
+
+### CHẠY THẬT trong Lark — cùng ngày, đường đầu-cuối
+
+Phần trên là đo bằng CLI, tức mới chứng minh hàm đúng. Cái còn lại chỉ chạy thật
+mới biết: **model có chọn đúng tool và có bịa không.**
+
+Thẩm nhắn *"cho tôi nguyên văn cuộc họp test lại luồng"* → bot gọi
+`get_transcript`, ra `obsg3s3814mk8j9r28x87pvr`. Đối chiếu với
+`python -m v2 transcript obsg3s3814mk8j9r28x87pvr`:
+
+| Kiểm | Kết quả |
+|---|---|
+| Số đoạn | 4/4, **không cắt bớt** |
+| Mốc thời gian | `[00:02] [00:20] [00:38] [00:49]` — đúng từng cái |
+| Nội dung | **khớp từng chữ**, không diễn giải lại, không "sửa" chỗ nghe nhầm |
+| Độ dài audio | nói đúng 58 giây |
+| Caveat "bản máy" | bot tự nói ở ĐẦU, và tự thêm một câu ở cuối là đừng dùng làm trích dẫn chính thức khi chưa đối chiếu âm thanh |
+
+Chỗ đáng chú ý: transcript này nhiễu rất nặng (whisper nghe "Sonnet" ra "Sonet",
+đẻ ra "lồn tự đốc", "RISC và RUZIC"). Model **không** dọn nó thành câu đọc được —
+đúng cái phải giữ, vì dọn là gán lời cho người ta. Ràng buộc đó nằm cả trong
+header của tool lẫn trong `platform_hints`, và nó ăn.
+
+Chưa kiểm: đường **nhiều phần** trong Lark thật (cuộc họp dài, agent phải tự gọi
+`part=2`). Cuộc họp thử chỉ có 1 phần. Muốn kiểm thì hỏi bot về `Web scraper`
+(`obsg23lsr45qp273r1m6i8nc`) — cuộc duy nhất hiện có đủ dài để ra 2 phần.
+
+### ⚠️ Phải làm sau khi sửa
+
+`hermes gateway restart` (đã chạy — feishu `connected`, `v2-enroll-gate` vẫn
+`enabled`). Prompt `platform_hints.feishu` cũng đã đổi: 2.083 → 2.792 ký tự, bản
+gốc version-control ở `hermes/feishu-config.yaml` (nay viết dạng block scalar
+`|` cho đọc được, không còn chuỗi escape).
+
+---
+
+## 35. Biên bản gửi đi là `.docx`, không còn `.txt` (03/08/2026, user chốt)
+
+### Yêu cầu
+
+User: *"gửi thẳng luôn file đã dịch về cho người dùng ở dạng doc"*, và khi hỏi
+lại thì chốt: **`.docx` gửi trong chat · giữ tiếng Việt, KHÔNG dịch · cứ họp
+xong mà có transcript thì tự động gửi.**
+
+Hai chỗ trong câu đó đọc được theo hai nghĩa, và hỏi lại là đúng:
+- **"đã dịch"** — hệ thống không có bước dịch nào; whisper chỉ phiên âm Việt ra
+  Việt. Hiểu nhầm thành "dịch sang tiếng Anh" là thêm cả một tầng LLM, mà trên
+  một transcript nhiễu nặng thì LLM buộc phải ĐOÁN chỗ nghe nhầm — đúng thứ cả
+  §34 đang cố ngăn.
+- **"dạng doc"** — `.docx` hay Lark Doc online? Lark Doc là **bản sao thứ hai**
+  của nội dung họp nằm ở chỗ có luật chia sẻ riêng, tức lặp lại đúng lỗ §28.1.
+  `.docx` gửi trong chat không tạo bản sao nào ngoài chat.
+
+### Tự viết OOXML, KHÔNG dùng `python-docx`
+
+`v2/docxfile.py` — một `.docx` là ZIP có ba phần: `[Content_Types].xml`,
+`_rels/.rels`, `word/document.xml`. Hết.
+
+Lý do không thêm dependency, và nó **được kiểm chứng ngay trong ngày**: soi tiến
+trình thật thì vòng `run` chạy bằng
+`%APPDATA%\uv\python\cpython-3.11-…\python.exe`, còn `python -m v2 mcp` mà
+Hermes spawn lại chạy bằng `…\Programs\Python\Python312\python.exe`. **Hai
+interpreter khác nhau trong cùng một hệ thống.** `pip install python-docx` vào
+cái này mà quên cái kia thì biên bản gửi đi thiếu file, hỏng ở đúng lúc không ai
+ngồi đó. Module chỉ dùng `zipfile` + `re` nên không có cửa đó.
+
+🪤 Ba cái bẫy đã cắm phép kiểm:
+- **`w:sz` là NỬA point.** `w:val="32"` = 16pt. Viết 16 tưởng 16pt thì ra chữ
+  8pt — không lỗi, chỉ là không ai đọc nổi.
+- **Ký tự điều khiển giết cả file.** XML 1.0 không nhận `\x00-\x1f`; lọt một cái
+  là Word báo "file bị lỗi" và **không mở**, chứ không bỏ qua ký tự đó. Tên cuộc
+  họp đến từ Lark (đã thấy `&amp;` lẫn trong đó) nên phải lọc.
+- **Không có `styles.xml`** → tuyệt đối đừng thêm `w:pStyle`. Tham chiếu một
+  style không tồn tại thì Word mở ra chữ trần, im lặng. Mọi định dạng ở đây đặt
+  thẳng vào `w:rPr`.
+
+Ghi qua `.part` rồi `replace`: chết giữa lúc ghi mà để lại ZIP cụt thì
+`bitable._tracking_fields` (chỉ kiểm `exists()`) sẽ đính một file hỏng vào Base.
+
+### Câu cảnh báo nằm TRONG file, không chỉ trong tin nhắn
+
+Dòng *"Bản do máy (Whisper) phiên âm tự động — có lỗi nghe nhầm…"* in ngay dưới
+tiêu đề. File rời khỏi chat rất nhanh (chuyển tiếp, tải về, dán vào báo cáo) và
+lúc đó không còn gì nói cho người đọc biết đây là bản máy nghe. Kèm link Lark
+Minutes ở cuối để đối chiếu.
+
+### Đổi đuôi làm gãy cái gì, và vá ở đâu
+
+`pipeline.txt_path` → **`doc_path`** (`.docx`), `write_txt` → **`write_doc`**,
+`_upload_txt` → **`_upload_doc`**. Đổi tên chứ không giữ tên cũ: `selftest`
+nhóm 30/32 thay `pipeline.write_txt` bằng bản giả, nên nếu giữ tên mà đổi hành
+vi thì hai nhóm đó vẫn xanh trong khi kiểm sai thứ.
+
+**Hai chỗ gãy nếu chỉ đổi đuôi rồi thôi:**
+
+1. **Cuộc họp CŨ chỉ có `.txt` trên đĩa.** `bitable._tracking_fields` tìm
+   `doc_path` không thấy sẽ tụt thẳng xuống đính kèm bản `.json` — người mở ô
+   file trên Base nhận một cục JSON thay vì biên bản, mà record vẫn ghi thành
+   công. Thêm `pipeline.legacy_txt_path` làm **nấc giữa**: `.docx` → `.txt` cũ →
+   `.json`.
+2. **Guard "transcript rỗng" mất tác dụng.** `.txt` rỗng là 0 byte nên
+   `st_size == 0` bắt được. `.docx` của một transcript rỗng vẫn **~1 KB** (tiêu
+   đề + dòng cảnh báo + cấu trúc ZIP) — guard cũ im, và §31.3 quay lại bằng cửa
+   khác: người dự nhận một file mở ra không có chữ nào, `deliveries` ghi `ok=1`.
+   `_upload_doc` nay nhận thêm `Transcript` và kiểm `t.text.strip()` TRƯỚC.
+
+`file_type` của `im/v1/files`: `.docx` → **`doc`**, không để `stream`. Đo
+03/08/2026: **cả hai đều upload OK** nên chuyện này không lộ ra thành lỗi — nó
+chỉ lộ ra ở phía người nhận, `stream` hiện như tệp nhị phân phải tải về mới đọc.
+
+### Đã kiểm (03/08/2026)
+
+| Phép thử | Kết quả |
+|---|---|
+| Sinh từ transcript THẬT (`Web scraper`, 84 đoạn) | 4.365 byte, 88 đoạn văn |
+| Cấu trúc ZIP | đúng 3 phần, `testzip()` sạch |
+| `word/document.xml` | XML hợp lệ (`ElementTree` parse được), 30.311 ký tự |
+| **Đọc lại bằng `python-docx`** | **88 đoạn, đúng nội dung, đúng thứ tự** |
+| Upload lên Lark | `file_type=doc` OK, `file_type=stream` OK |
+| `selftest` | 240 → **257** (nhóm 37 mới, 17 phép kiểm) |
+
+`python-docx` **chỉ dùng để ĐỌC LẠI lúc kiểm**, cài vào thư mục tạm ngoài repo —
+không phải dependency của V2. Đó là cách chứng minh file hợp lệ mà không phải
+mở Word bằng tay.
+
+### ⚠️ Phải khởi động lại `run`
+
+Vòng `run` đang chạy vẫn ghi `.txt` cho tới khi restart. Nó do
+`run-v2-auto.bat` giữ trong vòng lặp có sẵn, nên dừng tiến trình python là bat
+tự bật lại sau ~2 phút:
+
+```
+taskkill /T /F /PID <pid cua "python -m v2 run --send">
+```
+
+### Chưa làm, cố ý
+
+- **Cuộc họp CŨ không được phát lại dưới dạng `.docx`.** Họ đã nhận `.txt` rồi;
+  gửi lại là gửi trùng. File cũ vẫn đọc được, và Base vẫn đính đúng nó (nấc
+  `legacy` ở trên).
+- **`get_transcript` vẫn trả TEXT trong chat**, không gửi file. User chốt phạm
+  vi là "họp xong tự động gửi", không phải "hỏi thì gửi file". Muốn thêm thì
+  đường đúng là một tool GHI riêng gọi `im_send_file` tới chính người hỏi —
+  KHÔNG đặt trong `qa.py` (bất biến chỉ-đọc), cùng khuôn với `create_task`.
+
+---
+
+## 36. `send_transcript_file` — bot gửi file khi được xin (03/08/2026)
+
+### Vì sao cần, sau khi đã có §34 và §35
+
+§35 gửi `.docx` **tự động một lần** lúc phát biên bản. §34 cho hỏi lại nguyên
+văn nhưng trả **chữ trong chat**, cắt thành phần. Còn hở đúng một chỗ: người
+dùng muốn CẦM lại cái file của một cuộc họp cũ thì không có cửa nào — file cũ
+nằm đâu đó trong lịch sử chat, và bot chỉ biết dump chữ.
+
+Nay: xin file thì bot gửi file.
+
+### Đường GHI thứ hai, và vì sao lại một file riêng nữa
+
+`v2/sendfile.py`. Không đặt trong `qa.py` (bất biến chỉ-đọc, V2_HANDOFF §5.3),
+cũng không nhét vào `tasks.py` (file đó nói về task). MCP server nay **6 tool**:
+
+| | Tool | Cưỡng chế ở |
+|---|---|---|
+| ĐỌC | `list_meetings`, `get_meeting`, `search_meetings`, `get_transcript` | `qa.py` |
+| GHI | `create_task` | `tasks.py` — 4 ràng buộc |
+| GHI | `send_transcript_file` | `sendfile.py` — 5 ràng buộc |
+
+### Năm ràng buộc, và cái thứ 3 là cái quan trọng nhất
+
+1. `minute_token` phải là cuộc họp CÓ THẬT trong `jobs`.
+2. Người hỏi phải ĐƯỢC XEM — gọi thẳng `qa._may_see`, không dựng luật thứ hai.
+3. **Gửi cho CHÍNH người hỏi, không nhận người nhận tuỳ ý.** Một tool "gửi file
+   cho \<ai đó\>" mà agent gọi được là một máy phát tán biên bản — và nội dung
+   họp, thứ lái được agent, chảy thẳng vào prompt của nó. Ràng buộc này không
+   phải để tiện, nó là lý do tool này an toàn.
+4. Transcript phải CÓ CHỮ (§31.3 lại).
+5. **Chống gửi lặp** `RESEND_COOLDOWN_MIN = 10`: cùng người + cùng cuộc họp
+   trong 10 phút thì không gửi lại, trả về câu bảo agent **đừng gọi lại**.
+   Agent hiểu nhầm hay gặp lỗi là nó thử lại; không có cửa này thì một vòng lặp
+   của agent = hai chục file rơi vào chat người dùng. Đây là rủi ro riêng của
+   tool GHI có tác dụng nhìn thấy được, `create_task` không có (task trùng thì
+   xoá được, file đã gửi thì không thu lại).
+
+`deliveries` ghi `kind="ondemand"`, **KHÔNG dùng lại `full`**: bảng đó trả lời
+câu "ai đã nhận khi hệ thống PHÁT", và `_backfill_deliveries` đọc nó để biết còn
+ai chưa nhận. Đội lốt `full` là làm backfill tưởng người đó đã được phát rồi.
+
+### Một lỗi tiềm ẩn tìm ra khi làm việc này
+
+`lark_api.im_send_file` có **bảng `file_type` RIÊNG** không có `.docx`, tách rời
+bảng trong `pipeline._upload_doc`. Đường `deliver` truyền sẵn `file_key` nên
+bảng trong `im_send_file` là code chết ở đó — nhưng `sendfile` gọi không kèm
+`file_key`, tức đi đúng vào nhánh đó. Kết quả sẽ là: **file gửi tự động thì xem
+trước được trong chat, file gửi theo yêu cầu thì hiện như tệp nhị phân** — khác
+nhau tuỳ đường đi, không lỗi, không ai đoán ra vì sao. Đã gộp về **một chỗ duy
+nhất**: `lark_api.FILE_TYPES`.
+
+### Đường terminal
+
+```bash
+python -m v2 transcript <minute_token> --as <union_id> --send-file
+```
+
+`--send-file` **đòi `--as`** có chủ ý: `askers.admin_view()` (quyền admin đường
+CLI) không có `union_id` nào, nên `sendfile` sẽ từ chối — không bắt buộc `--as`
+thì người gõ lệnh tưởng tool hỏng thay vì hiểu là mình gọi sai.
+⚠️ Cờ này **gửi tin nhắn Lark THẬT** cho người ở `--as`.
+
+### Đã kiểm (03/08/2026)
+
+`selftest` 257 → **274** (nhóm 38, 17 phép kiểm). Nặng nhất là các phép kiểm
+**"sai điều kiện thì KHÔNG có lời gọi API nào"** — ở tool này một lỗ không phải
+"trả lời sai" mà là "file biên bản bay tới người không được xem", và không lùi
+lại được:
+
+| Ca | Kỳ vọng |
+|---|---|
+| Người có dự | gửi `.docx`, tới đúng `union_id` của chính họ |
+| Người KHÔNG dự | 0 lời gọi API, câu từ chối không lộ một chữ nội dung |
+| `who=None` / token rỗng / cuộc họp không có thật | 0 lời gọi API |
+| Transcript rỗng | 0 lời gọi API |
+| `admin_view()` (không có id Lark) | không gửi, nói rõ vì sao |
+| Gọi lại ngay | KHÔNG gửi lần hai; qua 10 phút thì gửi lại được |
+| Lark trả 230013 | nói **CHƯA gửi**, và vẫn ghi `ok=0` |
+
+🪤 Một phép kiểm của tôi FAIL lúc đầu vì tôi nhầm `askers.who("on_ADMIN", …)`
+với `askers.admin_view()`. Hai thứ khác hẳn: cái đầu là admin THẬT trong Lark và
+**phải** nhận được file; cái sau là cửa sau cho người ngồi trước máy và không có
+định danh nào để gửi tới.
+
+`hermes mcp test meetings` → **6 tool**. Gateway đã restart, feishu `connected`,
+`v2-enroll-gate` vẫn `enabled`.
+
+### CHẠY THẬT trong Lark — cùng ngày
+
+Thẩm nhắn *"gửi cho tôi file biên bản cuộc họp Web scraper"*:
+
+| Kiểm | Kết quả |
+|---|---|
+| Chọn tool | gọi `send_transcript_file`, **không** dump chữ bằng `get_transcript` |
+| File tới nơi | `Bien ban - Web scraper 27-07-2026 16h45.docx`, **4,3 KB** (khớp 4.365 byte trên đĩa) |
+| Lark hiện thế nào | **biểu tượng Word + xem trước được** ⇒ `file_type="doc"` đúng, không phải tệp nhị phân |
+| Câu trả lời | báo ngắn gọn + tự nhắc "bản máy phiên âm nên có thể có một số từ nghe nhầm" |
+| KHÔNG chép nội dung ra chat | đúng — chỉ một câu, không kèm transcript |
+| `deliveries` | đúng **một** dòng `kind='ondemand'`, `ok=1`, `recipient` = union_id của Thẩm, 09:41:30 |
+| Gọi lặp | không có — đúng một lần |
+
+Tức cả ba tầng đều ăn: prompt chọn đúng tool, code gửi đúng người, và cửa chống
+lặp không phải kích hoạt vì agent không thử lại.
+
+Prompt đã tách rõ hai tool (`platform_hints`, 2.792 → 3.306 ký tự).
+
+---
+
+## 37. App secret nằm ở HEAD, không phải chỉ trong history (03/08/2026)
+
+### Phát hiện
+
+Đang trả lời câu hỏi "cắt scope cho người auth thôi, Console để nguyên được
+không?" thì kiểm lại giả định của §29 và thấy nó **nhẹ hơn sự thật**.
+
+§29 (và `.gitignore` cũ) ghi: *"history CÓ app secret đang dùng thật"* — đúng,
+nhưng chưa đủ. Đo bằng `git show HEAD:v1/config.bat`:
+
+```
+HEAD:v1/config.bat:15   set OPENAI_API_KEY=sk-p…      <- CÒN GIÁ TRỊ
+HEAD:v1/config.bat:27   set SENDER_APP_SECRET=Xm2F…   <- CÒN GIÁ TRỊ
+```
+
+File **đang tracked ở HEAD** và đã push lên `origin/main`. Không phải chôn trong
+history: ai `git clone` repo hôm đó là có hai secret trần nằm sẵn trên đĩa, không
+cần biết lệnh git nào.
+
+Và `SENDER_APP_SECRET` không phải secret cũ của V1 — nó **dùng chung** với
+`v2/.env` (`LARK_APP_SECRET`) và `%LOCALAPPDATA%\hermes\.env`
+(`FEISHU_APP_SECRET`). Kiểm bằng cách so ba giá trị: giống hệt nhau. Tức đó
+chính là chìa mint tenant token mang **457 scope tenant** (§33.3).
+
+`.gitignore` có dòng `v1/config.bat` từ lâu — vô tác dụng, vì **git không áp
+ignore cho file đã tracked**. Chính file đó đã ghi rõ cái bẫy này ở phần dữ liệu
+runtime, nhưng phần secret ngay bên dưới lại mô tả tình trạng như "có ý thức,
+chấp nhận được" nên không ai quay lại.
+
+Điểm sáng: `lamson` (repo công ty) **sạch** — chỉ có `v1/config.bat.example`.
+§29 giữ được đúng như thiết kế.
+
+### Đã làm
+
+```
+git rm --cached v1/config.bat          # gỡ tracking, GIỮ file trên đĩa
+v1/config.bat.example                  # bản mẫu, lấy từ lamson cho hai repo khớp nhau
+.gitignore + README.md                 # sửa mô tả cũ (nó đang chỉ đường tới secret)
+```
+
+Kiểm sau khi sửa: `git grep --cached` cả hai giá trị → **không còn trong cây sẽ
+commit**. File `v1/config.bat` vẫn nằm trên đĩa và nay thật sự bị ignore, nên V1
+chạy được nếu cần.
+
+### CÒN LẠI — việc cho người làm, và đây mới là bản vá thật
+
+**Gỡ tracking KHÔNG xoá khỏi history.** Commit `985573f` vẫn còn secret, và nó
+đã ở trên `origin`. Cách duy nhất làm nó vô hại:
+
+**Xoay app secret** — Console app `cli_aae288361ef89eed` → App Credentials →
+reset. Rồi sửa **cả hai** chỗ và khởi động lại:
+
+| Chỗ | Biến |
+|---|---|
+| `v2\.env` | `LARK_APP_SECRET` |
+| `%LOCALAPPDATA%\hermes\.env` | `FEISHU_APP_SECRET` |
+
+Xong: `hermes gateway restart` + khởi động lại `run`, rồi `python -m v2 doctor`.
+
+⚠️ **Chưa đo:** xoay secret có làm mất refresh token của người đã enroll không.
+Về lý là không (token gắn với app, không gắn với secret) nhưng chưa kiểm. Hỏng
+thì 3 người enroll lại — rẻ, nhưng đừng xoay ngay trước một cuộc họp quan trọng.
+
+**KHÔNG rewrite history rồi force push.** `origin` đứng cạnh `lamson` và §29 nói
+rõ `--force` là điều tuyệt đối không được làm. Sau khi xoay secret thì bản trong
+history đã chết, không đáng đánh đổi rủi ro đó.
+
+**Revoke `OPENAI_API_KEY`** ở phía OpenAI. V2 không còn dùng nó từ 31/07 (recap
+đi qua Hermes, §15) — `config.py` chỉ còn một nhánh dự phòng
+`LLM_API_KEY or OPENAI_API_KEY` mà `v2/.env` đã đặt `LLM_API_KEY` nên không chạm
+tới. Key đó giờ chỉ còn là một khoản nợ.
+
+### Vì sao KHÔNG cắt scope Console (user hỏi, chốt để nguyên)
+
+Cắt Console **không** đổi màn hình Đồng ý (cái đó do `OAUTH_SCOPES`=18 quyết,
+đã sạch từ §22), **không** thu hẹp token của người đã enroll (Lark cộng dồn —
+Thẩm giữ 197 scope), và **không** chặn gì ở đường bot (agent chỉ có
+`clarify`+`meetings`, không có tool gọi HTTP tuỳ ý). Thứ duy nhất nó mua là thu
+nhỏ sức nổ của tenant token **khi secret lọt ra ngoài** — mà đó đúng là thứ việc
+xoay secret giải quyết trực tiếp, rẻ hơn, và không có cửa hỏng im lặng.
+
+Cái giá của việc cắt thì thật: không có API nào liệt kê được tenant scope mà
+`deliver` đang cần, cắt nhầm một cái là Lark trả `99991672` **đúng lúc đang phát
+biên bản**, và hoàn tác phải qua chu kỳ admin duyệt.
+
+⇒ Thứ tự đúng: **xoay secret trước, cắt Console sau (nếu vẫn muốn)** — lúc đó nó
+là dọn dẹp, không phải vá lỗ.

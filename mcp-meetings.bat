@@ -14,7 +14,7 @@ REM
 REM Doi Python? Sua dong PY duoi day. Kiem tra bang:
 REM   echo {"jsonrpc":"2.0","id":1,"method":"tools/list"} | mcp-meetings.bat
 
-set PY=C:\Users\Hi WINDOWS 11\AppData\Local\Programs\Python\Python312\python.exe
+set PY=C:\Users\PC\AppData\Local\Programs\Python\Python312\python.exe
 set PYTHONIOENCODING=utf-8
 set PYTHONUNBUFFERED=1
 cd /d "%~dp0"

@@ -16,7 +16,7 @@ REM khong co quyen xem. Bo trong = plugin doi cu -> V2 cho di tiep + canh bao.
 REM
 REM stdout CHI co JSON (log cua V2 di stderr) - cung ky luat voi mcp-meetings.bat.
 
-set PY=C:\Users\Hi WINDOWS 11\AppData\Local\Programs\Python\Python312\python.exe
+set PY=C:\Users\PC\AppData\Local\Programs\Python\Python312\python.exe
 set PYTHONIOENCODING=utf-8
 set PYTHONUNBUFFERED=1
 cd /d "%~dp0"

@@ -44,8 +44,14 @@ ST_NO_RECAP = "không có recap"   # có người nhận, nhưng tóm tắt rỗ
 # là đi mời người ta cấp quyền. Gộp chung thì mỗi cuộc họp của phòng chưa dùng
 # hệ thống lại hiện lên như một sự cố.
 ST_NO_CONSENT = "chưa ai cấp quyền"
+# Thêm 03/08/2026 (mô hình kéo): đã phiên âm whisper XONG nhưng CỐ Ý giữ, chờ
+# người dự nhắn 'gửi transcript [tên]' mới gửi. KHÔNG có dòng recap-delivery nào
+# (held không broadcast) nên nếu không tách riêng, `delivery_status` sẽ nhầm nó
+# là `chưa ai cấp quyền` — sai hẳn: người dự VẪN được báo Minute+tóm tắt lúc họp
+# xong, chỉ là bản nguyên văn thì chờ hỏi.
+ST_HELD = "chờ hỏi transcript"
 
-STATUS_OPTIONS = [ST_SENT, ST_NO_RECAP, ST_FAILED, ST_NO_CONSENT]
+STATUS_OPTIONS = [ST_SENT, ST_NO_RECAP, ST_FAILED, ST_NO_CONSENT, ST_HELD]
 
 # Tên field là KHÓA khi ghi record (base/v3 nhận map tên -> giá trị). Đổi tên
 # field trên UI Base = code ghi hỏng. Muốn đổi nhãn thì đổi cả hai chỗ.
@@ -174,13 +180,15 @@ def delivery_status(minute_token: str, recap: Recap | None = None) -> str:
     enroll. Gộp hai cái vào `phát hỏng` thì mỗi cuộc họp của phòng chưa dùng hệ
     thống lại hiện lên như một sự cố, và người ta thôi đọc cột này.
 
-    Suy luận đó chỉ đúng vì hàm này CHỈ được gọi cho job `delivered`
-    (`write_draft` từ `_deliver_now`, `retry_missing_records` lọc
-    `by_status("delivered")`, `sync_tracking` chỉ đụng record đã có). Job
-    `failed` cũng có 0 dòng `deliveries` nhưng vì lý do khác hẳn — nó không bao
-    giờ tới đây. Nếu sau này có ai cho job `failed` lên Base thì phải xét
-    `jobs.status` trước, đừng để nó nhận nhãn này.
+    Xét `jobs.status` TRƯỚC nhánh đếm `deliveries` (mô hình kéo, 03/08/2026):
+    job `held` cũng có 0 dòng `deliveries` (không broadcast) nên rơi thẳng vào
+    `chưa ai cấp quyền` — SAI, người dự vẫn được báo Minute+tóm tắt, chỉ giữ bản
+    nguyên văn chờ hỏi. Đây đúng là ca mà docstring cũ đã dặn: "Nếu sau này có ai
+    cho job [không-delivered] lên Base thì phải xét `jobs.status` trước". Nay
+    `_base_record_held` + `retry_missing_records` cho cả `held` lên Base thật.
     """
+    if (jobstore.get(minute_token) or {}).get("status") == "held":
+        return ST_HELD
     ok, failed = jobstore.delivery_counts(minute_token, "recap")
     if ok == 0:
         return ST_FAILED if failed else ST_NO_CONSENT
@@ -343,11 +351,20 @@ def _tracking_fields(meta: MeetingMeta, *,
         out[F_WHISPER_X] = f"{float(ws) / float(aud):.2f}x realtime"
 
     # --- file transcript (attachment) ---
-    # Ưu tiên bản .txt người đọc được (`pipeline.txt_path` TÍNH ra đường dẫn,
-    # không glob mò); không có thì đính kèm chính file .json trong DB.
+    # Ưu tiên bản người đọc được (`pipeline.doc_path` TÍNH ra đường dẫn, không
+    # glob mò); không có thì đính kèm chính file .json trong DB.
+    #
+    # BA nấc, và nấc giữa mới thêm 03/08/2026: đuôi file đổi .txt -> .docx hôm
+    # đó, nên mọi cuộc họp CŨ chỉ có bản .txt trên đĩa. Thiếu nấc `legacy` thì
+    # các đường ghi Base MUỘN (sync_tracking, retry_missing_records) tụt thẳng
+    # xuống .json, và người mở ô file nhận một cục JSON thay vì biên bản —
+    # hỏng im lặng, vì record vẫn ghi thành công.
     from . import pipeline
-    target = None if skip_file else pipeline.txt_path(meta)
+    target = None if skip_file else pipeline.doc_path(meta)
     if target and not target.exists():
+        legacy = pipeline.legacy_txt_path(meta)
+        target = legacy if legacy.exists() else None
+    if target is None and not skip_file:
         raw = Path(row.get("transcript_path") or "")
         target = raw if raw.exists() else None
     if target:
@@ -522,6 +539,12 @@ def retry_missing_records() -> int:
     ghi Base là cuộc họp đó vĩnh viễn không lên Base, còn bot thì báo "CHƯA CÓ
     BIÊN BẢN" mãi mãi (`qa.pending_meetings` xét đúng cột này) dù đã phát xong.
 
+    Quét cả `held` (sửa 03/08/2026 — mô hình kéo): cuộc `held` đã phiên âm xong
+    và `_base_record_held` đã cố ghi record, nhưng ghi hỏng thì cùng một lỗ —
+    không có `bitable_record_id`, mất trong `list_meetings`/`search_meetings`, và
+    KHÔNG được nhánh `delivered` này vá vì held không bao giờ thành delivered.
+    `write_draft` với `n_recipients=0` khớp đúng cái `_base_record_held` ghi.
+
     Gọi từ hai chỗ: cuối mỗi `process_queue` thật, và đầu `base-sync` (người
     chạy tay cũng phải vá được, không chỉ vòng `run`).
 
@@ -531,7 +554,7 @@ def retry_missing_records() -> int:
     if not enabled():
         return 0
     n = 0
-    for row in jobstore.by_status("delivered"):
+    for row in jobstore.by_status("delivered", "held"):
         if row.get("bitable_record_id"):
             continue
         token = row["minute_token"]

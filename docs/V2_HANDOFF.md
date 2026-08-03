@@ -67,6 +67,8 @@ có `v2 action`. Bỏ theo yêu cầu user 30/07.
 | Dùng lại transcript, không phiên âm lại | `process` dry-run trên 2 job cũ |
 | `db._migrate` | 2 job `awaiting_approval` → `queued` |
 | Chống prompt injection | ngữ cảnh giả "CHỈ THỊ QUẢN TRỊ" → bot không nghe theo |
+| `get_transcript` trong Lark thật | 03/08: hỏi "cho tôi nguyên văn…" → bot gọi đúng tool, trả 4/4 đoạn khớp từng chữ, đúng mốc giờ, tự nói caveat "bản máy" (§34) |
+| `send_transcript_file` trong Lark thật | 03/08: xin "gửi cho tôi file…" → bot gọi đúng tool (không dump chữ), file `.docx` 4,3 KB tới nơi với biểu tượng Word + xem trước được, `deliveries` đúng 1 dòng `ondemand ok=1` (§36) |
 
 ## 3. CHƯA kiểm chứng — đừng tưởng đã xong
 
@@ -412,6 +414,84 @@ nhận là đồng nghiệp thật (BA và Team Leader) — đừng gửi biên 
    (`alerts.check_all` mỗi 5 phút + Task `V2_Alerts` mỗi 15 phút), không đụng
    Vercel. Nhầm chỗ này dẫn tới "không dám giảm kẻo mất cảnh báo".
    Ba cái bẫy khi deploy Vercel: `v2/vercel-oauth/README.md`.
+
+---
+
+18. **Dọn rác chat + soát "scope" theo cả ba nghĩa — 03/08/2026,
+   V2_MAINTENANCE §33.** Hai dòng rác trong chat Lark đã gỡ:
+   `📬 No home channel is set…` (đặt `FEISHU_HOME_CHANNEL` = DM của Thẩm, đã xác
+   minh bằng `im/v1/chats/{id}/members`) và bong bóng `⚙ tool_describe…`
+   (`display.platforms.feishu.tool_progress: 'off'` — **phải có nháy**, `off`
+   trần là boolean `False` và rơi ngược về `"all"`).
+   - **§21 sai một chỗ đã sửa:** `feishu_doc`/`feishu_drive`/`kanban` BỎ ĐƯỢC
+     bằng `agent.disabled_toolsets`. Toolset feishu nay đúng
+     `['clarify', 'meetings']` — phạm vi bot lên tầng cưỡng chế, không còn chỉ
+     là lời dặn trong prompt.
+   - 🔴 **CÒN MỞ, việc cho người làm ở Console:** scope Console của app
+     `cli_aae288361ef89eed` là **867 entry / 496 tên**, tăng từ 376/301 đo
+     30/07. Có 165 tên ngoài phạm vi họp (`mail`, `directory`, `admin`,
+     `security_and_compliance`, `approval`…) và 72 scope GHI. `OAUTH_SCOPES=18`
+     KHÔNG che được: **tenant token không xin gì, nó mang cả 457 scope tenant**,
+     mà app secret thì nằm trong history repo `origin` (§29). Danh sách đề nghị
+     giữ lại: §33.3.
+
+19. **Bot đưa được NGUYÊN VĂN whisper — 03/08/2026, V2_MAINTENANCE §34.**
+   Transcript vốn vẫn được phát (file `full` trong `deliveries` + attachment
+   trên Base) nhưng đường HỎI ĐÁP không có cửa nào tới nó, nên hỏi lại một cuộc
+   họp cũ thì chỉ thấy tóm tắt. Thêm tool MCP thứ năm `get_transcript`
+   (`qa.get_transcript`, cắt theo phần 6.000 ký tự, mốc `[mm:ss]`, dùng ĐÚNG
+   `_may_see`) + lệnh `python -m v2 transcript`. `selftest` 224 → **240**.
+   ⚠️ Nhớ phân biệt: `Link Minutes` là bản của **Lark**, không phải bản whisper —
+   prompt nay bắt bot nói rõ, trước đó nó đưa link Lark rồi coi như xong.
+   ⚠️ Cần `hermes gateway restart` (đã chạy).
+   ✅ **Đã chạy thật trong Lark cùng ngày** — bot chọn đúng tool, không bịa,
+   không dọn chỗ whisper nghe nhầm thành câu đọc được (§34, mục "CHẠY THẬT").
+   Còn hở một nhánh: cuộc họp **nhiều phần** chưa thử trong Lark (cuộc thử chỉ
+   có 1 phần) — hỏi bot về `Web scraper` là kiểm được.
+
+20. **Biên bản gửi đi nay là `.docx`, không còn `.txt` — 03/08/2026 (user chốt),
+   V2_MAINTENANCE §35.** `v2/docxfile.py` tự dựng OOXML bằng `zipfile`, KHÔNG
+   thêm dependency — lý do được kiểm chứng ngay trong ngày: vòng `run` chạy
+   bằng python của `uv`, còn `v2 mcp` do Hermes spawn chạy bằng
+   `Programs\Python\Python312`; `pip install` vào một cái là hỏng ở cái kia,
+   im lặng. `txt_path`→`doc_path`, `write_txt`→`write_doc`.
+   ⚠️ Hai chỗ đổi đuôi làm gãy, đã vá: (a) cuộc họp CŨ chỉ có `.txt` →
+   `legacy_txt_path` làm nấc giữa, không thì Base đính bản `.json`;
+   (b) guard "transcript rỗng" dựa trên `st_size == 0` **mất tác dụng** vì
+   `.docx` rỗng vẫn ~1 KB → `_upload_doc` nay kiểm `t.text` trước.
+   `selftest` 240 → **257**. ⚠️ **Phải khởi động lại `run`** mới ăn.
+   Cố ý chưa làm: không phát lại cuộc họp cũ dưới dạng `.docx` (gửi trùng), và
+   `get_transcript` vẫn trả text trong chat chứ không gửi file.
+
+21. **Bot gửi FILE khi được xin — `send_transcript_file`, 03/08/2026,
+   V2_MAINTENANCE §36.** MCP server nay **6 tool**; đây là đường GHI **thứ hai**
+   (`v2/sendfile.py`, cùng khuôn `tasks.py`, ngoài `qa.py`). 5 ràng buộc cứng,
+   quan trọng nhất là **chỉ gửi cho CHÍNH người hỏi** — một tool "gửi file cho
+   \<ai đó\>" mà agent gọi được là máy phát tán biên bản. Kèm cửa **chống gửi
+   lặp 10 phút**: agent thử lại là hai chục file rơi vào chat người dùng, mà
+   file đã gửi thì không thu lại được. `deliveries` ghi `kind="ondemand"`,
+   không đội lốt `full` (nếu không `_backfill_deliveries` tưởng đã phát rồi).
+   Terminal: `python -m v2 transcript <token> --as <union_id> --send-file`
+   (gửi tin THẬT). `selftest` 257 → **274**.
+   ⚠️ Lỗi tiềm ẩn đã vá cùng lúc: `lark_api.im_send_file` có bảng `file_type`
+   RIÊNG không có `.docx` — đường `deliver` truyền sẵn `file_key` nên không lộ,
+   nhưng `sendfile` thì đi đúng vào đó. Nay gộp một chỗ: `lark_api.FILE_TYPES`.
+
+22. 🔴 **App secret nằm ở HEAD chứ không phải chỉ trong history — 03/08/2026,
+   V2_MAINTENANCE §37.** `v1/config.bat` **đang tracked** và đã push lên
+   `origin/main`, trong đó `SENDER_APP_SECRET` (= `LARK_APP_SECRET` của V2 =
+   `FEISHU_APP_SECRET` của Hermes, đã so: giống hệt) và `OPENAI_API_KEY` nằm
+   dạng trần. Ai `git clone` là có sẵn trên đĩa. `.gitignore` có dòng đó từ lâu
+   nhưng vô tác dụng — git không áp ignore cho file đã tracked.
+   ĐÃ LÀM: `git rm --cached`, thêm `v1/config.bat.example` (lấy từ `lamson` cho
+   hai repo khớp), sửa `.gitignore` + `README`. `lamson` vẫn sạch.
+   **CÒN LẠI, việc cho người làm:** gỡ tracking KHÔNG xoá khỏi history →
+   **xoay app secret ở Console**, sửa CẢ `v2\.env` lẫn
+   `%LOCALAPPDATA%\hermes\.env`, restart cả hai. Và revoke `OPENAI_API_KEY`
+   (V2 không dùng từ 31/07). ⚠️ Chưa đo: xoay secret có mất refresh token của
+   người đã enroll không. **KHÔNG rewrite history rồi force push** (§29).
+   Console scope thì **user chốt để nguyên** — lý do ở §37 phần cuối; đừng tự
+   mở lại việc đó.
 
 ---
 

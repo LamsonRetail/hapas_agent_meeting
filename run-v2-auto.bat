@@ -20,8 +20,9 @@ REM output bi block-buffer -> log rong hang chuc phut, tuong la treo (da gap).
 REM PYTHONIOENCODING: ten cuoc hop co tieng Viet, console cp1252 se crash.
 set PYTHONUNBUFFERED=1
 set PYTHONIOENCODING=utf-8
+set PY=C:\Users\PC\AppData\Local\Programs\Python\Python312\python.exe
 
-set WHISPER_BAT=E:\whisper\run-server.bat
+set WHISPER_BAT=D:\whisper\run-server.bat
 set HEALTH=http://localhost:8000/health
 set LOGDIR=%~dp0v2\data\logs
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
@@ -96,7 +97,7 @@ REM lan sau ai do chan loi "hom 5/8 co gi" se mo v2-2026-08-05.log, thay file
 REM TRONG, roi ket luan he thong khong chay - dung kieu doc sai nguy hiem nhat.
 call :setlog
 call :log "[*] python -m v2 run --send"
-python -m v2 run --send >> "%LOG%" 2>&1
+"%PY%" -m v2 run --send >> "%LOG%" 2>&1
 call :log "[!] orchestrator thoat (ma %errorlevel%) - bat lai sau 120s"
 ping -n 121 127.0.0.1 >nul
 goto loop

@@ -648,13 +648,25 @@ def im_upload_file(path: Path, file_type: str = "stream") -> str:
     return _check(resp, "im_upload").get("data", {}).get("file_key", "")
 
 
+# `file_type` của `im/v1/files`, theo đuôi file. Sai giá trị KHÔNG làm hỏng lời
+# gọi — Lark nhận `stream` cho mọi thứ — nên nó không lộ ra ở đâu ngoài phía
+# người nhận: `stream` hiện như tệp nhị phân, phải tải về mới đọc; `doc` thì xem
+# trước được ngay trong chat.
+#
+# MỘT chỗ duy nhất, có chủ ý: bảng này từng nằm hai nơi (`im_send_file` và
+# `pipeline._upload_doc`). Thêm `.docx` vào một bên mà quên bên kia thì đường
+# `deliver` (có file_key) hiện đẹp còn đường gửi lẻ (tự upload) hiện xấu — khác
+# nhau tuỳ đường đi, không ai đoán ra vì sao.
+FILE_TYPES = {".mp4": "mp4", ".pdf": "pdf", ".opus": "opus",
+              ".docx": "doc", ".doc": "doc"}
+
+
 def im_send_file(receive_id: str, path: Path, *,
                  id_type: str = "union_id", uuid_key: str | None = None,
                  file_key: str | None = None) -> str:
     """Gửi file. Truyền file_key để tái dùng khi gửi cho nhiều người."""
-    ext = path.suffix.lower()
-    ftype = {".mp4": "mp4", ".pdf": "pdf", ".opus": "opus"}.get(ext, "stream")
-    key = file_key or im_upload_file(path, ftype)
+    key = file_key or im_upload_file(path, FILE_TYPES.get(path.suffix.lower(),
+                                                          "stream"))
     return im_send(receive_id, "file", {"file_key": key},
                    id_type=id_type, uuid_key=uuid_key)
 

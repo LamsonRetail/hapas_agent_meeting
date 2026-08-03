@@ -2,9 +2,10 @@
 Lớp DỮ LIỆU về các cuộc họp — đọc Base, trả text cho người/agent đọc.
 
     list_meetings(...) / get_meeting(query) / search_meetings(keyword)
+    get_transcript(query, part=)          # nguyên văn whisper, thêm 03/08/2026
 
 Ai dùng:
-  - `mcp_server.py` phơi đúng ba hàm này thành MCP tool cho Hermes gọi.
+  - `mcp_server.py` phơi đúng bốn hàm này thành MCP tool cho Hermes gọi.
   - `python -m v2 ask "..."` — smoke test tại terminal, không cần Hermes.
 
 CHIỀU GỌI: Hermes -> V2 (Hermes là con chat, V2 là nguồn dữ liệu). Bản đầu tôi
@@ -12,9 +13,14 @@ làm ngược (V2 gọi AIAgent.chat và tự viết cầu nối Lark) — sai, 
 adapter Feishu/Lark hạng nhất (`plugins/platforms/feishu/`, `FEISHU_DOMAIN=lark`)
 và nó nạp tool từ MCP server. Viết lại cầu nối Lark là làm trùng việc.
 
-Nguồn dữ liệu là **Base** (`bitable.py`), không phải transcript: Base đã qua
-recap nên ngắn/sạch; transcript whisper CPU rất nhiễu (xem docs). Cần nguyên văn
-thì mỗi record có `Link Minutes`.
+Nguồn dữ liệu MẶC ĐỊNH là **Base** (`bitable.py`): đã qua recap nên ngắn/sạch,
+còn transcript whisper CPU rất nhiễu (xem docs). Ba hàm đầu chỉ đọc Base.
+
+Nguyên văn whisper KHÔNG đi kèm câu trả lời thường — nó là một tool RIÊNG
+(`get_transcript`, 03/08/2026), trả theo từng phần, và chỉ khi người dùng hỏi
+tới. Đừng gộp nó vào `fmt_record`: làm vậy là mỗi câu hỏi vặt cũng kéo hàng chục
+nghìn ký tự vào prompt agent. Lưu ý `Link Minutes` trên record là bản của
+**Lark**, không phải bản whisper — hai thứ khác nhau, đừng nói lẫn.
 
 AN TOÀN: nội dung Base bắt nguồn từ lời nói trong họp = input KHÔNG tin cậy, và
 nó chảy vào prompt của agent. Lớp này chỉ ĐỌC — không có hàm nào ghi/xoá. Đừng
@@ -231,12 +237,19 @@ _TINH_TRANG = {
     "transcribing": "đang phiên âm",
     "recapping": "đang tóm tắt",
     # `delivered` mà vẫn lọt vào danh sách này = đã phát cho người dự nhưng lần
-    # ghi Base hỏng. PHẢI có dòng này: thiếu nó thì `_TINH_TRANG.get(st, st)` rơi
-    # về chuỗi thô và bot nói câu tự mâu thuẫn "CHƯA CÓ BIÊN BẢN — delivered".
-    # Vòng `run` và `base-sync` đều tự ghi lại (bitable.retry_missing_records),
-    # nên trạng thái này chỉ tồn tại tạm.
-    "delivered": "ĐÃ phát cho người dự, nhưng chưa ghi được lên Base "
-                 "(hệ thống sẽ tự thử lại)",
+    # ghi record hỏng. PHẢI có dòng này: thiếu nó thì `_TINH_TRANG.get(st, st)`
+    # rơi về chuỗi thô và bot nói câu tự mâu thuẫn "CHƯA CÓ BIÊN BẢN — delivered".
+    # KHÔNG lộ "Base" cho người dùng (user chốt 03/08/2026) — nói đúng phần họ
+    # quan tâm: đã gửi rồi. Vòng `run`/`base-sync` tự ghi lại nên chỉ tạm.
+    "delivered": "ĐÃ gửi cho người dự — hệ thống đang đồng bộ nốt",
+    # `held` (mô hình kéo, 03/08/2026): đã phiên âm whisper XONG nhưng ghi record
+    # hỏng nên chưa có `bitable_record_id` -> lọt vào danh sách này. KHÔNG lộ chữ
+    # "Base" cho người dùng (user chốt 03/08/2026: Base là chỗ nội bộ, hạn chế
+    # người vào) — nói theo góc nhìn của họ: biên bản đang hoàn tất, xong tự gửi.
+    # `retry_missing_records` tự vá nên trạng thái này chỉ tạm. Thiếu dòng này
+    # thì `_TINH_TRANG.get` rơi về "held" thô và bot nói "CHƯA CÓ BIÊN BẢN — held".
+    "held": "chưa tạo xong biên bản — tạo xong hệ thống sẽ tự động gửi cho "
+            "bạn ngay",
     "failed": "XỬ LÝ HỎNG — sẽ không tự chạy lại",
     "discarded": "đã bị bỏ qua (người vận hành chọn không xử lý)",
     "awaiting_approval": "di sản cửa duyệt cũ",
@@ -305,11 +318,18 @@ def pending_meetings(who: dict[str, Any] | None = None) -> list[dict[str, Any]]:
 
 def fmt_pending(p: dict[str, Any]) -> str:
     line = f"- {p['when'] or '(không rõ giờ)'} · {p['title']}"
-    # Job `delivered` lọt vào đây là chuyện KHÁC hẳn: biên bản có thật và đã tới
-    # tay người dự, chỉ là chưa lên Base. Nói "CHƯA CÓ BIÊN BẢN" ở trường hợp đó
-    # là nói sai theo chiều ngược lại — người ta sẽ đi tìm cái đã nằm trong chat.
-    dau = ("CHƯA LÊN BASE" if p["status"] == "delivered"
-           else "CHƯA CÓ BIÊN BẢN")
+    # Ba ca KHÁC nhau, đừng gộp. KHÔNG lộ "Base" cho người dùng (user chốt
+    # 03/08/2026 — Base là chỗ nội bộ, hạn chế người vào):
+    #  - delivered: biên bản CÓ THẬT và đã tới tay người dự, chỉ chưa đồng bộ
+    #    xong. Nói "CHƯA CÓ BIÊN BẢN" là sai ngược — họ đi tìm cái đã trong chat.
+    #  - held: đã phiên âm xong nhưng chưa ghi record — nói theo góc người dùng:
+    #    đang hoàn tất, xong tự gửi.
+    if p["status"] == "delivered":
+        dau = "ĐÃ GỬI CHO BẠN"
+    elif p["status"] == "held":
+        dau = "CHƯA TẠO XONG BIÊN BẢN"
+    else:
+        dau = "CHƯA CÓ BIÊN BẢN"
     line += f"\n    tình trạng: {dau} — {p['tinh_trang']}"
     if p["status"] == "failed" and p["error"]:
         line += f" (lỗi: {p['error']})"
@@ -469,6 +489,154 @@ def search_meetings(who: dict[str, Any] | None, keyword: str,
                    f"có biên bản, nên không tìm được trong nội dung. PHẢI nêu ra:")
         out += [fmt_pending(p) for p in pend]
     return "\n\n".join(out)
+
+
+# --------------------------------------------- nguyên văn whisper (03/08/2026)
+#
+# Vì sao thêm (user hỏi 03/08/2026: "sao ở đây ko có transcript của whisper?"):
+# transcript vẫn được PHÁT — `pipeline.deliver` gửi kèm file `.txt` và
+# `bitable.py` đính nó vào cột `File transcript` — nhưng đường HỎI ĐÁP thì không
+# có cửa nào tới nó. `fmt_record` cố ý chỉ trả tóm tắt/quyết định/việc cần làm +
+# `Link Minutes`, mà `Link Minutes` là **bản của Lark**, không phải bản whisper.
+# Nên người dùng hỏi lại một cuộc họp cũ thì thấy đúng cái họ không tìm.
+#
+# Ba cách khác đã cân và bỏ (V2_MAINTENANCE §34):
+#  - nhét nguyên văn vào `get_meeting`: transcript 1 tiếng họp là hàng chục
+#    nghìn ký tự đổ thẳng vào prompt agent MỖI lần hỏi bất cứ gì.
+#  - trả link tới attachment trên Base: Base đang `tenant_readable` (§28.1), tức
+#    câu trả lời sẽ là một đường vòng qua chính hàng rào §20.
+#  - gửi lại file: cần đường cho agent kích hoạt việc GỬI, mà lớp này chỉ đọc.
+#
+# Quyền: dùng ĐÚNG `_may_see` như mọi hàm khác ở đây. Không dựng luật thứ hai —
+# hai luật song song sẽ lệch, và cái lỏng hơn thắng (bài học §21 mục 2).
+
+TRANSCRIPT_PART_CHARS = 6000
+
+
+def _mmss(sec: float) -> str:
+    s = max(0, int(sec))
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def _split_parts(lines: list[str], budget: int) -> list[str]:
+    """Gom dòng thành các phần <= `budget` ký tự, KHÔNG cắt giữa một dòng.
+
+    Dòng dài hơn cả `budget` (một đoạn nói liền 10 phút) thì mới cắt cứng — thà
+    cắt giữa câu còn hơn trả về một phần phình gấp mấy lần ngân sách.
+    """
+    parts: list[str] = []
+    cur: list[str] = []
+    n = 0
+    for ln in lines:
+        while len(ln) > budget:
+            if cur:
+                parts.append("\n".join(cur))
+                cur, n = [], 0
+            parts.append(ln[:budget])
+            ln = ln[budget:]
+        if cur and n + len(ln) + 1 > budget:
+            parts.append("\n".join(cur))
+            cur, n = [], 0
+        cur.append(ln)
+        n += len(ln) + 1
+    if cur:
+        parts.append("\n".join(cur))
+    return parts or [""]
+
+
+def _job_title(row: dict[str, Any]) -> str:
+    return str(row.get("title") or "") or "(không tiêu đề)"
+
+
+def get_transcript(who: dict[str, Any] | None, query: str,
+                   *, part: int = 1) -> str:
+    """Nguyên văn whisper của một cuộc họp, cắt thành phần cho vừa prompt.
+
+    Tra trên `jobs` chứ không trên Base: transcript thuộc về job, và có job đã
+    phiên âm xong mà chưa lên được Base (`bitable_record_id` rỗng) — tra theo
+    Base thì đúng những cuộc đó lại nói "không tìm thấy" trong khi file đang nằm
+    trên đĩa.
+    """
+    if not who:
+        return NO_ASKER
+    query = (query or "").strip()
+    if not query:
+        return "Cần minute_token hoặc một phần tên cuộc họp."
+
+    from . import jobstore
+    rows = jobstore.all_jobs()
+    q = query.lower()
+    hits = [r for r in rows if r["minute_token"] == query]
+    if not hits:
+        hits = [r for r in rows if q in _job_title(r).lower()]
+    if not hits:
+        return (f"Không tìm thấy cuộc họp nào khớp '{query}'. Gọi list_meetings "
+                f"hoặc search_meetings để lấy đúng minute_token.")
+
+    index = viewers_index()
+    allowed = [r for r in hits if _may_see(r["minute_token"], who, index)]
+    if not allowed:
+        # Cùng câu chữ với `get_meeting`: người ta vừa tự gõ tên ra nên nói
+        # "có nhưng không phải của bạn" không tiết lộ gì thêm, mà nói "không
+        # tìm thấy" thì họ tưởng cuộc họp không tồn tại.
+        return ("Cuộc họp này CÓ trong hệ thống nhưng bạn không có trong danh "
+                "sách người dự, nên mình không đưa nguyên văn được. Nếu bạn có "
+                "dự thì nhắn quản trị hệ thống — có thể việc tra người dự bị sót.")
+    if len(allowed) > 1:
+        allowed.sort(key=lambda r: r.get("start_ts") or 0, reverse=True)
+        return (f"Có {len(allowed)} cuộc họp khớp '{query}', gọi lại kèm "
+                f"minute_token cụ thể:\n"
+                + "\n".join(f"- {_ts_to_str(r.get('start_ts'))} · {_job_title(r)}"
+                            f" · {r['minute_token']}" for r in allowed))
+
+    row = allowed[0]
+    title = _job_title(row)
+    tpath = row.get("transcript_path")
+    if not tpath:
+        st = row.get("status") or "?"
+        return (f"Cuộc họp '{title}' CHƯA có nguyên văn: {_TINH_TRANG.get(st, st)}"
+                + (f" (lỗi: {(row.get('error') or '')[:160]})"
+                   if row.get("error") else "")
+                + ". Nói rõ điều đó cho người dùng, đừng bịa nội dung.")
+
+    import json as _json
+    from .models import Transcript
+    try:
+        with open(tpath, encoding="utf-8") as f:
+            t = Transcript.from_json(_json.load(f))
+    except (OSError, _json.JSONDecodeError, KeyError, TypeError) as exc:
+        # Không nuốt: job nói CÓ transcript mà đọc không ra là hỏng thật, và im
+        # lặng ở đây thành "cuộc họp không có nguyên văn" — sai hẳn nguyên nhân.
+        return (f"Cuộc họp '{title}' có ghi đường dẫn nguyên văn nhưng đọc "
+                f"KHÔNG được ({exc}). Đây là lỗi hệ thống, không phải cuộc họp "
+                f"thiếu dữ liệu — báo người dùng nhắn quản trị hệ thống.")
+
+    segs = [s for s in t.segments if (s.text or "").strip()]
+    if not segs:
+        return (f"Cuộc họp '{title}' có file nguyên văn nhưng KHÔNG có chữ nào "
+                f"({t.duration:.0f}s audio, engine {t.engine}). Bản ghi im lặng "
+                f"thật, hoặc whisper hỏng lúc chạy — nhắn quản trị hệ thống.")
+
+    body = _split_parts([f"[{_mmss(s.start)}] {s.text.strip()}" for s in segs],
+                        TRANSCRIPT_PART_CHARS)
+    total = len(body)
+    part = max(1, int(part or 1))
+    if part > total:
+        return (f"Nguyên văn cuộc họp '{title}' chỉ có {total} phần, không có "
+                f"phần {part}.")
+
+    head = [f"### Nguyên văn (whisper) — {title}",
+            f"- Phần {part}/{total}"
+            + ("" if part >= total else "  ← CHƯA hết, xem dòng cuối"),
+            f"- Nguồn: {t.engine}, {t.duration:.0f}s audio, {len(segs)} đoạn",
+            f"- minute_token: {row['minute_token']}",
+            "- Đây là bản MÁY PHIÊN ÂM, có lỗi nghe nhầm — trích dẫn thì nói rõ",
+            ""]
+    tail = ("" if part >= total else
+            f"\n\n… còn phần {part + 1}/{total}. Gọi lại get_transcript với "
+            f"cùng minute_token và part={part + 1}. Đừng nói với người dùng là "
+            f"đã hết khi chưa đọc hết.")
+    return "\n".join(head) + body[part - 1] + tail
 
 
 # ------------------------------------- smoke test tại terminal (`v2 ask`)

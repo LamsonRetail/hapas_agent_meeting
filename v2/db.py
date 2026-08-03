@@ -159,6 +159,19 @@ CREATE TABLE IF NOT EXISTS deliveries (
     ok           INTEGER,
     error        TEXT
 );
+
+-- Người ĐÃ HỎI transcript whisper của một cuộc chưa dịch xong. Vì sao bảng
+-- riêng, không phải một cột: nhiều người có thể cùng hỏi một cuộc, "ai cần tự
+-- gửi khi dịch xong" là DANH SÁCH. Job đó lên priority=2 (cực cao); phiên âm
+-- xong thì `process_queue` gửi transcript cho từng người ở đây rồi xoá.
+-- Khoá kép (cuộc, người) để hỏi lại không tạo dòng trùng.
+CREATE TABLE IF NOT EXISTS transcript_requests (
+    minute_token TEXT,
+    requester    TEXT,               -- union_id người hỏi
+    name         TEXT,
+    requested_at INTEGER,
+    PRIMARY KEY (minute_token, requester)
+);
 """
 
 _local = threading.local()
@@ -213,7 +226,10 @@ def _migrate() -> None:
 
         have = {r["name"] for r in c.execute("PRAGMA table_info(jobs)")}
         for col, decl in (("bitable_record_id", "TEXT"),
-                          ("recap_fails", "INTEGER DEFAULT 0")):
+                          ("recap_fails", "INTEGER DEFAULT 0"),
+                          # 2=cực cao (có người hỏi), 1=thường (cuộc mới),
+                          # 0=backlog (7 ngày lúc enroll). Job cũ mặc định 1.
+                          ("priority", "INTEGER DEFAULT 1")):
             if col not in have:
                 c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
                 print(f"[db] thêm cột jobs.{col}")
@@ -326,3 +342,31 @@ def is_claimed(minute_token: str) -> bool:
         "SELECT 1 FROM minutes_lock WHERE minute_token=?", (minute_token,)
     ).fetchone()
     return row is not None
+
+
+# --- Yêu cầu transcript whisper (auto-gửi khi dịch xong) -------------
+
+def add_transcript_request(minute_token: str, requester: str,
+                           name: str = "") -> None:
+    """Ghi 'người này đã hỏi transcript cuộc này'. Hỏi lại không tạo dòng trùng."""
+    with tx() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO transcript_requests"
+            "(minute_token, requester, name, requested_at) VALUES (?,?,?,?)",
+            (minute_token, requester, name, _now_ms()),
+        )
+
+
+def transcript_requesters(minute_token: str) -> list[dict]:
+    """Người đang chờ transcript của cuộc này (union_id + tên), cũ trước."""
+    rows = conn().execute(
+        "SELECT requester, name FROM transcript_requests "
+        "WHERE minute_token=? ORDER BY requested_at", (minute_token,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_transcript_requests(minute_token: str) -> None:
+    """Đã gửi xong cho mọi người hỏi -> xoá, để lần dịch sau không gửi lại."""
+    with tx() as c:
+        c.execute("DELETE FROM transcript_requests WHERE minute_token=?",
+                  (minute_token,))

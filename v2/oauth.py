@@ -274,15 +274,14 @@ def poll_pending(*, notify: bool = True, force: bool = False) -> list[dict]:
         # nhắn bot nên nhắn lại cho họ là đúng. Đường admin dán tay thì không:
         # DM bất ngờ cho người không hỏi gì là chuyện khác.
         print(f"[enroll] ✓ {name} đã cấp quyền")
-        if union_id:
-            if notify:
-                try:
-                    lark_api.im_send_text(
-                        union_id,
-                        f"Xong rồi {name}! Giờ bạn hỏi về biên bản họp được.",
-                        id_type="union_id",
-                    )
-                except lark_api.LarkError as exc:
-                    print(f"[enroll] không nhắn được cho {name}: {exc}")
+        if union_id and notify:
+            # Chào + liệt kê cuộc họp 7 ngày + tạo backlog (priority 0). Đặt
+            # trong orchestrator để dùng enqueue/meetings/jobstore; import cục
+            # bộ tránh vòng import. Chào/backlog hỏng KHÔNG làm hỏng enroll.
+            try:
+                from . import orchestrator
+                orchestrator.welcome_and_backlog(info)
+            except Exception as exc:          # noqa: BLE001
+                print(f"[enroll] chào/backlog hỏng cho {name}: {exc}")
         done.append(info)
     return done

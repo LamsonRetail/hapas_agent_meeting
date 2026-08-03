@@ -22,7 +22,10 @@ from . import db
 from .models import Attendee, MeetingMeta
 
 # Trạng thái được coi là "đã xong / không cần xử lý lại" khi quét.
-TERMINAL = {"delivered", "owner_only", "expired", "discarded"}
+# `held`: đã phiên âm whisper xong nhưng CỐ Ý không gửi — giữ chờ người dự tự
+# hỏi (kéo). Terminal với vòng quét (scan không tạo lại), nhưng transcript vẫn
+# phục vụ được qua `sendfile` bất kể status.
+TERMINAL = {"delivered", "owner_only", "expired", "discarded", "held"}
 
 
 def _now_ms() -> int:
@@ -60,20 +63,36 @@ def meta_from_json(s: str) -> MeetingMeta:
     return m
 
 
-def create(meta: MeetingMeta, status: str = "queued") -> None:
-    """Ghi job mới (hoặc bỏ qua nếu đã có)."""
+def create(meta: MeetingMeta, status: str = "queued",
+           priority: int = 1) -> None:
+    """Ghi job mới (hoặc bỏ qua nếu đã có).
+
+    priority: 2=cực cao (có người hỏi), 1=thường (cuộc mới), 0=backlog.
+    `process_queue` xử lý priority cao trước, và chỉ priority=2 mới tự gửi.
+    """
     now = _now_ms()
     with db.tx() as c:
         c.execute(
             """INSERT OR IGNORE INTO jobs
                (minute_token, title, start_ts, owner_open_id, invitee_count,
-                meta_json, status, detected_at, queued_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                meta_json, status, priority, detected_at, queued_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (meta.minute_token, meta.title,
              int(meta.start * 1000) if meta.start else None,
              meta.owner_open_id, meta.invitee_count, _meta_to_json(meta),
-             status, now, now),
+             status, priority, now, now),
         )
+
+
+def set_priority(minute_token: str, priority: int) -> None:
+    """Đổi mức ưu tiên (vd nâng lên 2 khi có người hỏi transcript).
+
+    KHÔNG hạ priority đang cao hơn: một cuộc đã lên cực cao vì người A hỏi thì
+    người B hỏi lại không được kéo nó xuống. Chỉ nâng lên.
+    """
+    with db.tx() as c:
+        c.execute("UPDATE jobs SET priority=MAX(COALESCE(priority,1), ?) "
+                  "WHERE minute_token=?", (priority, minute_token))
 
 
 def set_status(minute_token: str, status: str, *, error: str | None = None,
@@ -175,6 +194,19 @@ def by_status(*statuses: str) -> list[dict]:
     rows = db.conn().execute(
         f"SELECT * FROM jobs WHERE status IN ({q}) ORDER BY detected_at",
         statuses).fetchall()
+    return [dict(r) for r in rows]
+
+
+def active_by_priority() -> list[dict]:
+    """Job đang chờ xử lý, ƯU TIÊN CAO TRƯỚC (cùng hạng thì cũ trước — FIFO).
+
+    Dùng cho `process_queue`: cực cao (2, có người hỏi) chen đầu, rồi cuộc mới
+    (1), rồi backlog (0). Thay cho `by_status(...)` cũ vốn chỉ theo detected_at.
+    """
+    rows = db.conn().execute(
+        "SELECT * FROM jobs "
+        "WHERE status IN ('queued','transcribing','recapping') "
+        "ORDER BY COALESCE(priority,1) DESC, detected_at ASC").fetchall()
     return [dict(r) for r in rows]
 
 

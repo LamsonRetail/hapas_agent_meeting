@@ -277,13 +277,16 @@ def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Path]:
     return t, tpath
 
 
-# ------------------------------------------------------------ transcript .txt
+# ---------------------------------------------------------- transcript .docx
 
 
-def txt_path(meta: MeetingMeta) -> Path:
-    """Đường dẫn file .txt của một cuộc họp — TÍNH được, không phải đi tìm.
+def doc_path(meta: MeetingMeta) -> Path:
+    """Đường dẫn file biên bản của một cuộc họp — TÍNH được, không phải đi tìm.
 
-    Tách khỏi `write_txt` để chỗ khác (bitable.py, khi đính kèm file vào Base)
+    Đuôi đổi `.txt` -> `.docx` ngày 03/08/2026 (user chốt, V2_MAINTENANCE §35).
+    File cũ vẫn còn trên đĩa: xem `legacy_txt_path`.
+
+    Tách khỏi `write_doc` để chỗ khác (bitable.py, khi đính kèm file vào Base)
     dựng lại đúng đường dẫn thay vì glob mò theo tên.
 
     ⚠️ Tên file PHẢI phân biệt được hai cuộc họp khác nhau, và lý do nghiêm
@@ -311,30 +314,47 @@ def txt_path(meta: MeetingMeta) -> Path:
     else:
         # Không có giờ -> token là thứ DUY NHẤT còn phân biệt được hai cuộc họp.
         stamp = f" {meta.minute_token[:12]}"
-    return config.TRANSCRIPT_DIR / f"Bien ban - {_safe_name(meta.title)}{stamp}.txt"
+    return config.TRANSCRIPT_DIR / f"Bien ban - {_safe_name(meta.title)}{stamp}.docx"
 
 
-def write_txt(t: Transcript, meta: MeetingMeta) -> Path:
-    """Xuất transcript .txt (đường dẫn tương đối để gửi IM được)."""
-    dest = txt_path(meta)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(t.text, encoding="utf-8")
-    return dest
+def legacy_txt_path(meta: MeetingMeta) -> Path:
+    """Đường dẫn .txt của các cuộc họp phát TRƯỚC 03/08/2026.
+
+    `txt_path` đổi đuôi .txt -> .docx hôm đó. Các file cũ vẫn nằm trên đĩa và
+    `bitable._tracking_fields` vẫn cần thấy chúng: mất dấu là những record cũ
+    khi được ghi lại (sync_tracking / retry_missing_records) sẽ tụt xuống đính
+    kèm bản .json — người mở ô file trên Base nhận một cục JSON thay vì biên bản.
+    """
+    return doc_path(meta).with_suffix(".txt")
+
+
+def write_doc(t: Transcript, meta: MeetingMeta) -> Path:
+    """Xuất transcript ra .docx (user chốt 03/08/2026, V2_MAINTENANCE §35)."""
+    from . import docxfile
+    return docxfile.write_docx(t, meta, doc_path(meta))
 
 
 # --------------------------------------------------------------- phát
 
 
-def _upload_txt(txt: Path) -> tuple[str | None, str]:
-    """(file_key, lý do KHÔNG có file). Đúng một trong hai giá trị có nghĩa."""
+def _upload_doc(txt: Path, t: Transcript | None = None) -> tuple[str | None, str]:
+    """(file_key, lý do KHÔNG có file). Đúng một trong hai giá trị có nghĩa.
+
+    ⚠️ Từ 03/08/2026 phải kiểm CẢ transcript, không chỉ cỡ file. Bản .txt rỗng
+    là 0 byte nên `st_size` bắt được; bản .docx của một transcript rỗng vẫn
+    ~1 KB (tiêu đề + dòng cảnh báo + cấu trúc ZIP). Bỏ phép kiểm này là gửi cho
+    người dự một file mở ra không có chữ nào, và mọi chỗ đọc trạng thái đều
+    báo `ok=1` — đúng lỗi §31.3 quay lại bằng cửa khác.
+    """
+    if t is not None and not (t.text or "").strip():
+        return None, "transcript rỗng — không có gì để gửi"
     if txt.stat().st_size == 0:
         # Lark từ chối file 0 byte (234010) — đừng gọi API để nhận đúng câu đó.
         # Với job mới thì `EmptyTranscript` đã chặn từ trước; nhánh này là cho
         # job CŨ đang được phát lại từ một transcript rỗng đã lưu.
         return None, "transcript rỗng (0 byte) — không có gì để gửi"
     try:
-        ftype = {".mp4": "mp4", ".pdf": "pdf", ".opus": "opus"}.get(
-            txt.suffix.lower(), "stream")
+        ftype = lark_api.FILE_TYPES.get(txt.suffix.lower(), "stream")
         return lark_api.im_upload_file(txt, ftype), ""
     except lark_api.LarkError as exc:
         return None, f"upload transcript hỏng: {exc}"
@@ -354,9 +374,9 @@ def deliver_file(meta: MeetingMeta, t: Transcript,
     để gửi thì thử lại bao nhiêu lần cũng vậy, mà ghi thêm dòng `ok=0` mỗi vòng
     chỉ làm bảng `deliveries` nói dối là đã cố.
     """
-    txt = write_txt(t, meta)
+    txt = write_doc(t, meta)
     token = meta.minute_token
-    file_key, why = _upload_txt(txt)
+    file_key, why = _upload_doc(txt, t)
     if file_key is None:
         print(f"[deliver] {token} gửi bù file: {why}")
         if txt.stat().st_size > 0:
@@ -392,7 +412,7 @@ def deliver(meta: MeetingMeta, recap: Recap, t: Transcript,
     Không còn cửa duyệt — xem docstring orchestrator.
     """
     card = cards.recap_card(meta, recap)
-    txt = write_txt(t, meta)
+    txt = write_doc(t, meta)
 
     if dry_run:
         print(f"\n{'='*56}\nDRY-RUN — sẽ phát cho {len(recipients)} người\n{'='*56}")
@@ -405,7 +425,7 @@ def deliver(meta: MeetingMeta, recap: Recap, t: Transcript,
 
     # Upload transcript MỘT lần rồi dùng lại file_key cho mọi người: upload lặp
     # theo từng người là n lần tải file lên cho cùng một nội dung.
-    file_key, no_file_why = _upload_txt(txt)
+    file_key, no_file_why = _upload_doc(txt, t)
     if no_file_why:
         print(f"[deliver] {no_file_why}, chỉ gửi tóm tắt")
 

@@ -24,8 +24,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from . import (alerts, backup, config, db, jobstore, lark_api, meetings,
-               pipeline, tokenstore, transcribe)
+from . import (alerts, backup, cards, config, db, jobstore, lark_api, meetings,
+               pipeline, summarize, tokenstore, transcribe)
 from .models import MeetingMeta
 
 
@@ -38,11 +38,16 @@ def _now_ms() -> int:
 # =====================================================================
 
 def enqueue_minute(reader_open_id: str, minute_token: str,
-                   raw_item: dict | None = None) -> bool:
+                   raw_item: dict | None = None, *,
+                   priority: int = 1, notify: bool = True) -> bool:
     """Dựng job cho một minute nếu chưa ai xử lý. True nếu vừa tạo job.
 
     Dùng chung cho cả polling và event. reader_open_id là người mà ta có
     token để đọc minute (thường là người mà minute xuất hiện trong danh sách).
+
+    priority: 1 = cuộc mới (mặc định), 0 = backlog lúc enroll.
+    notify:   gửi thẻ "họp xong" (Minute+tóm tắt) hay không. Backlog thì TẮT —
+              cuộc cũ đã liệt kê trong tin chào, đừng báo "họp xong" lần nữa.
     """
     if not db.try_claim_minute(minute_token):
         return False                     # người/luồng khác đã chiếm
@@ -64,15 +69,125 @@ def enqueue_minute(reader_open_id: str, minute_token: str,
                 meta.owner_open_id = reader_open_id
                 meta.participants_source += " -> fallback:owner"
 
-        jobstore.create(meta, status="queued")
+        jobstore.create(meta, status="queued", priority=priority)
         print(f"[enqueue] {meta.title}  ({minute_token})  "
-              f"{meta.invitee_count} người [{meta.participants_source}]")
+              f"{meta.invitee_count} người [{meta.participants_source}] "
+              f"prio={priority}")
+        # Báo NGAY khi họp xong (mô hình kéo): gửi tóm tắt Minute Lark + lời
+        # mời transcript. Whisper chạy nền -> held, chờ người dự tự hỏi. Không
+        # được làm hỏng enqueue: báo hỏng thì job vẫn còn, vòng sau vẫn dịch.
+        if notify:
+            try:
+                _notify_minute(meta, token)
+            except Exception as exc:          # noqa: BLE001
+                print(f"[notify] {minute_token} báo hỏng (bỏ qua): {exc}")
         return True
     except Exception as exc:             # noqa: BLE001
         # Nhả khóa để vòng sau thử lại; không để job kẹt vì lỗi tạm thời.
         db.release_minute(minute_token)
         print(f"[enqueue] {minute_token} hỏng, nhả khóa: {exc}")
         return False
+
+
+def _notify_minute(meta: MeetingMeta, access_token: str) -> None:
+    """Báo NGAY khi họp xong: tóm tắt Minute Lark + link + lời mời transcript.
+
+    Gửi cho người dự đã enroll (`_recipients`). KÉO: KHÔNG kèm transcript
+    whisper (đang chạy nền -> held, chờ hỏi). Gate theo SEND_MODE — dry-run thì
+    chỉ in. Lấy Minute hỏng thì vẫn gửi, chỉ thiếu phần tóm tắt.
+    """
+    recips, _ = _recipients(meta)
+    if not recips:
+        return
+    try:
+        minute_text = lark_api.minutes_transcript(access_token, meta.minute_token)
+    except Exception as exc:                  # noqa: BLE001 — báo vẫn phải gửi
+        minute_text = ""
+        print(f"[notify] {meta.minute_token} không lấy được Minute Lark "
+              f"(gửi không kèm tóm tắt): {exc}")
+    recap = summarize.recap_from_text(minute_text, meta.title)
+    # Lưu tóm tắt Minute vào job để bước `held` ghi Base dùng lại (khỏi gọi LLM
+    # lần hai). Giữ nguyên status 'queued' — chỉ ghi thêm recap_json.
+    try:
+        import json as _json
+        jobstore.set_status(meta.minute_token, "queued", recap_json=_json.dumps(
+            {"summary": recap.summary, "decisions": recap.decisions,
+             "action_items": [a.__dict__ for a in recap.action_items]},
+            ensure_ascii=False))
+    except Exception as exc:                  # noqa: BLE001 — lưu recap là phụ
+        print(f"[notify] {meta.minute_token} lưu recap_json hỏng (bỏ qua): {exc}")
+    card = cards.minute_notice_card(meta, recap)
+    if not config.SEND_MODE:
+        print(f"[notify] (dry-run) {meta.minute_token} -> báo Minute+tóm tắt "
+              f"cho {len(recips)} người")
+        return
+    ok = 0
+    for rid in recips:
+        try:
+            lark_api.im_send_card(rid, card, id_type="union_id",
+                                  uuid_key=f"notice-{meta.minute_token}-{rid}"[:50])
+            ok += 1
+        except lark_api.LarkError as exc:
+            print(f"[notify] gửi báo cho {rid} hỏng: {exc}")
+    print(f"[notify] {meta.minute_token} -> báo Minute+tóm tắt: "
+          f"{ok}/{len(recips)} người")
+
+
+def welcome_and_backlog(info: dict) -> None:
+    """Sau khi một người enroll: chào + liệt kê cuộc họp 7 ngày của họ + tạo
+    backlog (priority 0) để dịch dần + `note_viewer` để họ pull được.
+
+    KÉO: KHÔNG tự gửi transcript nào. Người mới nhắn 'gửi transcript [tên]' thì
+    `sendfile` nâng cực cao + tự gửi. Gọi từ `oauth.poll_pending` (đường tự phục
+    vụ — người vừa nhắn bot, nhắn lại cho họ là đúng). KHÔNG được ném: enroll đã
+    xong rồi, một phép quét hỏng không được làm hỏng việc đó.
+    """
+    union_id = info.get("union_id", "")
+    open_id = info.get("open_id", "")
+    name = info.get("name") or open_id or "bạn"
+    if not union_id:
+        return
+    titles: list[str] = []
+    try:
+        token = tokenstore.get_access_token(open_id)
+        end = _now_ms()
+        start = end - config.LOOKBACK_DAYS * 86_400_000
+        items = lark_api.minutes_list(token, start, end, open_id)
+    except Exception as exc:                  # noqa: BLE001 — xem docstring
+        items = []
+        print(f"[welcome] {name}: không quét được minute 7 ngày: {exc}")
+    for it in items:
+        mt = it.get("token") or it.get("minute_token")
+        if not mt:
+            continue
+        db.note_viewer(mt, open_id, union_id, name)   # để họ pull được
+        titles.append(it.get("title") or it.get("topic") or mt)
+        # Tạo backlog nếu chưa có job: priority 0, KHÔNG báo "họp xong".
+        if not (db.is_claimed(mt) or jobstore.get(mt)):
+            try:
+                enqueue_minute(open_id, mt, it, priority=0, notify=False)
+            except Exception as exc:          # noqa: BLE001
+                print(f"[welcome] backlog {mt} hỏng (bỏ qua): {exc}")
+
+    if titles:
+        shown = "\n".join(f"• {t}" for t in titles[:15])
+        more = f"\n…và {len(titles) - 15} cuộc nữa" if len(titles) > 15 else ""
+        body = (f"Xong rồi {name}! Mình thấy bạn có {len(titles)} cuộc họp trong "
+                f"7 ngày qua:\n\n{shown}{more}\n\n"
+                f"Cần bản transcript chuẩn (whisper) cuộc nào thì nhắn: "
+                f"gửi transcript [tên cuộc] — mình ưu tiên dịch và tự gửi ngay. "
+                f"Từ giờ họp xong mình cũng tự gửi Minute + tóm tắt cho bạn.")
+    else:
+        body = (f"Xong rồi {name}! Từ giờ họp xong mình sẽ tự gửi Minute + tóm "
+                f"tắt cho bạn. Cần bản transcript chuẩn (whisper) cuộc nào thì "
+                f"nhắn: gửi transcript [tên cuộc].")
+    if not config.SEND_MODE:
+        print(f"[welcome] (dry-run) chào {name}: {len(titles)} cuộc, backlog đã tạo")
+        return
+    try:
+        lark_api.im_send_text(union_id, body, id_type="union_id")
+    except lark_api.LarkError as exc:
+        print(f"[welcome] không nhắn được cho {name}: {exc}")
 
 
 def scan_once() -> int:
@@ -164,8 +279,17 @@ def process_queue(dry_run: bool | None = None) -> None:
 
 def _process_queue(dry_run: bool | None = None) -> None:
     dry_run = (not config.SEND_MODE) if dry_run is None else dry_run
-    for row in jobstore.by_status("queued", "transcribing", "recapping"):
+    backlog_done = 0
+    for row in jobstore.active_by_priority():
         token = row["minute_token"]
+        priority = int(row["priority"]) if row["priority"] is not None else 1
+        # Backlog (priority 0) chỉ chạy 1 job/vòng: whisper CPU không cắt ngang
+        # được, nhưng đừng ôm cả loạt backlog trong một vòng — để cuộc mới (1) và
+        # cực cao (2), vốn đã đứng trước nhờ active_by_priority, luôn chạy trước.
+        if priority <= 0:
+            if backlog_done >= 1:
+                continue
+            backlog_done += 1
         if dry_run:
             # Dry-run KHÔNG được tiêu quota thử lại, và KHÔNG được ghi gì.
             # `process` (không --send) là lệnh CHẨN ĐOÁN — người ta chạy nó vài
@@ -257,20 +381,26 @@ def _process_queue(dry_run: bool | None = None) -> None:
                       f"(thử {attempts}/{config.MAX_ATTEMPTS}): {exc}")
                 continue
 
-        if recap is None:
-            recap = _recap_step(meta, t, attempts, dry_run=dry_run)
-            if recap is None:
-                continue             # hoãn sang vòng sau, KHÔNG phát bản trống
-
-        # Tra lại người dự NGAY TRƯỚC khi phát, không sớm hơn: xem docstring.
-        # Bọc try riêng — tra lại là việc CẢI THIỆN, hỏng thì phát bằng danh
-        # sách cũ chứ không được chặn cả biên bản.
-        try:
-            meta = _maybe_reresolve(meta, dry_run=dry_run)
-        except Exception as exc:     # noqa: BLE001 — xem trên
-            print(f"[reresolve] {token} bỏ qua vì lỗi: {exc}")
-
-        _deliver_now(meta, recap, t, dry_run=dry_run)
+        # ĐÃ CÓ transcript. Rẽ theo priority (mô hình KÉO, 03/08/2026):
+        #   cực cao (2) = có người HỎI  -> gửi transcript cho đúng họ
+        #   thường (1) / backlog (0)    -> GIỮ (held), chờ người dự tự hỏi
+        # Không còn broadcast recap+transcript cho mọi người dự nữa. `recap` từ
+        # `_reuse` (nếu có) bỏ qua: người hỏi transcript thì nhận transcript.
+        _ = recap
+        if priority >= 2:
+            _deliver_requested(meta, t, dry_run=dry_run)
+        elif dry_run:
+            print(f"[queue] (dry-run) {token} -> sẽ GIỮ (held), chờ người hỏi")
+        else:
+            # Viết .docx để đính vào Base; set held; ghi record Base (nguồn bot
+            # Q&A đọc — không có thì 'gửi transcript [tên]' tra không ra cuộc).
+            try:
+                pipeline.write_doc(t, meta)
+            except Exception as exc:      # noqa: BLE001 — đính file là việc phụ
+                print(f"[queue] {token} viết .docx hỏng (bỏ qua): {exc}")
+            jobstore.set_status(token, "held", transcribed_at=_now_ms())
+            _base_record_held(token, meta)
+            print(f"[queue] {token} dịch xong -> held + Base (chờ người dự hỏi)")
 
     if not dry_run:
         # Recap TRƯỚC Base: `_backfill_recaps` sửa recap trong DB, và
@@ -684,6 +814,70 @@ def _deliver_now(meta: MeetingMeta, recap, t, *, dry_run: bool) -> None:
     # làm gãy gì: biên bản đã tới tay người dự rồi.
     from . import bitable
     bitable.write_draft(meta, recap, len(sent))
+
+
+def _base_record_held(token: str, meta: MeetingMeta) -> None:
+    """Ghi record Base cho cuộc đã held/gửi (mô hình kéo, 03/08/2026).
+
+    BẮT BUỘC: Base là nguồn bot Q&A đọc MẶC ĐỊNH (qa.base_records_all). Không ghi
+    thì bot không thấy cuộc họp -> người dùng nhắn 'gửi transcript [tên]' mà bot
+    tra không ra. Trước khi có mô hình kéo, record được ghi trong `_deliver_now`;
+    giờ đường đó bị bỏ nên phải ghi ở ĐÂY.
+
+    Dùng lại tóm tắt Minute đã lưu ở `_notify_minute` (recap_json) — khỏi gọi LLM
+    lần hai. Backlog không có thì để tóm tắt giữ chỗ; transcript vẫn đính, bot vẫn
+    tra được. Ghi Base là việc PHỤ: hỏng thì bỏ qua, không làm chết vòng.
+    """
+    import json as _json
+    from .models import ActionItem, Recap
+    row = jobstore.get(token) or {}
+    recap = None
+    if row.get("recap_json"):
+        try:
+            rj = _json.loads(row["recap_json"])
+            recap = Recap(summary=rj.get("summary", ""),
+                          decisions=rj.get("decisions", []),
+                          action_items=[ActionItem(**a)
+                                        for a in rj.get("action_items", [])])
+        except (ValueError, TypeError, KeyError):
+            recap = None
+    if recap is None:
+        recap = summarize.placeholder("chưa tóm tắt — nhắn bot để lấy transcript")
+    try:
+        from . import bitable
+        bitable.write_draft(meta, recap, 0)
+    except Exception as exc:              # noqa: BLE001 — ghi Base là việc phụ
+        print(f"[base] {token} ghi record (held) hỏng (bỏ qua): {exc}")
+
+
+def _deliver_requested(meta: MeetingMeta, t, *, dry_run: bool) -> None:
+    """CỰC CAO (priority=2): gửi transcript cho những người ĐÃ HỎI, rồi xoá
+    danh sách hỏi. Không broadcast, không thẻ recap — họ hỏi transcript whisper
+    thì nhận đúng transcript.
+
+    Ai gửi hỏng (429/mạng) thì cứ hỏi lại: job thành `delivered`/`held` nên
+    `sendfile` sẽ gửi thẳng từ transcript đã có, không cần vòng `run` nữa.
+    """
+    token = meta.minute_token
+    reqs = [r["requester"] for r in db.transcript_requesters(token)
+            if r["requester"]]
+    if not reqs:
+        # Không còn ai chờ (vd đã gửi vòng trước) -> giữ như held.
+        if not dry_run:
+            jobstore.set_status(token, "held", transcribed_at=_now_ms())
+        return
+    if dry_run:
+        print(f"[queue] (dry-run) {token} CỰC CAO -> sẽ gửi transcript cho "
+              f"{len(reqs)} người đã hỏi")
+        jobstore.set_status(token, "queued")      # để chạy lại thật
+        return
+    sent, failed = pipeline.deliver_file(meta, t, reqs)
+    db.clear_transcript_requests(token)           # đã thử hết; hỏng thì hỏi lại
+    jobstore.set_status(token, "delivered" if sent else "held",
+                        delivered_at=_now_ms() if sent else None)
+    _base_record_held(token, meta)                # cuộc này cũng phải lên Base
+    print(f"[queue] {token} CỰC CAO -> gửi transcript: {len(sent)} ok, "
+          f"{len(failed)} hỏng")
 
 
 # =====================================================================

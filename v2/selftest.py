@@ -87,8 +87,9 @@ def _main() -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     import time
     from v2 import (alerts, askers, backup, cards, config, db, gate, jobstore,
-                    lark_api, meetings, oauth, oauth_callback, orchestrator,
-                    pipeline, qa, summarize, tasks, tokenstore, transcribe)
+                    lark_api, mcp_server, meetings, oauth, oauth_callback,
+                    orchestrator, pipeline, qa, summarize, tasks, tokenstore,
+                    transcribe)
     from v2.models import Attendee, MeetingMeta, Recap, Segment, Transcript
 
     config.ensure_dirs()
@@ -197,15 +198,15 @@ def _main() -> int:
         pipeline.jobstore = keep
 
     # =================================================================
-    part("2. txt_path — hai cuộc họp KHÔNG được dùng chung một file")
+    part("2. doc_path — hai cuộc họp KHÔNG được dùng chung một file")
     # =================================================================
     # `bitable._tracking_fields` dựng lại đúng đường dẫn này để đính kèm vào
     # Base. Đụng tên = record của cuộc A nhận transcript của cuộc B.
-    a = pipeline.txt_path(meta(title="Hop tuan", start=None, minute_token="obsgAAA"))
-    b = pipeline.txt_path(meta(title="Hop tuan", start=None, minute_token="obsgBBB"))
+    a = pipeline.doc_path(meta(title="Hop tuan", start=None, minute_token="obsgAAA"))
+    b = pipeline.doc_path(meta(title="Hop tuan", start=None, minute_token="obsgBBB"))
     check("không có giờ họp: hai cuộc trùng tên vẫn ra hai file", a != b,
           f"cả hai đều là {a.name}")
-    c1 = pipeline.txt_path(meta(title="H", start=1785000000.0, minute_token="obsgAAA"))
+    c1 = pipeline.doc_path(meta(title="H", start=1785000000.0, minute_token="obsgAAA"))
     check("có giờ họp: tên file giữ nguyên định dạng cũ (không phá file đã có)",
           "obsgAAA" not in c1.name)
 
@@ -1315,11 +1316,11 @@ def _main() -> int:
 
     # File 0 byte: đừng gọi Lark để nhận đúng câu 234010, và PHẢI để lại dấu
     # vết. `deliveries` là thứ duy nhất trả lời được "ai đã nhận gì".
-    keep30b = (pipeline.write_txt, lark_api.im_upload_file, lark_api.im_send_card)
+    keep30b = (pipeline.write_doc, lark_api.im_upload_file, lark_api.im_send_card)
     empty_txt = config.TRANSCRIPT_DIR / "rong.txt"
     empty_txt.write_text("", encoding="utf-8")
     called = []
-    pipeline.write_txt = lambda t, m: empty_txt
+    pipeline.write_doc = lambda t, m: empty_txt
     lark_api.im_upload_file = lambda *a, **k: called.append("upload")
     lark_api.im_send_card = lambda *a, **k: None
     wipe_jobs()
@@ -1339,7 +1340,7 @@ def _main() -> int:
     check("dòng đó nói RÕ vì sao",
           "rỗng" in (kinds30.get("full", {})["error"] or "")
           if "full" in kinds30 else False)
-    pipeline.write_txt, lark_api.im_upload_file, lark_api.im_send_card = keep30b
+    pipeline.write_doc, lark_api.im_upload_file, lark_api.im_send_card = keep30b
 
     # =================================================================
     part("33. Một người token chập không được làm mù cả vòng quét")
@@ -1498,8 +1499,8 @@ def _main() -> int:
     # thử lại một thứ không tồn tại chỉ làm `deliveries` nói dối là đã cố.
     # Từ đây chạy hàm THẬT (bỏ stub), nên phải chặn ở tầng lark_api bên dưới.
     pipeline.deliver_file = keep32[1]
-    keep32c = (pipeline.write_txt, lark_api.im_upload_file)
-    pipeline.write_txt = lambda t, m: empty_txt
+    keep32c = (pipeline.write_doc, lark_api.im_upload_file)
+    pipeline.write_doc = lambda t, m: empty_txt
     up32: list = []
     lark_api.im_upload_file = lambda *a, **k: up32.append("upload")
     with db.tx() as c:
@@ -1512,7 +1513,7 @@ def _main() -> int:
     check("transcript rỗng -> không gọi upload", not up32)
     check("transcript rỗng -> KHÔNG ghi thêm lần thử nào", n32 == 0, str(n32))
     check("transcript rỗng -> không báo là đã gửi", s32 == [])
-    pipeline.write_txt, lark_api.im_upload_file = keep32c
+    pipeline.write_doc, lark_api.im_upload_file = keep32c
 
     pipeline.deliver, pipeline.deliver_file = keep32
     with db.tx() as c:
@@ -1604,6 +1605,447 @@ def _main() -> int:
     check("khởi động đẩy status xong thì ĐẶT LẠI mốc, không để 0.0",
           "last_push = time.monotonic()" in _src35,
           "vòng đầu sẽ đẩy lần thứ hai ngay sau cú lúc khởi động")
+
+    # =================================================================
+    part("36. `get_transcript` — nguyên văn whisper, cùng luật phân quyền")
+    # =================================================================
+    # Tool này phơi thứ THÔ nhất trong hệ thống: lời nói chưa qua recap. Nếu bộ
+    # lọc ở đây lỏng hơn `get_meeting` một chút thì cả §20 thành vô nghĩa — ai
+    # cũng đọc được nguyên văn cuộc họp người khác, mà còn chi tiết hơn biên bản.
+    # Nên phép kiểm chính không phải "có trả nội dung không" mà là "người KHÔNG
+    # dự có bị chặn không", và chặn bằng ĐÚNG `_may_see`, không phải luật thứ hai.
+    import json as _tjson
+    wipe_jobs()
+    _tdir = Path(config.TRANSCRIPT_DIR)
+    _tdir.mkdir(parents=True, exist_ok=True)
+
+    def _mk_transcript(tok, segs) -> str:
+        p = _tdir / f"{tok}.json"
+        p.write_text(_tjson.dumps({
+            "minute_token": tok, "lang": "vi", "duration": 120.0,
+            "engine": "test/fake", "created_at": 0.0,
+            "segments": [{"start": st, "end": st + 5, "text": tx}
+                         for st, tx in segs]}, ensure_ascii=False),
+            encoding="utf-8")
+        return str(p)
+
+    for _tok, _att, _owner in (
+            ("mtTA", [Attendee(open_id="ou_A", union_id="on_A")], "ou_A"),
+            ("mtTB", [Attendee(open_id="ou_B", union_id="on_B")], "ou_B"),
+            ("mtTEMPTY", [Attendee(open_id="ou_A", union_id="on_A")], "ou_A"),
+            ("mtTNONE", [Attendee(open_id="ou_A", union_id="on_A")], "ou_A")):
+        jobstore.create(meta(minute_token=_tok, title="Hop " + _tok,
+                             owner_open_id=_owner, attendees=_att),
+                        status="delivered")
+    jobstore.set_status("mtTA", "delivered", transcript_path=_mk_transcript(
+        "mtTA", [(0.0, "cau mot cua A"), (65.0, "cau hai cua A")]))
+    jobstore.set_status("mtTB", "delivered", transcript_path=_mk_transcript(
+        "mtTB", [(0.0, "BI MAT cua B")]))
+    jobstore.set_status("mtTEMPTY", "delivered", transcript_path=_mk_transcript(
+        "mtTEMPTY", [(0.0, "   ")]))
+    # mtTNONE: cố ý KHÔNG có transcript_path (job mới, chưa phiên âm xong)
+
+    _outA = qa.get_transcript(wA, "mtTA")
+    check("người CÓ dự đọc được nguyên văn",
+          "cau mot cua A" in _outA and "cau hai cua A" in _outA)
+    check("có mốc thời gian mm:ss để lần lại chỗ nói",
+          "[00:00]" in _outA and "[01:05]" in _outA, _outA[:200])
+    _outAB = qa.get_transcript(wA, "mtTB")
+    check("người KHÔNG dự bị chặn, và KHÔNG lộ một chữ nào của nguyên văn",
+          "BI MAT" not in _outAB and "không có trong danh sách người dự" in _outAB,
+          _outAB[:200])
+    check("who=None -> get_transcript từ chối",
+          qa.get_transcript(None, "mtTA") == qa.NO_ASKER)
+    check("admin đọc được cuộc mình không dự (đúng như các tool khác)",
+          "BI MAT" in qa.get_transcript(wAd, "mtTB"))
+    check("transcript RỖNG nói rõ là rỗng, không nói 'không có cuộc họp'",
+          "KHÔNG có chữ nào" in qa.get_transcript(wA, "mtTEMPTY"))
+    check("job chưa phiên âm xong -> nói tình trạng, KHÔNG bịa nội dung",
+          "CHƯA có nguyên văn" in qa.get_transcript(wA, "mtTNONE"))
+    check("không khớp cuộc nào -> chỉ đường lấy minute_token",
+          "Không tìm thấy" in qa.get_transcript(wA, "khongcogi"))
+
+    # Cắt phần: một transcript dài phải ra nhiều phần, và phần CUỐI không được
+    # mời gọi đọc tiếp — agent tin lời đó rồi gọi part=n+1 là một vòng vô ích.
+    jobstore.create(meta(minute_token="mtTLONG", title="Hop dai",
+                         owner_open_id="ou_A",
+                         attendees=[Attendee(open_id="ou_A", union_id="on_A")]),
+                    status="delivered")
+    jobstore.set_status("mtTLONG", "delivered", transcript_path=_mk_transcript(
+        "mtTLONG", [(float(i * 10), f"doan {i} " + "x" * 400) for i in range(40)]))
+    _p1 = qa.get_transcript(wA, "mtTLONG", part=1)
+    check("transcript dài bị cắt thành nhiều phần, mỗi phần vừa ngân sách",
+          "Phần 1/" in _p1 and "1/1" not in _p1
+          and len(_p1) < qa.TRANSCRIPT_PART_CHARS * 1.5, f"len={len(_p1)}")
+    check("phần chưa cuối MỜI đọc tiếp và nói rõ part kế",
+          "part=2" in _p1)
+    _n = int(_p1.split("Phần 1/")[1].split()[0].split("\n")[0])
+    _plast = qa.get_transcript(wA, "mtTLONG", part=_n)
+    check("phần CUỐI không mời đọc tiếp",
+          "còn phần" not in _plast and "CHƯA hết" not in _plast)
+    check("hai phần liền nhau KHÔNG trùng nội dung",
+          qa.get_transcript(wA, "mtTLONG", part=2).count("doan 0 ") == 0)
+    check("part ngoài tầm -> nói số phần thật, không trả rỗng",
+          f"chỉ có {_n} phần" in qa.get_transcript(wA, "mtTLONG", part=_n + 9))
+
+    # Tool mới phải nằm trong danh sách MCP, và phải đòi vé y như các tool khác.
+    # Quên `asker_token` ở `required` là mở toang: `_who()` trả None, mà một
+    # nhánh `who=None` nào đó lỏng là rò nguyên văn cho bất kỳ ai nhắn bot.
+    _tnames = {t["name"] for t in mcp_server.public_tools()}
+    check("get_transcript có trong tools/list", "get_transcript" in _tnames)
+    check("mọi tool MCP đều BẮT BUỘC asker_token",
+          all("asker_token" in (t["inputSchema"]["required"] or [])
+              for t in mcp_server.public_tools()),
+          str(sorted(_tnames)))
+    check("public_tools không để lọt `_fn` ra ngoài dây",
+          all(not any(k.startswith("_") for k in t)
+              for t in mcp_server.public_tools()))
+
+    # =================================================================
+    part("37. Biên bản .docx — file tự viết, không có thư viện nào đỡ")
+    # =================================================================
+    # `docxfile.py` dựng OOXML bằng tay để không thêm dependency (xem docstring
+    # của nó). Cái giá: không có thư viện nào báo lỗi giúp — một ký tự sai là
+    # Word/Lark nói "file bị lỗi" và người dự nhận một file không mở được, còn
+    # `deliveries` thì vẫn ghi `ok=1`. Nên phải kiểm tận cấu trúc ZIP + XML.
+    import zipfile as _zf
+    from xml.etree import ElementTree as _ET
+    from v2 import docxfile as _dx
+
+    _dmeta = meta(minute_token="obsgDOCX0000000000001",
+                  title='Hop <A&B> "quy 3"', start=1785000000.0,
+                  app_link="https://x/minutes/obsgDOCX0000000000001")
+    _dt = Transcript(
+        minute_token="obsgDOCX0000000000001", lang="vi", duration=125.0,
+        engine="test/fake",
+        segments=[Segment(start=0.0, end=5.0, text="cau mot & <the>"),
+                  Segment(start=65.0, end=70.0, text="cau hai\x07co ky tu dieu khien"),
+                  Segment(start=90.0, end=95.0, text="   ")])
+    _dpath = _dx.write_docx(_dt, _dmeta, Path(config.TRANSCRIPT_DIR) / "t.docx")
+    with _zf.ZipFile(_dpath) as _z:
+        _names = set(_z.namelist())
+        _zbad = _z.testzip()
+        _docxml = _z.read("word/document.xml").decode("utf-8")
+    check("có đủ 3 phần bắt buộc của một .docx",
+          _names == {"[Content_Types].xml", "_rels/.rels", "word/document.xml"},
+          str(sorted(_names)))
+    check("ZIP không hỏng", _zbad is None, str(_zbad))
+    try:
+        _ET.fromstring(_docxml)
+        _xmlok = True
+    except _ET.ParseError as _pe:
+        _xmlok = False
+        print("     ", _pe)
+    check("word/document.xml là XML hợp lệ", _xmlok)
+    check("`&` và `<` trong TIÊU ĐỀ được escape, không phá XML",
+          "&amp;" in _docxml and "&lt;A&amp;B&gt;" in _docxml)
+    check("ký tự điều khiển bị loại (Word từ chối mở nếu lọt vào)",
+          "\x07" not in _docxml and "cau haico ky tu dieu khien" in _docxml)
+    check("đoạn rỗng bị bỏ, không đẻ ra dòng trắng", "[01:30]" not in _docxml)
+    check("mốc thời gian đúng mm:ss", "[00:00]" in _docxml and "[01:05]" in _docxml)
+    check("có câu cảnh báo 'bản do máy' NGAY TRONG FILE",
+          "Whisper" in _docxml and "nghe nhầm" in _docxml,
+          "file rời khỏi chat rất nhanh — cảnh báo chỉ ở tin nhắn là mất")
+    check("có link bản ghi gốc để đối chiếu", "minutes/obsgDOCX" in _docxml)
+    check("`w:sz` là NỬA point — 32 = 16pt, không phải 32pt",
+          'w:sz w:val="32"' in _docxml)
+    check("ghi xong không để lại file .part",
+          not list(Path(config.TRANSCRIPT_DIR).glob("*.part")))
+
+    # Đuôi file đổi .txt -> .docx. Hai chỗ bám vào tên file: `_upload_doc` chọn
+    # `file_type` (sai thì Lark hiện tệp nhị phân thay vì xem trước được), và
+    # `bitable` tìm file cũ của các cuộc họp trước 03/08.
+    _lp = pipeline.legacy_txt_path(_dmeta)
+    check("doc_path ra .docx", pipeline.doc_path(_dmeta).suffix == ".docx")
+    check("legacy_txt_path ra .txt, CÙNG tên, chỉ khác đuôi",
+          _lp.suffix == ".txt" and _lp.stem == pipeline.doc_path(_dmeta).stem)
+    check(".docx -> file_type 'doc' (để Lark xem trước được trong chat)",
+          lark_api.FILE_TYPES.get(".docx") == "doc")
+
+    # Guard rỗng: .txt rỗng là 0 byte nên `st_size` bắt được; .docx của một
+    # transcript rỗng vẫn ~1 KB. Mất phép kiểm này là §31.3 quay lại bằng cửa
+    # khác — file gửi đi mở ra không có chữ nào, `deliveries` vẫn `ok=1`.
+    _empty_doc = _dx.write_docx(
+        Transcript(minute_token="x", lang="vi", duration=60.0, engine="e",
+                   segments=[Segment(start=0.0, end=1.0, text="  ")]),
+        _dmeta, Path(config.TRANSCRIPT_DIR) / "rong.docx")
+    check(".docx của transcript RỖNG vẫn > 0 byte (nên st_size KHÔNG cứu được)",
+          _empty_doc.stat().st_size > 0, str(_empty_doc.stat().st_size))
+    _keep37 = lark_api.im_upload_file
+    _up37: list = []
+    lark_api.im_upload_file = lambda *a, **k: _up37.append("upload")
+    _fk37, _why37 = pipeline._upload_doc(
+        _empty_doc, Transcript(minute_token="x", lang="vi", duration=60.0,
+                               engine="e", segments=[]))
+    check("transcript rỗng -> KHÔNG upload dù file to hơn 0 byte",
+          not _up37 and _fk37 is None and "rỗng" in _why37, f"{_up37} {_why37}")
+    lark_api.im_upload_file = _keep37
+
+    # Base: cuộc họp CŨ chỉ có .txt trên đĩa. Phải tìm ra nó, đừng tụt xuống
+    # đính kèm bản .json — người mở ô file trên Base sẽ nhận một cục JSON.
+    _oldmeta = meta(minute_token="obsgOLD00000000000001", title="Hop cu",
+                    start=1785000000.0)
+    pipeline.legacy_txt_path(_oldmeta).write_text("bien ban cu", encoding="utf-8")
+    jobstore.create(_oldmeta, status="delivered")
+    _keep37b = (lark_api.base_media_upload, lark_api.contact_batch)
+    _got37: list = []
+    lark_api.base_media_upload = lambda p, *a, **k: (_got37.append(Path(p)), "ft")[1]
+    lark_api.contact_batch = lambda ids: {}
+    _bt._tracking_fields(_oldmeta)
+    check("cuộc họp cũ: Base vẫn đính đúng bản .txt, không tụt xuống .json",
+          len(_got37) == 1 and _got37[0].suffix == ".txt", str(_got37))
+    lark_api.base_media_upload, lark_api.contact_batch = _keep37b
+
+    # =================================================================
+    part("38. `send_transcript_file` — đường GHI thứ hai, gửi tin THẬT")
+    # =================================================================
+    # Tool này gửi tin nhắn Lark. Một lỗ ở đây không phải "trả lời sai" mà là
+    # "file biên bản bay tới người không được xem", và không lùi lại được.
+    # Nên phép kiểm nặng nhất là: sai điều kiện thì KHÔNG có lời gọi API nào.
+    from v2 import sendfile as _sf
+    wipe_jobs()
+    with db.tx() as c:
+        c.execute("DELETE FROM deliveries")
+    for _tok, _att, _owner in (
+            ("mtSA", [Attendee(open_id="ou_A", union_id="on_A")], "ou_A"),
+            ("mtSB", [Attendee(open_id="ou_B", union_id="on_B")], "ou_B"),
+            ("mtSEMPTY", [Attendee(open_id="ou_A", union_id="on_A")], "ou_A")):
+        jobstore.create(meta(minute_token=_tok, title="Hop " + _tok,
+                             owner_open_id=_owner, attendees=_att),
+                        status="delivered")
+    jobstore.set_status("mtSA", "delivered", transcript_path=_mk_transcript(
+        "mtSA", [(0.0, "noi dung cua A")]))
+    jobstore.set_status("mtSB", "delivered", transcript_path=_mk_transcript(
+        "mtSB", [(0.0, "BI MAT cua B")]))
+    jobstore.set_status("mtSEMPTY", "delivered", transcript_path=_mk_transcript(
+        "mtSEMPTY", [(0.0, "  ")]))
+
+    _keep38 = (lark_api.im_send_file, lark_api.im_upload_file)
+    _sent38: list = []
+    lark_api.im_upload_file = lambda *a, **k: "FK"
+    lark_api.im_send_file = lambda rid, p, **k: (
+        _sent38.append((rid, Path(p).suffix, k.get("id_type"))), "om_x")[1]
+
+    _r = _sf.send_transcript(wA, "mtSA")
+    check("người CÓ dự: gửi được, và gửi .docx",
+          len(_sent38) == 1 and _sent38[0][1] == ".docx", str(_sent38))
+    check("gửi tới CHÍNH người hỏi, bằng union_id của họ",
+          _sent38 and _sent38[0][0] == "on_A" and _sent38[0][2] == "union_id")
+    check("báo cho agent là ĐÃ gửi, và dặn đừng chép nội dung ra chat",
+          "ĐÃ gửi" in _r and "KHÔNG chép" in _r)
+    check("ghi deliveries kind='ondemand', KHÔNG đội lốt 'full'",
+          [dict(r) for r in db.conn().execute(
+              "SELECT kind, ok FROM deliveries WHERE minute_token='mtSA'")]
+          == [{"kind": "ondemand", "ok": 1}],
+          "dùng lại 'full' là _backfill_deliveries tưởng đã phát rồi")
+
+    _n_before = len(_sent38)
+    _rb = _sf.send_transcript(wA, "mtSB")
+    check("người KHÔNG dự: KHÔNG gọi API lần nào",
+          len(_sent38) == _n_before, str(_sent38))
+    check("và câu từ chối không lộ nội dung",
+          "BI MAT" not in _rb and "không có trong danh sách người dự" in _rb)
+    check("who=None -> từ chối, không gửi",
+          _sf.send_transcript(None, "mtSA") == qa.NO_ASKER
+          and len(_sent38) == _n_before)
+    check("minute_token rỗng -> từ chối",
+          _sf.send_transcript(wA, "") == _sf.NO_MEETING)
+    check("cuộc họp không có thật -> từ chối, không gửi",
+          _sf.send_transcript(wA, "mtKHONGCO") == _sf.NO_MEETING
+          and len(_sent38) == _n_before)
+    check("transcript rỗng -> KHÔNG gửi file mở ra trắng",
+          "KHÔNG có chữ nào" in _sf.send_transcript(wA, "mtSEMPTY")
+          and len(_sent38) == _n_before)
+    # `admin_view()` là cửa sau cho người ngồi trước máy (`v2 ask` không có
+    # --as): nó KHÔNG có union_id/open_id nào. Đừng nhầm với `who("on_ADMIN",…)`
+    # — người đó là admin THẬT trong Lark và phải nhận được file bình thường.
+    check("admin đường terminal (không có id Lark) -> KHÔNG gửi, nói rõ vì sao",
+          "không có định danh Lark" in _sf.send_transcript(
+              askers.admin_view(), "mtSA")
+          and len(_sent38) == _n_before)
+
+    # Chống lặp: agent hiểu nhầm hoặc gặp lỗi là nó gọi lại. Không có cửa này
+    # thì một vòng lặp của agent = hai chục file rơi vào chat người dùng.
+    _r2 = _sf.send_transcript(wA, "mtSA")
+    check("gọi lại ngay -> KHÔNG gửi lần hai",
+          len(_sent38) == 1 and "KHÔNG gọi lại tool này" in _r2, str(_sent38))
+    with db.tx() as c:
+        c.execute("UPDATE deliveries SET sent_at=sent_at-? WHERE kind='ondemand'",
+                  ((_sf.RESEND_COOLDOWN_MIN + 1) * 60_000,))
+    _sf.send_transcript(wA, "mtSA")
+    check("qua cửa sổ chống lặp thì gửi lại được (người dùng thật đổi ý)",
+          len(_sent38) == 2, str(_sent38))
+
+    # Lỗi Lark phải nói THẲNG là chưa gửi. Báo "đã gửi" rồi người dùng ngồi chờ
+    # một file không bao giờ tới là kiểu hỏng tệ nhất ở đây.
+    def _boom38(*a, **k):
+        raise lark_api.LarkError(230013, "chua phat hanh", "im_send")
+
+    lark_api.im_send_file = _boom38
+    with db.tx() as c:
+        c.execute("DELETE FROM deliveries")
+    _re = _sf.send_transcript(wA, "mtSA")
+    check("Lark từ chối -> nói CHƯA gửi, không nói đã gửi",
+          "chưa gửi" in _re and "ĐÃ gửi" not in _re, _re[:120])
+    check("và vẫn để lại dấu vết ok=0",
+          db.conn().execute("SELECT ok FROM deliveries WHERE kind='ondemand'"
+                            ).fetchone()["ok"] == 0)
+    lark_api.im_send_file, lark_api.im_upload_file = _keep38
+
+    check("send_transcript_file có trong tools/list",
+          "send_transcript_file" in {t["name"] for t in mcp_server.public_tools()})
+    check("`.docx` -> file_type 'doc' ở MỘT chỗ duy nhất (lark_api.FILE_TYPES)",
+          lark_api.FILE_TYPES.get(".docx") == "doc"
+          and "FILE_TYPES" in _inspect.getsource(lark_api.im_send_file),
+          "bảng này từng nằm hai nơi — thêm đuôi ở một bên là lệch hành vi")
+
+    # =================================================================
+    part("39. Mô hình KÉO — priority, held, hỏi -> cực cao -> tự gửi")
+    # =================================================================
+    # Transcript/Segment/Attendee đã import ở đầu run() (from v2.models ...).
+    from v2 import sendfile
+
+    # (a) active_by_priority: cực cao(2) -> thường(1) -> backlog(0)
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgPRIO0000000000low"), priority=0)
+    jobstore.create(meta(minute_token="obsgPRIO000000000norm"), priority=1)
+    jobstore.create(meta(minute_token="obsgPRIO0000000000urg"), priority=2)
+    order = [r["minute_token"] for r in jobstore.active_by_priority()]
+    check("active_by_priority: 2 -> 1 -> 0",
+          order == ["obsgPRIO0000000000urg", "obsgPRIO000000000norm",
+                    "obsgPRIO0000000000low"], str(order))
+
+    # (b) set_priority chỉ NÂNG, không hạ
+    jobstore.set_priority("obsgPRIO000000000norm", 0)
+    check("set_priority KHÔNG hạ mức đang cao hơn",
+          jobstore.get("obsgPRIO000000000norm")["priority"] == 1)
+    jobstore.set_priority("obsgPRIO000000000norm", 2)
+    check("set_priority nâng lên được",
+          jobstore.get("obsgPRIO000000000norm")["priority"] == 2)
+
+    # (c) transcript_requests: khử trùng (cuộc,người), list, clear
+    db.add_transcript_request("obsgTREQ000000000001", "on_A", "An")
+    db.add_transcript_request("obsgTREQ000000000001", "on_A", "An")   # trùng
+    db.add_transcript_request("obsgTREQ000000000001", "on_B", "Binh")
+    reqs = db.transcript_requesters("obsgTREQ000000000001")
+    check("transcript_requests khử trùng, giữ 2 người",
+          len(reqs) == 2 and {r["requester"] for r in reqs} == {"on_A", "on_B"})
+    db.clear_transcript_requests("obsgTREQ000000000001")
+    check("clear_transcript_requests xoá hết",
+          db.transcript_requesters("obsgTREQ000000000001") == [])
+
+    # Mock run_transcription THÀNH CÔNG (như thật: set recapping + transcript_path)
+    keepP = pipeline.run_transcription
+
+    def _fake_ok(m):
+        p = config.TRANSCRIPT_DIR / f"fake-{m.minute_token}.json"
+        jobstore.set_status(m.minute_token, "recapping",
+                            transcript_path=str(p),
+                            audio_seconds=60.0, whisper_seconds=1.0)
+        return (Transcript(minute_token=m.minute_token, lang="vi",
+                           duration=60.0, engine="fake",
+                           segments=[Segment(0.0, 1.0, "xin chao")]), p)
+    pipeline.run_transcription = _fake_ok
+    # Base là nguồn bot Q&A đọc mặc định — held/cực cao PHẢI ghi record, không
+    # thì "gửi transcript [tên]" tra không ra cuộc. Mock để bắt lời gọi.
+    import v2.bitable as _bit
+    base_calls: list[str] = []
+    keepWD = _bit.write_draft
+    _bit.write_draft = lambda m, r, n: (base_calls.append(m.minute_token),
+                                        "rec")[1]
+
+    # (d) cuộc THƯỜNG (priority 1) dịch xong -> held, KHÔNG broadcast, có Base
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgHELD00000000001"), priority=1)
+    orchestrator.process_queue(dry_run=False)
+    check("cuộc thường dịch xong -> held (không gửi cho ai)",
+          jobstore.get("obsgHELD00000000001")["status"] == "held")
+    check("cuộc held -> CÓ ghi record Base (bot Q&A tra được)",
+          "obsgHELD00000000001" in base_calls)
+
+    # (e) cuộc CỰC CAO (priority 2) + có người hỏi -> gửi transcript cho họ
+    sentbox: list[str] = []
+    keepDF = pipeline.deliver_file
+    pipeline.deliver_file = (lambda m, t, recips:
+                             (sentbox.extend(recips), (list(recips), []))[1])
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgURG000000000001"), priority=2)
+    db.add_transcript_request("obsgURG000000000001", "on_ASK", "Nguoi Hoi")
+    orchestrator.process_queue(dry_run=False)
+    r = jobstore.get("obsgURG000000000001")
+    check("cực cao xong -> gửi transcript cho người đã hỏi",
+          "on_ASK" in sentbox)
+    check("cực cao xong -> status delivered", r["status"] == "delivered")
+    check("cực cao xong -> xoá danh sách hỏi",
+          db.transcript_requesters("obsgURG000000000001") == [])
+    check("cực cao xong -> cũng ghi record Base",
+          "obsgURG000000000001" in base_calls)
+    pipeline.deliver_file = keepDF
+    pipeline.run_transcription = keepP
+    _bit.write_draft = keepWD
+
+    # (f) sendfile: hỏi transcript chưa có -> nâng cực cao + ghi người hỏi
+    add_user("ou_ASK", "on_ASK2", "Nguoi Hoi 2")
+    wipe_jobs()
+    mm_ask = meta(minute_token="obsgASK000000000001", owner_open_id="ou_ASK",
+                  attendees=[Attendee(open_id="ou_ASK", union_id="on_ASK2")])
+    jobstore.create(mm_ask, status="queued", priority=1)
+    db.note_viewer("obsgASK000000000001", "ou_ASK", "on_ASK2", "Nguoi Hoi 2")
+    msg_ask = sendfile.send_transcript(
+        {"union_id": "on_ASK2", "open_id": "ou_ASK", "name": "Nguoi Hoi 2"},
+        "obsgASK000000000001")
+    check("hỏi transcript chưa có -> nâng priority=2",
+          jobstore.get("obsgASK000000000001")["priority"] == 2)
+    check("hỏi transcript chưa có -> ghi người hỏi để tự gửi",
+          any(r["requester"] == "on_ASK2"
+              for r in db.transcript_requesters("obsgASK000000000001")))
+    check("hỏi transcript chưa có -> trả lời 'ưu tiên dịch/tự gửi'",
+          "ưu tiên" in msg_ask.lower() or "tự gửi" in msg_ask.lower())
+
+    # (g) held mà ghi Base HỎNG lần đầu -> `retry_missing_records` PHẢI vá
+    #     (sửa 03/08/2026): trước đó retry chỉ quét 'delivered', bỏ sót held
+    #     vĩnh viễn -> cuộc mất trong list/search Base dù transcript nằm sẵn.
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgHELDRETRY000001"),
+                    status="held", priority=1)   # KHÔNG có bitable_record_id
+    retry_calls: list[str] = []
+    keepEN, keepWD3 = _bit.enabled, _bit.write_draft
+    _bit.enabled = lambda: True                  # selftest tắt Base (env rỗng)
+    _bit.write_draft = lambda m, r, n: (retry_calls.append(m.minute_token),
+                                        "rec")[1]
+    _bit.retry_missing_records()
+    _bit.enabled, _bit.write_draft = keepEN, keepWD3
+    check("held chưa lên Base -> retry_missing_records vá (không bỏ sót held)",
+          "obsgHELDRETRY000001" in retry_calls)
+
+    # (h) held lọt vào pending (ghi record hỏng) -> nói theo góc người dùng
+    #     ('chưa tạo xong biên bản, tạo xong tự gửi'), KHÔNG lộ chữ 'Base' hay
+    #     'held' thô, và KHÔNG nói 'CHƯA CÓ BIÊN BẢN' (sai ngược).
+    check("_TINH_TRANG có 'held' (không rơi về chữ thô cho người dùng)",
+          "held" in qa._TINH_TRANG)
+    _held_row = {"when": "2026-08-03 10:00:00", "title": "Hop dang giu",
+                 "status": "held", "tinh_trang": qa._TINH_TRANG["held"],
+                 "minute_token": "obsgHELDRETRY000001", "link": "", "error": ""}
+    _line = qa.fmt_pending(_held_row)
+    check("held trong pending -> KHÔNG lộ 'Base'/'held' cho người dùng",
+          "Base" not in _line and "held" not in _line, _line)
+    check("held trong pending -> 'chưa tạo xong', không 'CHƯA CÓ BIÊN BẢN'",
+          "CHƯA TẠO XONG BIÊN BẢN" in _line and "CHƯA CÓ BIÊN BẢN" not in _line,
+          _line)
+
+    # (i) delivery_status(held) -> nhãn RIÊNG, KHÔNG nhầm 'chưa ai cấp quyền'
+    #     (sửa 03/08/2026): held có 0 dòng recap-delivery nên nhánh đếm cũ gán
+    #     ST_NO_CONSENT — sai, người dự vẫn được báo Minute+tóm tắt, chỉ giữ bản
+    #     nguyên văn chờ hỏi. Phải xét jobs.status TRƯỚC.
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgHELDSTAT00001"),
+                    status="held", priority=1)
+    check("delivery_status(held) -> ST_HELD, không ST_NO_CONSENT",
+          _bit.delivery_status("obsgHELDSTAT00001") == _bit.ST_HELD)
+    check("ST_HELD nằm trong STATUS_OPTIONS (Base mới nhận được giá trị)",
+          _bit.ST_HELD in _bit.STATUS_OPTIONS)
+    check("ST_HELD KHÔNG lộ 'Base'/'held' thô cho người dùng",
+          "Base" not in _bit.ST_HELD and "held" not in _bit.ST_HELD)
 
     # =================================================================
     part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")

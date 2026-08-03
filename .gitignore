@@ -9,10 +9,14 @@
 # ============================================================
 
 # --- Secret ---------------------------------------------------
-# v1/config.bat DANG BI TRACKED CO Y THUC (commit 985573f, repo private): trong
-# do co OPENAI_API_KEY + SENDER_APP_SECRET dang tran. Ai duoc them vao repo la
-# doc duoc, va no nam trong history vinh vien. Dong duoi KHONG go tracking —
-# no chi giup nguoi clone ve khoi commit ban rieng cua ho.
+# v1/config.bat: DA GO TRACKING 03/08/2026 (`git rm --cached`). Truoc do no bi
+# tracked va nam o HEAD — khong phai chi trong history — nen ai `git clone` la
+# co OPENAI_API_KEY + SENDER_APP_SECRET dang TRAN nam san tren dia. Ban mau
+# `v1/config.bat.example` thay cho no (giong repo `lamson`).
+#
+# ⚠️ Go tracking KHONG xoa khoi HISTORY: commit 985573f van con secret. Cach
+# duy nhat lam no vo hai la XOAY app secret o Console (V2_MAINTENANCE §37) —
+# KHONG rewrite history roi force push, xem §29 ve remote `lamson`.
 v1/config.bat
 v1/users.json
 v2/.env

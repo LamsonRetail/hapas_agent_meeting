@@ -209,3 +209,24 @@ def summarize(transcript: Transcript, meta: MeetingMeta) -> Recap:
     if raw is None:
         return placeholder("chưa đặt LLM_API_KEY trong v2/.env")
     return _parse(raw)
+
+
+def recap_from_text(text: str, title: str) -> Recap:
+    """Tóm tắt một khối text bất kỳ (vd bản Minute của Lark) -> Recap.
+
+    Dùng cho tin báo tự động khi họp xong (mô hình kéo, 03/08/2026): tóm tắt
+    NỘI DUNG MINUTE LARK để gửi kèm NGAY, không chờ whisper.
+
+    KHÁC `summarize`: KHÔNG BAO GIỜ ném. Tin báo phải gửi được cả khi LLM lỗi —
+    hỏng thì trả placeholder, tin vẫn có Minute link + lời mời transcript.
+    """
+    text = (text or "").strip()
+    if not text:
+        return placeholder("bản Minute của Lark chưa có nội dung")
+    try:
+        raw = _call_llm(text, title)
+    except RecapUnavailable as exc:
+        return placeholder(f"LLM tạm thời không tóm tắt được ({exc})")
+    if raw is None:
+        return placeholder("chưa đặt LLM_API_KEY trong v2/.env")
+    return _parse(raw)

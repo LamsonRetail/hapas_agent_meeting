@@ -13,7 +13,7 @@ REM
 REM  Gui THAT: sua dong RUN o cuoi thanh:  python -m v2 run --send
 REM ============================================================
 
-set WHISPER_BAT=E:\whisper\run-server.bat
+set WHISPER_BAT=D:\whisper\run-server.bat
 set HEALTH=http://localhost:8000/health
 
 echo [*] Kiem tra whisper server...

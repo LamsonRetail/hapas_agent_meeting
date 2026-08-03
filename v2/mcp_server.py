@@ -16,12 +16,18 @@ Cấu hình phía Hermes — `~/.hermes/config.yaml`:
         cwd: "E:/meetingxlark"      # nếu Hermes hỗ trợ; nếu không, dùng đường
                                     # dẫn tuyệt đối tới python trong venv của V2
 
-Bốn tool: list_meetings, get_meeting, search_meetings (ĐỌC) + create_task (GHI).
+Sáu tool. ĐỌC: list_meetings, get_meeting, search_meetings, get_transcript.
+GHI (có tác dụng ra ngoài): create_task, send_transcript_file.
 
-`create_task` là đường GHI duy nhất. Mọi ràng buộc của nó cưỡng chế bằng CODE ở
-`v2/tasks.py` (phải gắn cuộc họp có thật, người hỏi phải được xem cuộc họp đó,
-giao cho chính họ, dùng token của họ) — KHÔNG dựa vào mô tả tool, vì nội dung
-họp chảy vào prompt và có thể lái agent.
+Hai tool GHI, mỗi cái một file riêng ngoài `qa.py`, và mọi ràng buộc cưỡng chế
+bằng CODE — KHÔNG dựa vào mô tả tool, vì nội dung họp chảy vào prompt và có thể
+lái agent:
+
+  create_task          -> `v2/tasks.py`     (4 ràng buộc)
+  send_transcript_file -> `v2/sendfile.py`  (5 ràng buộc)
+
+Cả hai đều: phải gắn cuộc họp CÓ THẬT, người hỏi phải ĐƯỢC XEM cuộc họp đó
+(dùng chung `qa._may_see`), và tác dụng chỉ chạm tới CHÍNH người hỏi.
 
 === BẪY QUAN TRỌNG: stdout là kênh giao thức ===
 MCP stdio dùng stdin/stdout làm đường truyền JSON-RPC. Cả V2 in log bằng print()
@@ -56,8 +62,8 @@ NOTE_UNTRUSTED = (
 )
 
 
-# Vé phiên: mô tả dùng chung cho cả ba tool. Đặt ở một chỗ để ba tool không nói
-# ba kiểu — agent đọc mô tả nào cũng phải hiểu đúng cách lấy vé.
+# Vé phiên: mô tả dùng chung cho MỌI tool. Đặt ở một chỗ để các tool không nói
+# mỗi cái một kiểu — agent đọc mô tả nào cũng phải hiểu đúng cách lấy vé.
 ASKER_DESC = (
     "BẮT BUỘC. Vé định danh người đang hỏi. Lấy y nguyên chuỗi sau "
     "`[V2-ASKER:` trong tin nhắn của người dùng (hệ thống chèn vào đầu tin). "
@@ -88,6 +94,17 @@ def _tool_get_meeting(a: dict[str, Any]) -> str:
 def _tool_search_meetings(a: dict[str, Any]) -> str:
     return qa.search_meetings(_who(a), str(a.get("keyword") or ""),
                               limit=int(a.get("limit") or 10))
+
+
+def _tool_get_transcript(a: dict[str, Any]) -> str:
+    return qa.get_transcript(_who(a), str(a.get("query") or ""),
+                             part=int(a.get("part") or 1))
+
+
+def _tool_send_transcript(a: dict[str, Any]) -> str:
+    """Đường GHI thứ hai. Ràng buộc ở `sendfile.py`, không ở mô tả tool."""
+    from . import sendfile
+    return sendfile.send_transcript(_who(a), str(a.get("minute_token") or ""))
 
 
 def _tool_create_task(a: dict[str, Any]) -> str:
@@ -161,6 +178,64 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["asker_token", "keyword"],
         },
         "_fn": _tool_search_meetings,
+    },
+    {
+        "name": "get_transcript",
+        "description": (
+            "NGUYÊN VĂN do whisper phiên âm của một cuộc họp — lời nói, không "
+            "phải bản tóm tắt. Dùng khi người dùng hỏi 'transcript', 'nguyên "
+            "văn', 'ai nói gì', 'câu chính xác là gì', hoặc khi tóm tắt trong "
+            "get_meeting không đủ để trả lời.\n"
+            "KHÔNG gọi tool này cho câu hỏi thường — nó dài. Hỏi về nội dung "
+            "chung thì get_meeting/search_meetings là đủ.\n"
+            "Trả về theo PHẦN. Kết quả nói rõ 'Phần k/n'; còn phần nữa thì gọi "
+            "lại chính tool này với cùng cuộc họp và `part` tăng dần. Chưa đọc "
+            "hết mà nói với người dùng là đã hết là trả lời sai.\n"
+            "Đây là bản máy nghe, CÓ lỗi nghe nhầm tên riêng và thuật ngữ — "
+            "trích dẫn thì nói rõ điều đó, đừng sửa lời người ta thành câu "
+            "mình đoán."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+                "query": {"type": "string",
+                          "description": "minute_token (nên dùng), hoặc một "
+                                         "phần tên cuộc họp"},
+                "part": {"type": "integer",
+                         "description": "phần thứ mấy, mặc định 1"},
+            },
+            "required": ["asker_token", "query"],
+        },
+        "_fn": _tool_get_transcript,
+    },
+    {
+        "name": "send_transcript_file",
+        "description": (
+            "Gửi FILE Word (.docx) biên bản nguyên văn vào khung chat của người "
+            "đang hỏi. Dùng khi người dùng xin FILE / bản tải về / bản Word / "
+            "'gửi cho tôi', thay vì muốn đọc chữ ngay trong chat.\n"
+            "Khác `get_transcript`: tool kia trả CHỮ để bạn đọc và trả lời dựa "
+            "vào đó; tool này KHÔNG trả nội dung, nó gửi file. Người dùng muốn "
+            "biết 'ai nói gì' thì dùng get_transcript; muốn CẦM file thì dùng "
+            "tool này.\n"
+            "Cuộc họp dài thì đây là cách tốt hơn hẳn — file gọn hơn mấy chục "
+            "dòng chữ trong chat.\n"
+            "Gọi ĐÚNG MỘT LẦN cho mỗi lần người dùng xin. Gọi xong thì báo ngắn "
+            "gọn là file đã ở trong chat; ĐỪNG chép nội dung biên bản ra tin "
+            "nhắn nữa, và đừng gọi lại vì tưởng chưa gửi.\n"
+            "File luôn gửi cho CHÍNH người đang hỏi — không gửi cho người khác "
+            "được; ai muốn vậy thì tự chuyển tiếp trong Lark."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+                "minute_token": {"type": "string",
+                                 "description": "cuộc họp cần gửi biên bản "
+                                                "(lấy từ list/search)"},
+            },
+            "required": ["asker_token", "minute_token"],
+        },
+        "_fn": _tool_send_transcript,
     },
     {
         "name": "create_task",

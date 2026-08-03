@@ -17,6 +17,7 @@ CLI orchestrator V2.
     python -m v2 base-init              # tạo Base "nội dung đã chốt" (1 lần)
     python -m v2 base-sync              # đổ lại ô theo dõi + cột Trạng thái
     python -m v2 ask "tuần này chốt gì?"        # hỏi đáp ở terminal
+    python -m v2 transcript <token|tên> [--part N]   # nguyên văn whisper
     python -m v2 mcp                    # MCP server dữ liệu họp (Hermes gọi)
     python -m v2 genkey                 # sinh Fernet key
 
@@ -427,6 +428,41 @@ def cmd_ask(args) -> None:
     print(qa.answer(who, " ".join(args.question)))
 
 
+def cmd_transcript(args) -> None:
+    """In nguyên văn whisper ở terminal — smoke test cho tool `get_transcript`.
+
+    Đi thẳng vào `qa.get_transcript`, KHÔNG qua LLM: cần thấy đúng chuỗi mà agent
+    sẽ nhận, kể cả các nhánh từ chối. `--as` giống `ask` — không có cờ thì xem
+    bằng quyền admin, tức KHÔNG phải cái người dùng thật thấy.
+    """
+    _init()
+    from . import askers, qa
+    if args.as_who:
+        who = askers.find_enrolled(args.as_who)
+        if not who:
+            print(f"Không thấy ai đã enroll có id '{args.as_who}'. "
+                  f"Xem: python -m v2 users", file=sys.stderr)
+            sys.exit(1)
+        print(f"[xem bằng danh tính] {who['name']}"
+              f"{' (là admin, thấy hết)' if who['admin'] else ''}\n")
+    else:
+        who = askers.admin_view("(CLI, quyền admin)")
+        print("[!] Không có --as: đang xem bằng QUYỀN ADMIN, thấy hết mọi cuộc "
+              "họp.\n")
+    if args.send_file:
+        # Gửi THẬT một tin nhắn Lark. Đòi `--as` chứ không cho chạy bằng quyền
+        # admin: `admin_view` không có union_id nên `sendfile` sẽ từ chối, và
+        # người gõ lệnh sẽ tưởng tool hỏng thay vì hiểu là mình gọi sai.
+        from . import sendfile
+        if not args.as_who:
+            print("`--send-file` cần `--as <union_id>` — gửi cho CHÍNH người "
+                  "đó, không gửi cho ai khác được.", file=sys.stderr)
+            sys.exit(1)
+        print(sendfile.send_transcript(who, " ".join(args.query)))
+        return
+    print(qa.get_transcript(who, " ".join(args.query), part=args.part))
+
+
 def cmd_mcp(_) -> None:
     """MCP server phơi dữ liệu họp cho Hermes. Hermes tự spawn lệnh này.
 
@@ -576,6 +612,19 @@ def main() -> None:
     q.add_argument("--show-context", action="store_true",
                    help="in cả dữ liệu Base đưa vào prompt")
     q.set_defaults(fn=cmd_ask)
+
+    tr = sub.add_parser("transcript",
+                        help="in nguyên văn whisper của một cuộc họp")
+    tr.add_argument("query", nargs="+", help="minute_token hoặc một phần tên")
+    tr.add_argument("--as", dest="as_who", default="",
+                    help="xem bằng danh tính một người đã enroll — để kiểm bộ "
+                         "lọc phân quyền")
+    tr.add_argument("--part", type=int, default=1,
+                    help="phần thứ mấy (mặc định 1)")
+    tr.add_argument("--send-file", action="store_true",
+                    help="GỬI THẬT file .docx cho người ở --as (query phải là "
+                         "minute_token), thay vì in ra màn hình")
+    tr.set_defaults(fn=cmd_transcript)
 
     args = ap.parse_args()
     args.fn(args)

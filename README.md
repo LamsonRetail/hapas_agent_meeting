@@ -103,7 +103,8 @@ lark-cli tên `mine`. Không còn phụ thuộc app của anh Thiện.
 | File                    | Vai trò                                                                                                                                                                         |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `setup.bat`             | Cài đặt cho máy mới. Chạy đầu tiên.                                                                                                                                             |
-| `config.bat`            | **Cấu hình riêng** — key, secret, profile. ⚠️ File này đang bị **tracked** trong git (commit `985573f`, repo private) và chứa `OPENAI_API_KEY` + `SENDER_APP_SECRET` dạng trần. |
+| `config.bat`            | **Cấu hình riêng** — key, secret, profile. **Không** có trong repo: chép `config.bat.example` ra rồi điền. Đã gỡ tracking 03/08/2026 (trước đó nó nằm ở HEAD kèm secret trần — xem `.gitignore`). |
+| `config.bat.example`    | Bản mẫu của file trên, không chứa giá trị nào.                                                                                                                                  |
 | `check_config.py`       | Kiểm tra toàn bộ cấu hình, gọi thử OpenAI và Lark thật. Chạy trước khi nghi ngờ code.                                                                                           |
 | `run-meeting-note.bat`  | Khởi động poller. Tự bật Whisper server rồi chờ sẵn sàng.                                                                                                                       |
 | `run-listener.bat`      | Khởi động event listener (chạy song song, tuỳ chọn).                                                                                                                            |
@@ -122,7 +123,12 @@ lark-cli tên `mine`. Không còn phụ thuộc app của anh Thiện.
 
 ## Cấu hình
 
-Tất cả trong `config.bat`:
+Tất cả trong `config.bat` — file này **không** có trong repo. Chép bản mẫu ra
+rồi điền, đừng commit lại:
+
+```bat
+copy v1\config.bat.example v1\config.bat
+```
 
 | Biến                                  | Ý nghĩa                                                |
 | ------------------------------------- | ------------------------------------------------------ |
