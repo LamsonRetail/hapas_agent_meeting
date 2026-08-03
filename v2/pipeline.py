@@ -245,8 +245,12 @@ def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Path]:
         audio = extract_audio(video)
 
     t0 = time.time()
+    # Tên người dự -> initial_prompt của whisper (bias viết đúng chính tả tên).
+    # Dữ liệu chuẩn có sẵn từ resolve_participants, không phải đoán từ audio méo.
+    names = [a.name for a in meta.attendees if (getattr(a, "name", "") or "").strip()]
     t = transcribe.transcribe(audio, meta.minute_token,
-                              meeting_title=meta.title)
+                              meeting_title=meta.title,
+                              attendee_names=names)
     whisper_sec = time.time() - t0
     try:
         audio.unlink()

@@ -87,12 +87,38 @@ def _parse_segments(transcript_text: str, duration: float) -> list[Segment]:
     return segs
 
 
+def _prompt_hint(title: str, attendee_names: list[str] | None) -> str:
+    """Câu gợi ý ngữ cảnh cho whisper: tiêu đề + tên người dự (khử trùng, giữ thứ
+    tự). Văn xuôi tự nhiên vì `initial_prompt` là văn bản dẫn, không phải danh
+    sách. Cắt sớm ~40 tên để cuộc đông người không nuốt hết ngân sách; server còn
+    cắt lần nữa theo token thật.
+    """
+    names: list[str] = []
+    for n in (attendee_names or []):
+        n = (n or "").strip()
+        if n and n not in names:
+            names.append(n)
+    parts: list[str] = []
+    if (title or "").strip():
+        parts.append(f"Cuộc họp: {title.strip()}.")
+    if names:
+        parts.append("Người tham dự: " + ", ".join(names[:40]) + ".")
+    return " ".join(parts)
+
+
 def transcribe(audio_path: Path, minute_token: str,
                lang: str | None = None,
                meeting_title: str = "",
+               attendee_names: list[str] | None = None,
                poll_interval: float = 5.0,
                timeout_sec: float = 6 * 3600) -> Transcript:
-    """Phiên âm một file audio. Đồng bộ, có thể chậm (chờ cả hàng đợi GPU)."""
+    """Phiên âm một file audio. Đồng bộ, có thể chậm (chờ cả hàng đợi GPU).
+
+    `attendee_names`: tên người dự cuộc này. Nhồi vào `initial_prompt` của whisper
+    (qua form `prompt`) để bias viết ĐÚNG chính tả tên — tên là dữ liệu chuẩn có
+    sẵn, không phải đoán. Server gộp với glossary nền + tự cắt theo ngân sách
+    token, nên gửi bao nhiêu tên cũng không tràn (xem `_build_prompt` server).
+    """
     lang = lang if lang is not None else config.TRANSCRIBE_LANG
     base = config.TRANSCRIBE_URL.rstrip("/")
 
@@ -104,6 +130,9 @@ def transcribe(audio_path: Path, minute_token: str,
             data["language"] = lang
         if meeting_title:
             data["meeting_title"] = meeting_title   # server bỏ qua nếu không dùng
+        hint = _prompt_hint(meeting_title, attendee_names)
+        if hint:
+            data["prompt"] = hint
         try:
             r = httpx.post(f"{base}/transcribe", files=files, data=data,
                            timeout=300.0)

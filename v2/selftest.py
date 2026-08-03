@@ -1296,7 +1296,7 @@ def _main() -> int:
     mk_job("obsgEMPTY00000000000001", attempts=0)
     config.TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     pipeline.download_recording = _fake_dl
-    transcribe.transcribe = lambda a, mt, meeting_title="": empty_tr
+    transcribe.transcribe = lambda a, mt, meeting_title="", **kw: empty_tr
     try:
         pipeline.run_transcription(meta(minute_token="obsgEMPTY00000000000001"))
         out30 = "KHÔNG NÉM"
