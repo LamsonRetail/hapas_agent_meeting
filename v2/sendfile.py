@@ -29,6 +29,7 @@ NĂM RÀNG BUỘC, cưỡng chế bằng CODE chứ không bằng prompt:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from . import db, jobstore, lark_api, pipeline, qa
@@ -44,9 +45,129 @@ RESEND_COOLDOWN_MIN = 10
 KIND = "ondemand"
 
 NO_MEETING = (
-    "Không gửi được: cần `minute_token` của một cuộc họp có thật. Gọi "
-    "`list_meetings` hoặc `search_meetings` trước để lấy, rồi gọi lại."
+    "KHÔNG TRA RA cuộc họp nào tên như vậy trong hệ thống. Nói đúng như thế với "
+    "người dùng — ĐỪNG nói 'không xuất được file', 'bản ghi chưa hợp lệ' hay bất "
+    "cứ câu nào nghe như hệ thống hỏng: sự thật chỉ là không tìm thấy cuộc họp. "
+    "Gọi `list_meetings` hoặc `search_meetings` để lấy đúng tên/`minute_token` "
+    "rồi gọi lại."
 )
+
+
+def _no_meeting_with_hints(who: dict[str, Any] | None,
+                           qwords: set[str], limit: int = 5) -> str:
+    """`NO_MEETING` kèm danh sách cuộc GẦN ĐÚNG mà chính người hỏi được xem.
+
+    Vì sao phải kèm dữ liệu chứ không chỉ viết lại câu chữ (bài học 04/08/2026):
+    bản trước đã dặn thẳng trong câu trả lời "ĐỪNG nói 'không xuất được file'"
+    — agent vẫn nói y hệt. Chỉ thị trong output của tool KHÔNG điều khiển được
+    agent một cách đáng tin. Thứ điều khiển được nó là DỮ LIỆU HÀNH ĐỘNG ĐƯỢC:
+    đưa sẵn vài cái tên kèm `minute_token` thì nó gọi lại đúng, thay vì bịa ra
+    một lời giải thích kỹ thuật rồi bỏ cuộc.
+
+    Xếp theo số chữ trùng, và CHỈ nêu cuộc người đó được xem — không lộ cuộc của
+    người khác.
+    """
+    index = qa.viewers_index()
+    scored: list[tuple[int, str, str]] = []
+    for row in jobstore.all_jobs():
+        if not qa._may_see(row["minute_token"], who, index):
+            continue
+        try:
+            title = jobstore.meta_from_json(row["meta_json"]).title
+        except (ValueError, KeyError, TypeError):
+            continue
+        hit = len(qwords & set(_norm(title).split()))
+        if hit:
+            scored.append((hit, title, row["minute_token"]))
+    if not scored:
+        return NO_MEETING
+    scored.sort(key=lambda x: -x[0])
+    lines = [f"- {t} — minute_token: {tok}" for _, t, tok in scored[:limit]]
+    return (NO_MEETING + "\n\nGẦN ĐÚNG NHẤT (gọi lại tool này với một trong các "
+            "`minute_token` dưới đây, ĐỪNG bỏ cuộc):\n" + "\n".join(lines))
+
+
+def _norm(s: str) -> str:
+    """Chuẩn hoá tên cuộc họp để so khớp: thường hoá, bỏ DẤU CÂU, gộp khoảng trắng.
+
+    GIỮ dấu tiếng Việt (`\\w` của Python là unicode) — 'CĐS' và 'CDS' là hai từ
+    khác nhau, gộp chúng lại là mời gọi khớp nhầm. Chỉ bỏ dấu câu, vì đó mới là
+    thứ người ta lược đi khi gõ: tên thật 'CĐS: Flow Backlog' còn người dùng
+    nhắn 'cđs flow backlog' — thiếu đúng một dấu hai chấm là trượt sạch.
+    """
+    return " ".join(re.sub(r"[^\w\s]", " ", (s or ""), flags=re.UNICODE)
+                    .lower().split())
+
+
+def _resolve_token(who: dict[str, Any] | None, query: str) -> tuple[str, str]:
+    """(minute_token, câu báo lỗi) — đúng một trong hai có giá trị.
+
+    Nhận `minute_token` HOẶC tên cuộc họp. Vì sao phải nhận cả tên (sửa
+    04/08/2026, sau một ca thật): agent gọi tool này với TÊN cuộc họp thay vì
+    token là chuyện thường xuyên — nó vừa đọc tên từ câu người dùng. Mô tả tool
+    đã dặn rõ vẫn trượt, nên chặn ở CODE. Trước đó tool trả "cần minute_token",
+    agent diễn giải chệch thành "bản ghi chưa được nhận diện là biên bản có thể
+    xuất file", và người dùng — có toàn quyền với cuộc họp đó — tưởng hệ thống
+    hỏng rồi thôi không hỏi lại. Hay gặp nhất ở tin nhắn ĐẦU TIÊN của hội thoại,
+    khi agent chưa gọi list_meetings nên chưa có token trong tay.
+
+    KHÔNG nới quyền: đây chỉ là bước tên -> token. Người hỏi vẫn phải qua
+    `qa._may_see` ở `send_transcript` như cũ. Danh sách gợi ý khi trùng tên chỉ
+    nêu cuộc mà chính người đó được xem.
+    """
+    query = (query or "").strip()
+    if not query:
+        return "", NO_MEETING
+    if jobstore.get(query):
+        return query, ""                  # đã là token
+    q = _norm(query)
+    if not q:
+        return "", NO_MEETING
+    qwords = set(q.split())
+    exact: list[dict[str, Any]] = []
+    part: list[dict[str, Any]] = []
+    words: list[dict[str, Any]] = []
+    for row in jobstore.all_jobs():
+        try:
+            title = jobstore.meta_from_json(row["meta_json"]).title
+        except (ValueError, KeyError, TypeError):
+            continue
+        t = _norm(title)
+        if t == q:
+            exact.append(row)
+        elif q in t:
+            part.append(row)
+        elif qwords and qwords <= set(t.split()):
+            # Nấc thứ ba: ĐỦ CHỮ, không cần đúng thứ tự (thêm 04/08/2026 sau ca
+            # thật thứ hai). Người dùng gõ 'workforce AI 23-07' trong khi tên là
+            # '07-23 | Workforce AI Weekly Meeting Buổi 3' — đảo ngày/tháng và
+            # thiếu đuôi, khớp-chuỗi-liền trượt sạch. Sau chuẩn hoá thì '07-23'
+            # tách thành hai chữ '07' '23' nên phép so theo TẬP CHỮ bắt được cả
+            # kiểu viết ngày ngược, thứ mà không luật thứ tự nào bắt nổi.
+            words.append(row)
+    cands = exact or part or words
+    if not cands:
+        return "", _no_meeting_with_hints(who, qwords)
+    if len(cands) == 1:
+        return cands[0]["minute_token"], ""
+    # Trùng nhiều cuộc (hệ thống có hai cuộc cùng tên 'test luồng tự động' là
+    # chuyện thật). Thu hẹp theo quyền TRƯỚC khi hỏi lại: người ta thường chỉ
+    # được xem một trong số đó, và như vậy khỏi bắt hỏi lại vô ích.
+    index = qa.viewers_index()
+    vis = [r for r in cands if qa._may_see(r["minute_token"], who, index)]
+    if len(vis) == 1:
+        return vis[0]["minute_token"], ""
+    if not vis:
+        return "", NO_MEETING
+    import time as _t
+    lines = []
+    for r in sorted(vis, key=lambda x: x["start_ts"] or 0, reverse=True):
+        when = (_t.strftime("%d/%m/%Y %H:%M", _t.localtime(r["start_ts"] / 1000))
+                if r["start_ts"] else "?")
+        lines.append(f"- {jobstore.meta_from_json(r['meta_json']).title} "
+                     f"({when}) — minute_token: {r['minute_token']}")
+    return "", (f"Có {len(vis)} cuộc họp trùng tên '{query}'. Hỏi người dùng muốn "
+                f"cuộc nào rồi gọi lại với `minute_token`:\n" + "\n".join(lines))
 
 
 def _recent_send(minute_token: str, recipient: str) -> bool:
@@ -66,11 +187,11 @@ def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
     """Gửi file .docx nguyên văn cho chính `who`. Trả câu báo cho agent."""
     if not who:
         return qa.NO_ASKER
-    minute_token = (minute_token or "").strip()
-    if not minute_token:
-        return NO_MEETING
-
-    # (1) cuộc họp có thật
+    # (1) cuộc họp có thật — nhận cả TÊN, không chỉ `minute_token` (xem
+    # `_resolve_token`). Cửa quyền ở (2) không đổi.
+    minute_token, err = _resolve_token(who, minute_token)
+    if err:
+        return err
     row = jobstore.get(minute_token)
     if not row:
         return NO_MEETING

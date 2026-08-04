@@ -57,16 +57,33 @@ STATUS_OPTIONS = [ST_SENT, ST_NO_RECAP, ST_FAILED, ST_NO_CONSENT, ST_HELD]
 # field trên UI Base = code ghi hỏng. Muốn đổi nhãn thì đổi cả hai chỗ.
 F_TITLE = "Cuộc họp"
 F_WHEN = "Thời gian họp"
-F_STATUS = "Trạng thái"
+F_STATUS = "Tình trạng gửi"
 F_SUMMARY = "Tóm tắt"
 F_DECISIONS = "Quyết định"
 F_ACTIONS = "Việc cần làm"
 F_RECIPIENTS = "Số người nhận"
 F_SOURCE = "Nguồn người nhận"
-F_APPROVER = "Người chốt"
-F_APPROVED_AT = "Chốt lúc"
 F_LINK = "Link Minutes"
 F_TOKEN = "minute_token"
+
+# --- GƯƠNG của bảng `jobs` (03/08/2026, user yêu cầu quản trị trên Base) ------
+#
+# Trước đó Base chỉ có góc nhìn "biên bản đã phát": record CHỈ được tạo cho job
+# `delivered`/`held`, và cột `Trạng thái` nói về việc GỬI. Nhìn vào Base không
+# trả lời được ba câu người vận hành hỏi nhiều nhất — cuộc này đang ở bước nào,
+# hỏng vì cái gì, thử mấy lần rồi. Cuộc hỏng thì còn không có dòng nào trên Base
+# (hai cuộc HAPAS thiếu quyền tải là ví dụ: mất tăm, phải mở SQLite mới thấy).
+#
+# Nay mỗi job trong `jobs` = một record, và các cột dưới đây soi thẳng từ cột
+# cùng tên trong `db.py`. `Tình trạng gửi` (cũ tên `Trạng thái`) vẫn giữ nguyên
+# nghĩa CŨ và vẫn hữu ích — hai câu hỏi khác nhau, để hai cột.
+F_JOB_STATUS = "Tình trạng xử lý"    # jobs.status, dịch sang chữ người đọc được
+F_ERROR = "Lỗi gần nhất"             # jobs.error
+F_ATTEMPTS = "Số lần thử"            # jobs.attempts
+F_INVITEES = "Số người được mời"     # jobs.invitee_count (KHÁC `Số người nhận`)
+F_DETECTED = "Phát hiện lúc"         # jobs.detected_at
+F_TRANSCRIBED = "Dịch xong lúc"      # jobs.transcribed_at
+F_DELIVERED = "Gửi lúc"              # jobs.delivered_at
 
 # Thêm 31/07/2026 theo yêu cầu user: theo dõi cụ thể ai/cái gì/mất bao lâu.
 F_OWNER = "Chủ cuộc họp"          # tên người sở hữu minute (Lark trả owner_id)
@@ -78,6 +95,24 @@ F_AUDIO_SEC = "Audio (giây)"
 F_WHISPER_X = "Tốc độ whisper"    # whisper/audio, vd "0.59x realtime"
 
 TABLE_NAME = "Biên bản"
+
+# jobs.status -> chữ hiện trên Base. Người vận hành đọc Base, không đọc code:
+# `held` hay `recapping` không nói gì với họ. Giữ ĐỦ mọi giá trị `status` có thể
+# có (kể cả di sản) — thiếu một cái là ô select rỗng và không ai biết vì sao.
+JOB_STATUS_LABEL = {
+    "detected": "mới phát hiện",
+    "queued": "đang chờ dịch",
+    "transcribing": "đang phiên âm",
+    "recapping": "đang tóm tắt",
+    "held": "đã dịch xong — chờ người hỏi",
+    "delivered": "đã gửi",
+    "failed": "HỎNG — không tự chạy lại",
+    "discarded": "bỏ qua",
+    "awaiting_approval": "di sản: cửa duyệt cũ",
+    "owner_only": "di sản: chỉ gửi chủ cuộc",
+    "expired": "di sản: quá hạn duyệt",
+}
+JOB_STATUS_OPTIONS = list(dict.fromkeys(JOB_STATUS_LABEL.values()))
 
 # Schema tạo lần đầu. `text` chứa được cả đoạn dài, nên tóm tắt/quyết định/việc
 # cần làm đều là text nhiều dòng thay vì bảng con — bot Q&A đọc text dễ hơn.
@@ -91,10 +126,16 @@ SCHEMA: list[dict[str, Any]] = [
     {"name": F_ACTIONS, "type": "text"},
     {"name": F_RECIPIENTS, "type": "number"},
     {"name": F_SOURCE, "type": "text"},
-    {"name": F_APPROVER, "type": "text"},
-    {"name": F_APPROVED_AT, "type": "datetime"},
     {"name": F_LINK, "type": "text"},
     {"name": F_TOKEN, "type": "text"},
+    {"name": F_JOB_STATUS, "type": "select", "multiple": False,
+     "options": [{"name": s} for s in JOB_STATUS_OPTIONS]},
+    {"name": F_ERROR, "type": "text"},
+    {"name": F_ATTEMPTS, "type": "number"},
+    {"name": F_INVITEES, "type": "number"},
+    {"name": F_DETECTED, "type": "datetime"},
+    {"name": F_TRANSCRIBED, "type": "datetime"},
+    {"name": F_DELIVERED, "type": "datetime"},
     {"name": F_OWNER, "type": "text"},
     {"name": F_OWNER_UID, "type": "text"},
     {"name": F_MEMBERS, "type": "text"},
@@ -116,6 +157,7 @@ def ensure_fields() -> list[str]:
     """
     if not enabled():
         return []
+    migrate_fields()                      # đổi tên cột cũ TRƯỚC khi so theo tên
     have = {f.get("name") for f in lark_api.base_fields(
         config.BITABLE_APP_TOKEN, config.BITABLE_TABLE_ID)}
     added = []
@@ -133,38 +175,99 @@ def ensure_fields() -> list[str]:
     return added
 
 
+# Cột cũ đổi tên (03/08/2026) — PHẢI chạy TRƯỚC `ensure_fields`, nếu không nó
+# so theo tên và tạo thêm một cột mới nằm cạnh cột cũ cùng ý nghĩa.
+_RENAMES: list[tuple[str, str, str]] = [
+    # (tên CŨ trên Base, tên MỚI, type)
+    ("Trạng thái", F_STATUS, "select"),
+    # Hai cột dưới là di sản cửa duyệt đã bỏ 31/07: KHÔNG ai ghi, đo 03/08 là
+    # 0/6 record có dữ liệu. Đổi tên để TÁI DÙNG chỗ trống thay vì xoá — xoá
+    # field là thao tác không hoàn tác được, còn đổi tên thì giữ nguyên field_id
+    # và mọi view/filter đang trỏ vào nó.
+    ("Người chốt", F_ERROR, "text"),
+    ("Chốt lúc", F_TRANSCRIBED, "datetime"),
+]
+
+
+def migrate_fields() -> list[str]:
+    """Đổi tên các cột cũ sang tên mới. Trả danh sách đã đổi. Idempotent.
+
+    Chỉ đổi khi tên CŨ còn tồn tại và tên MỚI chưa có — chạy lần hai là no-op.
+    """
+    if not enabled():
+        return []
+    flds = lark_api.base_fields(config.BITABLE_APP_TOKEN,
+                                config.BITABLE_TABLE_ID)
+    by_name = {f.get("name"): f for f in flds}
+    done: list[str] = []
+    for old, new, ftype in _RENAMES:
+        if new in by_name or old not in by_name:
+            continue
+        spec: dict[str, Any] = {"name": new, "type": ftype}
+        if ftype == "select":
+            spec["multiple"] = False
+            spec["options"] = [{"name": s} for s in STATUS_OPTIONS]
+        # Lark chặn nhịp `OpenAPIUpdateField` rất gắt (800004135 — đo 03/08/2026:
+        # đổi 3 cột liên tiếp thì cột 2 và 3 bị chặn). Thử lại có giãn cách; hết
+        # lượt thì bỏ, `ensure_fields` sẽ tạo cột mới bên cạnh và cột cũ nằm lại
+        # rỗng — xấu chứ không mất gì.
+        for wait in (0, 3, 8):
+            if wait:
+                time.sleep(wait)
+            try:
+                lark_api.base_field_update(
+                    config.BITABLE_APP_TOKEN, config.BITABLE_TABLE_ID,
+                    by_name[old]["id"], spec)
+            except lark_api.LarkError as exc:
+                if "800004135" not in str(exc):
+                    print(f"[base] đổi tên cột {old!r} -> {new!r} hỏng: {exc}")
+                    break
+                last = exc
+                continue
+            done.append(f"{old} -> {new}")
+            print(f"[base] đã đổi tên cột {old!r} -> {new!r}")
+            break
+        else:
+            print(f"[base] đổi tên cột {old!r} -> {new!r} bị chặn nhịp: {last}")
+    return done
+
+
 def ensure_status_options() -> bool:
-    """Đổi bộ option của cột `Trạng thái` sang bộ mới. True nếu vừa đổi.
+    """Đồng bộ bộ option của HAI cột select (`Tình trạng gửi`, `Tình trạng xử lý`).
 
     Cần riêng một hàm vì `ensure_fields()` chỉ THÊM field còn thiếu — field đã
     tồn tại thì nó không đụng, nên Base tạo trước 31/07/2026 vẫn giữ option
     `draft`/`final` và ghi giá trị mới sẽ hỏng.
 
-    ⚠️ Gửi `options` là THAY THẾ cả bộ: record đang giữ `draft` sẽ mất giá trị ô
-    sau khi đổi. Đó là lý do `sync_tracking` đổ lại cột này cho mọi record —
+    ⚠️ Gửi `options` là THAY THẾ cả bộ: record đang giữ giá trị bị bỏ khỏi danh
+    sách sẽ mất ô. Đó là lý do `sync_tracking` đổ lại cột này cho mọi record —
     chạy `python -m v2 base-sync` ngay sau khi đổi.
     """
     if not enabled():
         return False
-    fld = next((f for f in lark_api.base_fields(
-        config.BITABLE_APP_TOKEN, config.BITABLE_TABLE_ID)
-        if f.get("name") == F_STATUS), None)
-    if not fld:
-        return False                      # chưa có cột -> ensure_fields tạo đúng
-    have = [o.get("name") for o in (fld.get("options") or [])]
-    if have == STATUS_OPTIONS:
-        return False
-    spec = {"name": F_STATUS, "type": "select", "multiple": False,
-            "options": [{"name": s} for s in STATUS_OPTIONS]}
-    try:
-        lark_api.base_field_update(config.BITABLE_APP_TOKEN,
-                                   config.BITABLE_TABLE_ID, fld["id"], spec)
-    except lark_api.LarkError as exc:
-        print(f"[base] đổi option cột {F_STATUS!r} hỏng: {exc}")
-        return False
-    print(f"[base] cột {F_STATUS!r}: {have} -> {STATUS_OPTIONS} "
-          f"(chạy `python -m v2 base-sync` để đổ lại giá trị)")
-    return True
+    flds = lark_api.base_fields(config.BITABLE_APP_TOKEN,
+                                config.BITABLE_TABLE_ID)
+    changed = False
+    for fname, want in ((F_STATUS, STATUS_OPTIONS),
+                        (F_JOB_STATUS, JOB_STATUS_OPTIONS)):
+        fld = next((f for f in flds if f.get("name") == fname), None)
+        if not fld:
+            continue                      # chưa có cột -> ensure_fields tạo đúng
+        have = [o.get("name") for o in (fld.get("options") or [])]
+        if have == want:
+            continue
+        spec = {"name": fname, "type": "select", "multiple": False,
+                "options": [{"name": s} for s in want]}
+        try:
+            lark_api.base_field_update(config.BITABLE_APP_TOKEN,
+                                       config.BITABLE_TABLE_ID, fld["id"], spec)
+        except lark_api.LarkError as exc:
+            print(f"[base] đổi option cột {fname!r} hỏng: {exc}")
+            continue
+        changed = True
+        print(f"[base] cột {fname!r}: {have} -> {want} "
+              f"(chạy `python -m v2 base-sync` để đổ lại giá trị)")
+    return changed
 
 
 def delivery_status(minute_token: str, recap: Recap | None = None) -> str:
@@ -286,10 +389,11 @@ def sync_tracking(only_token: str = "") -> int:
             continue
         meta = jobstore.meta_from_json(row["meta_json"])
         vals = _tracking_fields(meta, skip_file=rid in have_file)
-        # Đổ lại cột `Trạng thái` theo nghĩa MỚI (việc phát). Chỉ cho job đã
-        # chạy xong: job `queued`/`failed` chưa phát gì thì ghi "phát hỏng" là
-        # nói dối — nó chưa tới lượt.
-        if row.get("status") == "delivered":
+        vals.update(_job_fields(row))     # cột gương của `jobs`
+        # Đổ lại cột `Tình trạng gửi`. Chỉ cho job đã chạy xong: job
+        # `queued`/`failed` chưa phát gì thì ghi "phát hỏng" là nói dối — nó
+        # chưa tới lượt. (`held` có nghĩa riêng, xem `delivery_status`.)
+        if row.get("status") in ("delivered", "held"):
             vals[F_STATUS] = delivery_status(row["minute_token"])
         if not vals:
             print(f"[base] {meta.title!r}: không có dữ liệu theo dõi nào")
@@ -303,6 +407,39 @@ def sync_tracking(only_token: str = "") -> int:
         n += 1
         print(f"[base] ✓ {meta.title!r} -> {', '.join(sorted(vals))}")
     return n
+
+
+def _job_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Các ô SOI THẲNG từ một dòng `jobs` (rẻ: không gọi API nào).
+
+    Tách khỏi `_tracking_fields` vì hai thứ khác hẳn về giá: cái kia tra danh bạ
+    và upload file (chậm, hay hỏng), cái này chỉ đọc SQLite. Nhờ vậy vòng `run`
+    đổ được trạng thái lên Base mỗi lượt mà không tốn gì.
+
+    `error` cắt còn 500 ký tự: ô text của Base chứa được dài hơn, nhưng cột lỗi
+    dài làm hỏng cả bảng khi nhìn, mà phần đầu của lỗi mới là phần nói nguyên
+    nhân. Muốn xem đủ thì mở SQLite.
+    """
+    out: dict[str, Any] = {
+        F_ATTEMPTS: int(row.get("attempts") or 0),
+        F_INVITEES: int(row.get("invitee_count") or 0),
+        # Ghi CHUỖI RỖNG khi hết lỗi, không bỏ qua ô: job hỏng rồi chạy lại
+        # thành công mà ô lỗi vẫn còn chữ cũ thì người đọc Base tưởng vẫn đang
+        # hỏng. Ô này phải nói về TRẠNG THÁI HIỆN TẠI.
+        F_ERROR: (row.get("error") or "")[:500],
+    }
+    st = row.get("status") or ""
+    if st:
+        # Giá trị lạ (status mới thêm mà quên khai) thì ghi thẳng chữ thô: option
+        # select không khớp sẽ bị Base từ chối, và như vậy còn hơn im lặng bỏ ô.
+        out[F_JOB_STATUS] = JOB_STATUS_LABEL.get(st, st)
+    for fname, col in ((F_DETECTED, "detected_at"),
+                       (F_TRANSCRIBED, "transcribed_at"),
+                       (F_DELIVERED, "delivered_at")):
+        v = row.get(col)
+        if v:
+            out[fname] = int(v)           # datetime của Base nhận epoch ms
+    return out
 
 
 def _tracking_fields(meta: MeetingMeta, *,
@@ -359,50 +496,92 @@ def _tracking_fields(meta: MeetingMeta, *,
     # các đường ghi Base MUỘN (sync_tracking, retry_missing_records) tụt thẳng
     # xuống .json, và người mở ô file nhận một cục JSON thay vì biên bản —
     # hỏng im lặng, vì record vẫn ghi thành công.
+    # `is_file()` chứ KHÔNG `exists()` ở cả ba nấc (sửa 03/08/2026): job chưa
+    # dịch có `transcript_path` RỖNG, mà `Path("")` là `Path(".")` — thư mục
+    # hiện hành, và `.exists()` của nó là True. Trước đây không lộ vì Base chỉ
+    # nhận job đã phát (luôn có file); từ khi Base nhận cả job `queued` thì nấc
+    # cuối trỏ vào "." và `read_bytes()` ném PermissionError, làm CHẾT nguyên
+    # lượt `base-sync` chứ không chỉ mất một ô.
+    # `_usable`: phải là FILE và phải CÓ BYTE. File 0 byte bị Lark trả
+    # `1061002 params error` — và vì nấc chọn cũ chỉ hỏi "có tồn tại không",
+    # một bản .txt rỗng của cuộc họp cũ làm cả ô file hỏng VĨNH VIỄN, lượt đồng
+    # bộ nào cũng thử lại rồi lại trượt (đo 04/08/2026: cuộc 'test' 27/07).
+    def _usable(p: Path | None) -> bool:
+        return bool(p) and p.is_file() and p.stat().st_size > 0
+
     from . import pipeline
     target = None if skip_file else pipeline.doc_path(meta)
-    if target and not target.exists():
-        legacy = pipeline.legacy_txt_path(meta)
-        target = legacy if legacy.exists() else None
+    if not _usable(target):
+        legacy = pipeline.legacy_txt_path(meta) if not skip_file else None
+        target = legacy if _usable(legacy) else None
     if target is None and not skip_file:
-        raw = Path(row.get("transcript_path") or "")
-        target = raw if raw.exists() else None
+        raw_s = (row.get("transcript_path") or "").strip()
+        raw = Path(raw_s) if raw_s else None
+        target = raw if _usable(raw) else None
     if target:
-        try:
-            ft = lark_api.base_media_upload(
-                target, config.BITABLE_APP_TOKEN, _user_token(meta))
+        last: Exception | None = None
+        # `or [""]`: không lấy được token của ai thì VẪN thử một lần bằng tenant
+        # token — với tenant nào có scope `docs:document.media:upload` ở app
+        # level thì nó chạy. Bỏ nhánh này là mất luôn đường upload ở môi trường
+        # chưa ai enroll (và làm chết một phép kiểm cũ).
+        for tok in (_upload_tokens(meta) or [""]):
+            try:
+                ft = lark_api.base_media_upload(
+                    target, config.BITABLE_APP_TOKEN, tok)
+            except lark_api.LarkError as exc:
+                last = exc
+                continue                  # người này không ghi được Base -> thử người kế
             if ft:
                 out[F_TRANSCRIPT] = [{"file_token": ft}]
-        except lark_api.LarkError as exc:
-            print(f"[base] upload transcript hỏng ({exc}) — bỏ qua ô file")
+                break
+        else:
+            print(f"[base] upload transcript hỏng, đã thử hết người ({last}) "
+                  f"— bỏ qua ô file")
     return out
 
 
-def _user_token(meta: MeetingMeta) -> str:
-    """access_token của NGƯỜI DÙNG để upload attachment (xem base_media_upload).
+def _upload_tokens(meta: MeetingMeta) -> list[str]:
+    """access_token NGƯỜI DÙNG để upload attachment, theo thứ tự nên thử.
 
-    Thứ tự ưu tiên: chủ bản ghi -> người dự -> người đã enroll mà Lark báo có dự
-    -> bất kỳ ai đã enroll. Trả "" nếu không ai enroll — lúc đó upload sẽ thử
-    bằng tenant token và (với app này) sẽ hỏng, nhưng chỉ mất ô file chứ không
-    mất record.
+    ⚠️ ADMIN ĐỨNG TRƯỚC, không phải chủ bản ghi (sửa 04/08/2026) — đây là hai
+    MIỀN QUYỀN khác nhau và trước đó bị lẫn:
+      * tải bản ghi TỪ Lark: chủ bản ghi là người chắc chắn có quyền
+        (`pipeline._reader_candidates` — giữ nguyên, đúng cho việc đó);
+      * upload file VÀO Base: người phải có quyền GHI chính cái Base này, tức
+        chủ Base — hôm nay là admin.
+    Đo 04/08/2026 trên cùng một file: token của admin upload OK, token của Chi
+    và Thiện đều `1061004 forbidden` (Base chỉ chia sẻ tường minh cho admin).
+    Hậu quả của thứ tự cũ: cuộc họp do NGƯỜI KHÁC chủ trì thì ô 'File
+    transcript' trên Base rỗng vĩnh viễn, mà record vẫn ghi thành công nên
+    không có gì báo động.
 
-    Dùng chung danh sách ứng viên với `pipeline._reader_candidates` (sửa
-    02/08/2026). Trước đó chỉ thử `owner_open_id` rồi rơi thẳng xuống "người
-    enroll ĐẦU TIÊN bất kỳ" — một người có thể chẳng liên quan gì tới cuộc họp
-    này. Nhánh đó nay bị chạm thường xuyên hơn: từ khi `build_meta` tra ra CHỦ
-    THẬT (§25), `owner_open_id` không còn luôn là người đã enroll nữa.
+    Trả DANH SÁCH chứ không phải một token: caller thử lần lượt tới khi được.
+    Rỗng = chưa ai enroll — lúc đó `base_media_upload` rơi về tenant token và
+    (với app này) sẽ hỏng, nhưng chỉ mất ô file chứ không mất record.
     """
-    from . import pipeline, tokenstore
-    for oid in pipeline._reader_candidates(meta):
+    from . import tokenstore
+    out: list[str] = []
+    for oid in _upload_candidates(meta):
         try:
-            return tokenstore.get_access_token(oid)
+            out.append(tokenstore.get_access_token(oid))
         except Exception:                  # noqa: BLE001 — chưa enroll/token hỏng
             continue
-    try:
-        users = tokenstore.list_users(active_only=True)
-        return tokenstore.get_access_token(users[0]["open_id"]) if users else ""
-    except Exception:                      # noqa: BLE001
-        return ""
+    return out
+
+
+def _upload_candidates(meta: MeetingMeta) -> list[str]:
+    """open_id theo thứ tự nên thử upload — tách riêng để kiểm được thứ tự mà
+    không cần token thật."""
+    from . import pipeline, tokenstore
+    users = tokenstore.list_users(active_only=True)
+    admins = [u["open_id"] for u in users
+              if u.get("union_id") in config.QA_ADMIN_UNION_IDS]
+    order: list[str] = []
+    for oid in [*admins, *pipeline._reader_candidates(meta),
+                *[u["open_id"] for u in users]]:
+        if oid and oid not in order:
+            order.append(oid)
+    return order
 
 
 def enabled() -> bool:
@@ -469,7 +648,6 @@ def write_draft(meta: MeetingMeta, recap: Recap, n_recipients: int) -> str:
     from . import meetings
     fields: dict[str, Any] = {
         F_TITLE: meta.title,
-        F_STATUS: delivery_status(meta.minute_token, recap),
         F_SUMMARY: recap.summary.strip(),
         F_DECISIONS: _bullets(recap.decisions),
         F_ACTIONS: _action_lines(recap),
@@ -480,6 +658,14 @@ def write_draft(meta: MeetingMeta, recap: Recap, n_recipients: int) -> str:
     }
     if meta.start:
         fields[F_WHEN] = int(meta.start * 1000)   # datetime nhận epoch ms
+    # `Tình trạng gửi` CHỈ có nghĩa với job đã chạy xong. Từ 03/08/2026 Base
+    # nhận record của MỌI job (kể cả `queued`/`failed`), mà `delivery_status`
+    # của một job chưa tới lượt sẽ ra `chưa ai cấp quyền` — nói dối. Để TRỐNG
+    # thì đúng: chưa gửi thì chưa có gì để nói. Cột `Tình trạng xử lý` mới là
+    # chỗ trả lời "cuộc này đang ở đâu".
+    if (row.get("status") or "") in ("delivered", "held"):
+        fields[F_STATUS] = delivery_status(meta.minute_token, recap)
+    fields.update(_job_fields(row))
     fields.update(_tracking_fields(meta))
 
     try:
@@ -490,7 +676,8 @@ def write_draft(meta: MeetingMeta, recap: Recap, n_recipients: int) -> str:
         return ""
     jobstore.set_status(meta.minute_token, row.get("status") or "delivered",
                         bitable_record_id=rid)
-    print(f"[base] đã ghi record ({fields[F_STATUS]}): {rid}")
+    print(f"[base] đã ghi record ({fields.get(F_STATUS) or fields.get(F_JOB_STATUS)}"
+          f"): {rid}")
     return rid
 
 
@@ -528,8 +715,103 @@ def update_recap(minute_token: str, recap: Recap) -> bool:
     return True
 
 
+# Các ô đem ra SO khi quyết định có ghi lại record không. Cố ý KHÔNG có ô
+# datetime: Base trả chúng về dạng chuỗi '2026-07-29 09:41:23' còn ta gửi đi là
+# epoch ms, so thẳng thì lần nào cũng "lệch" -> ghi lại cả bảng mỗi 5 phút. Ba
+# mốc thời gian chỉ được đặt đúng lúc `status` đổi, mà `status` thì có trong
+# danh sách này — nên chúng vẫn lên Base, chỉ là đi ké.
+_DIFF_FIELDS = (F_JOB_STATUS, F_ERROR, F_ATTEMPTS, F_INVITEES)
+
+
+def _needs_push(rec: dict[str, Any], want: dict[str, Any]) -> bool:
+    """Record trên Base có lệch với dữ liệu muốn ghi không.
+
+    Vì sao không chỉ so mỗi `Tình trạng xử lý` (sửa 03/08/2026, ngay sau khi
+    dựng gương): một job đang thử lại đứng yên ở `queued` trong khi `attempts`
+    và `error` đổi mỗi vòng — đúng lúc người vận hành nhìn Base để hiểu chuyện
+    gì đang xảy ra thì nó lại là thứ KHÔNG được cập nhật.
+    """
+    for k in _DIFF_FIELDS:
+        if k not in want:
+            continue
+        cur, new = rec.get(k), want[k]
+        if isinstance(new, (int, float)):
+            if float(cur or 0) != float(new or 0):
+                return True
+        elif str(cur or "").strip() != str(new or "").strip():
+            return True
+    return False
+
+
+def sync_jobs() -> int:
+    """Đổ cột GƯƠNG (`jobs`) lên Base cho record đã có. Trả số record vừa sửa.
+
+    RẺ, gọi được mỗi vòng `run`: một lời gọi đọc cả bảng, rồi CHỈ ghi những
+    record có `Tình trạng xử lý` lệch với SQLite. Không tra danh bạ, không upload
+    file — phần đắt đó nằm ở `sync_tracking` (chạy tay qua `base-sync`).
+
+    Vì sao lọc chứ không ghi hết: 16 record x mỗi 5 phút là 190 lời gọi/giờ cho
+    việc không đổi gì. Nhưng lọc phải so ĐỦ các ô hay đổi — xem `_needs_push`.
+    """
+    if not enabled():
+        return 0
+    try:
+        recs = {r.get(F_TOKEN): r for r in lark_api.base_records_all(
+            config.BITABLE_APP_TOKEN, config.BITABLE_TABLE_ID)}
+    except lark_api.LarkError as exc:
+        print(f"[base] không đọc được record để đồng bộ ({exc})")
+        return 0
+    n = 0
+    for row in jobstore.all_jobs():
+        rec = recs.get(row["minute_token"])
+        rid = (rec or {}).get("_record_id") or row.get("bitable_record_id")
+        if not rid:
+            continue                      # chưa có record -> retry_missing_records lo
+        want = _job_fields(row)
+        # Ô ĐẮT (file transcript, số giây whisper, người dự) chỉ được điền lúc
+        # TẠO record. Từ 03/08/2026 record được tạo ngay khi job còn `queued` —
+        # lúc đó chưa có transcript, mà `write_draft` ở bước `held` thì thoát
+        # sớm vì record đã tồn tại ⇒ ô file TRỐNG VĨNH VIỄN, chỉ `base-sync`
+        # chạy tay mới vá. Đúng triệu chứng đã gặp: hai cuộc vừa dịch xong,
+        # .docx nằm sẵn trên đĩa mà ô 'File transcript' trên Base rỗng.
+        cur = rec or {}
+        has_file = bool(cur.get(F_TRANSCRIPT))
+        has_metrics = bool(cur.get(F_WHISPER_SEC))
+        lacks = ((row.get("transcript_path") and not has_file)
+                 or (row.get("whisper_seconds") and not has_metrics))
+        if rec is not None and not lacks and not _needs_push(rec, want):
+            continue                      # không có gì đổi -> khỏi ghi
+        if lacks:
+            # Chỉ chạm phần đắt khi THIẾU thật: mỗi lần là một cú tra danh bạ +
+            # một cú upload. Bỏ qua upload nếu ô đã có file — upload lại chỉ
+            # sinh file_token mới và biến bản cũ thành rác trong Base.
+            try:
+                meta = jobstore.meta_from_json(row["meta_json"])
+                want.update(_tracking_fields(meta, skip_file=has_file))
+            except Exception as exc:      # noqa: BLE001 — ô phụ, đừng chặn ô chính
+                print(f"[base] {row['minute_token']} lấy ô theo dõi hỏng "
+                      f"(vẫn ghi trạng thái): {exc}")
+        if (row.get("status") or "") in ("delivered", "held"):
+            want[F_STATUS] = delivery_status(row["minute_token"])
+        try:
+            lark_api.base_record_update(config.BITABLE_APP_TOKEN,
+                                        config.BITABLE_TABLE_ID, rid, want)
+        except lark_api.LarkError as exc:
+            print(f"[base] đồng bộ {row['minute_token']} hỏng: {exc}")
+            continue
+        n += 1
+    if n:
+        print(f"[base] đồng bộ trạng thái {n} record")
+    return n
+
+
 def retry_missing_records() -> int:
-    """Ghi record cho job ĐÃ phát mà trên Base chưa có. Trả số record vừa tạo.
+    """Ghi record cho job chưa có trên Base. Trả số record vừa tạo.
+
+    Từ 03/08/2026 quét MỌI job, không chỉ `delivered`/`held` (user yêu cầu quản
+    trị trên Base): cuộc `queued` chờ dịch và cuộc `failed` vì thiếu quyền tải
+    trước đây không có dòng nào trên Base, nên nhìn Base tưởng chúng không tồn
+    tại — phải mở SQLite mới thấy. Nay Base là GƯƠNG của bảng `jobs`.
 
     Vì sao phải có (sửa 31/07/2026): `write_draft` cố ý chỉ log rồi đi tiếp khi
     ghi Base hỏng — biên bản đã tới tay người dự rồi, không được làm job
@@ -554,7 +836,7 @@ def retry_missing_records() -> int:
     if not enabled():
         return 0
     n = 0
-    for row in jobstore.by_status("delivered", "held"):
+    for row in jobstore.all_jobs():
         if row.get("bitable_record_id"):
             continue
         token = row["minute_token"]
@@ -568,7 +850,8 @@ def retry_missing_records() -> int:
         # còn hơn không có gì (bot mới thôi nói "chưa có biên bản").
         recap = _recap_from_db(token) or Recap(summary="")
         n_recip, _ = jobstore.delivery_counts(token, "recap")
-        print(f"[base] {token} đã phát mà CHƯA có record trên Base -> ghi lại")
+        print(f"[base] {token} ({row.get('status')}) chưa có record trên Base "
+              f"-> ghi")
         if write_draft(meta, recap, n_recip):
             n += 1
     return n
@@ -578,8 +861,9 @@ def retry_missing_records() -> int:
 # Chúng chỉ tồn tại để flip `draft` -> `final`, mà `final` không còn là một giá
 # trị hợp lệ của cột `Trạng thái` nữa — giữ lại thì lệnh đó ghi một option không
 # tồn tại vào Base. Cửa duyệt đã bỏ từ 30/07 nên cũng không còn ai "chốt" cái gì.
-# Hai cột `Người chốt` / `Chốt lúc` trên Base nay không ai ghi; để trống vô hại,
-# muốn dọn thì xoá tay trên UI Base.
+# Hai cột `Người chốt` / `Chốt lúc` đã được TÁI DÙNG 03/08/2026: đổi tên thành
+# `Lỗi gần nhất` / `Dịch xong lúc` (xem `_RENAMES`). Chúng rỗng 0/6 record nên
+# không mất gì, và đổi tên giữ nguyên field_id — mọi view/filter cũ vẫn trỏ đúng.
 
 
 # ------------------------------------------------------- khởi tạo một lần

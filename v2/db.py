@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS glossary_candidates (
     term_key   TEXT PRIMARY KEY,     -- lower(strip(term)) — khoá so khớp
     term       TEXT,                 -- chính tả hiển thị (giữ hoa/thường)
     count      INTEGER DEFAULT 1,    -- số cuộc gặp
-    example    TEXT,                 -- ví dụ ngữ cảnh gần nhất
+    example    TEXT,                 -- TIÊU ĐỀ cuộc gặp gần nhất (không phải câu trích)
     status     TEXT DEFAULT 'pending',   -- pending | approved | rejected
     first_seen INTEGER,
     last_seen  INTEGER
@@ -433,6 +433,18 @@ def glossary_list(status: str = "", min_count: int = 0) -> list[dict]:
         args.append(status)
     q += " ORDER BY count DESC, last_seen DESC"
     return [dict(r) for r in conn().execute(q, args).fetchall()]
+
+
+def glossary_get(term: str) -> dict | None:
+    """Một ứng viên theo khoá so khớp, None nếu không có. Để caller đọc `status`
+    TRƯỚC khi đổi (vd: cảnh báo 'từ này trước đã bị bỏ')."""
+    key = _term_key(term)
+    if not key:
+        return None
+    row = conn().execute(
+        "SELECT term, count, example, status FROM glossary_candidates "
+        "WHERE term_key=?", (key,)).fetchone()
+    return dict(row) if row else None
 
 
 def glossary_approved_terms(limit: int = 1000) -> list[str]:

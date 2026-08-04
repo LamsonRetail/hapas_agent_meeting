@@ -87,12 +87,26 @@ def _parse_segments(transcript_text: str, duration: float) -> list[Segment]:
     return segs
 
 
+# Ngân sách TỪ cho hint gửi kèm. Server gộp `vi-prompt.txt` (~41 từ) + hint rồi
+# cắt còn 180 từ, GIỮ ĐUÔI — nên hint dài hơn ngần này thì phần ĐẦU bị chặt.
+# 135 = 180 - ~41 nền - lề. Không đọc được kích thước file nền của server từ đây,
+# nên chừa lề và để phép cắt của server làm lưới cuối.
+_HINT_WORD_BUDGET = 135
+
+
 def _prompt_hint(title: str, attendee_names: list[str] | None,
-                 glossary_terms: list[str] | None = None) -> str:
+                 glossary_terms: list[str] | None = None,
+                 budget: int = _HINT_WORD_BUDGET) -> str:
     """Câu gợi ý ngữ cảnh cho whisper: thuật ngữ đã duyệt + tiêu đề + tên người dự
     (khử trùng, giữ thứ tự). Văn xuôi tự nhiên vì `initial_prompt` là văn bản dẫn,
-    không phải danh sách. Cắt sớm ~40 tên/thuật ngữ để không nuốt hết ngân sách;
-    server còn cắt lần nữa theo token thật (`_build_prompt`).
+    không phải danh sách.
+
+    THỨ TỰ LÀ CÓ Ý: tên người dự đứng CUỐI vì server cắt giữ ĐUÔI — phần bias
+    chắc nhất (part A) được giữ lại. Nhưng vì vậy khối "Thuật ngữ" là thứ bị
+    chặt đầu tiên, và trước 03/08/2026 nó bị chặt GIỮA CHỪNG trong im lặng: cuộc
+    ~40 người là cả part B biến mất khỏi prompt mà không ai biết. Nên ở đây tự
+    cắt DANH SÁCH thuật ngữ cho vừa ngân sách còn lại (bỏ từ ít gặp nhất trước —
+    `glossary_approved_terms` đã xếp count giảm dần), thay vì để server chặt chữ.
     """
     def _dedup(xs: list[str] | None) -> list[str]:
         out: list[str] = []
@@ -104,14 +118,28 @@ def _prompt_hint(title: str, attendee_names: list[str] | None,
 
     names = _dedup(attendee_names)
     terms = _dedup(glossary_terms)
-    parts: list[str] = []
-    if terms:
-        parts.append("Thuật ngữ: " + ", ".join(terms[:40]) + ".")
+    tail: list[str] = []
     if (title or "").strip():
-        parts.append(f"Cuộc họp: {title.strip()}.")
+        tail.append(f"Cuộc họp: {title.strip()}.")
     if names:
-        parts.append("Người tham dự: " + ", ".join(names[:40]) + ".")
-    return " ".join(parts)
+        tail.append("Người tham dự: " + ", ".join(names[:40]) + ".")
+    tail_words = len(" ".join(tail).split())
+
+    head = ""
+    # Tail đã kín ngân sách (cuộc rất đông người) -> KHÔNG gửi thuật ngữ nữa:
+    # gửi thì server cũng chặt đúng phần đó, chỉ tổ đẩy tên người ra khỏi mép.
+    if terms and tail_words < budget:
+        # Thêm dần tới khi hết ngân sách. Không ước lượng "mỗi từ ~1.2 từ" cho
+        # nhanh: thuật ngữ tiếng Việt có từ 3-4 âm tiết, đếm thật mới đúng.
+        fit: list[str] = []
+        for t in terms[:40]:
+            cand = "Thuật ngữ: " + ", ".join(fit + [t]) + "."
+            if len(cand.split()) + tail_words > budget and fit:
+                break
+            fit.append(t)
+        if fit:
+            head = "Thuật ngữ: " + ", ".join(fit) + "."
+    return " ".join(([head] if head else []) + tail)
 
 
 def transcribe(audio_path: Path, minute_token: str,

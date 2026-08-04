@@ -27,7 +27,12 @@ set PY=C:\Users\PC\AppData\Local\Programs\Python\Python312\python.exe
 
 set LOGDIR=%~dp0v2\data\logs
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
-for /f "tokens=1-3 delims=/-. " %%a in ("%DATE%") do set TODAY=%%c-%%b-%%a
+REM Ten log theo ngay. KHONG cat %DATE% ra ma dung: dinh dang cua no theo
+REM Regional Settings, va tren chinh may nay 03/08/2026 no doi tu "03/08/2026"
+REM sang "Mon 08/03/2026" -> cong thuc cu de ra "alerts-03-08-Mon.log" (con
+REM nguyen trong v2\data\logs). Do la kieu hong am tham: file van duoc ghi,
+REM chi la nguoi tim log theo ngay khong thay no.
+for /f %%d in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set TODAY=%%d
 set LOG=%LOGDIR%\alerts-%TODAY%.log
 
 REM Log RIENG, khong ghi chung v2-<ngay>.log: log cua vong `run` la thu

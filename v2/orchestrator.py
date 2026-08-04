@@ -387,11 +387,6 @@ def _process_queue(dry_run: bool | None = None) -> None:
         # Không còn broadcast recap+transcript cho mọi người dự nữa. `recap` từ
         # `_reuse` (nếu có) bỏ qua: người hỏi transcript thì nhận transcript.
         _ = recap
-        # Trích thuật ngữ ứng viên cho glossary (part B). Best-effort, chỉ khi
-        # bật + chạy thật: không được làm hỏng phát/held. Chạy TRƯỚC nhánh rẽ để
-        # cả cuộc held lẫn cuộc có người hỏi đều góp từ.
-        if config.GLOSSARY_ENABLED and not dry_run:
-            _collect_glossary(t, meta)
         if priority >= 2:
             _deliver_requested(meta, t, dry_run=dry_run)
         elif dry_run:
@@ -406,6 +401,21 @@ def _process_queue(dry_run: bool | None = None) -> None:
             jobstore.set_status(token, "held", transcribed_at=_now_ms())
             _base_record_held(token, meta)
             print(f"[queue] {token} dịch xong -> held + Base (chờ người dự hỏi)")
+
+        # Trích thuật ngữ ứng viên cho glossary (part B). HAI ràng buộc, cả hai
+        # đều là lỗi đã sửa 03/08/2026 chứ không phải phòng xa:
+        #  1. Chạy SAU khi đã phát/held, không phải trước. Đây là một lời gọi LLM
+        #     (cả transcript, LLM_TIMEOUT=240s); đặt trước `_deliver_requested`
+        #     là bắt người vừa hỏi transcript chờ thêm ngần đó — mà recap vốn đã
+        #     cố tình đẩy xuống `_backfill_recaps` cuối vòng đúng vì lý do này.
+        #  2. CHỈ khi transcript vừa phiên âm xong (`done` rỗng). `count` là "số
+        #     CUỘC gặp" và là bộ lọc nhiễu DUY NHẤT của digest (>= MIN_COUNT):
+        #     job đã có transcript mà chạy lại (enqueue tay, phát hỏng nên về
+        #     `queued`, tiến trình chết giữa chừng) sẽ đi qua `_reuse` và cộng
+        #     count lần nữa cho CÙNG một cuộc — đủ để một từ nghe nhầm một lần
+        #     leo lên digest như "gặp 2 cuộc", tức hỏng đúng cái nó sinh ra để chặn.
+        if config.GLOSSARY_ENABLED and not dry_run and not done:
+            _collect_glossary(t, meta)
 
     if not dry_run:
         # Recap TRƯỚC Base: `_backfill_recaps` sửa recap trong DB, và
@@ -618,6 +628,11 @@ def _backfill_base() -> None:
     from . import bitable
     try:
         bitable.retry_missing_records()
+        # Rồi đổ trạng thái MỚI lên record đã có. Thiếu bước này thì Base chỉ
+        # đúng vào lúc record được TẠO: một cuộc `queued` chuyển sang `held` hay
+        # `failed` sau đó sẽ nằm im ở trạng thái cũ, tức cột trạng thái nói dối
+        # — tệ hơn là không có cột. Rẻ: 1 lời gọi đọc, chỉ ghi cái lệch.
+        bitable.sync_jobs()
     except Exception as exc:             # noqa: BLE001 — xem docstring
         print(f"[base] thử ghi lại record thiếu hỏng (bỏ qua): {exc}")
 

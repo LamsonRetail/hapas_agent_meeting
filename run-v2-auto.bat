@@ -114,6 +114,13 @@ REM khoi dong lai vai lan moi ngay (ngu / loi 31.2) nen sai lech chi con vai
 REM tieng thay vi vai ngay. Muon dung tuyet doi thi phai cho chinh Python tu mo
 REM file log theo ngay, khong dung chuyen huong cua cmd nua.
 :setlog
-for /f "tokens=1-3 delims=/-. " %%a in ("%DATE%") do set TODAY=%%c-%%b-%%a
+REM KHONG cat %DATE% ra ma dung (sua 03/08/2026): dinh dang cua no theo Regional
+REM Settings. Tren chinh may nay %DATE% doi tu "03/08/2026" sang "Mon 08/03/2026"
+REM trong ngay, va cong thuc cu de ra ten "v2-03-08-Mon.log" - dung kieu hong am
+REM tham nhat: log VAN duoc ghi day du, chi la nguoi lan loi mot cuoc hop mo
+REM v2\data\logs tim "v2-2026-08-03.log" thi khong thay, roi ket luan he thong
+REM khong chay. (File v2-03-08-Mon.log va alerts-03-08-Mon.log la di tich cua
+REM dung loi do - giu lai, do la log that.)
+for /f %%d in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set TODAY=%%d
 set LOG=%LOGDIR%\v2-%TODAY%.log
 exit /b 0

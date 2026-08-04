@@ -152,9 +152,15 @@ def cmd_base_sync(args) -> None:
     # TẠO record thiếu trước khi đổ lại ô: `sync_tracking` chỉ sửa record đã có,
     # nên job phát xong mà ghi Base hỏng thì nó bỏ qua vĩnh viễn (xem
     # bitable.retry_missing_records). Đây là đường vá bằng tay của người vận hành.
+    renamed = bitable.migrate_fields()
+    if renamed:
+        print("Đã đổi tên cột: " + "; ".join(renamed))
     created = bitable.retry_missing_records()
     if created:
-        print(f"Đã tạo {created} record còn thiếu (job đã phát mà Base chưa có).")
+        print(f"Đã tạo {created} record còn thiếu (job chưa có trên Base).")
+    synced = bitable.sync_jobs()
+    if synced:
+        print(f"Đã đổ lại trạng thái cho {synced} record.")
     n = bitable.sync_tracking(args.token)
     print(f"Xong: {n} record đã cập nhật ô theo dõi.")
 
@@ -281,11 +287,15 @@ def cmd_alerts(args) -> None:
         print("Không có gì để báo (hoặc đã báo rồi — xem bảng alert_state).")
 
 
-def cmd_glossary_digest(_) -> None:
+def cmd_glossary_digest(args) -> None:
     """Gửi digest tuần: thuật ngữ chờ duyệt -> DM admin (Task Scheduler gọi tuần).
 
     In ra danh sách dù không gửi được (chưa cấu hình người nhận) để chạy tay vẫn
     thấy có gì đang chờ.
+
+    `--dry-run` như `alerts --dry-run`, và cùng lý do: người ta chạy lệnh này
+    bằng tay để XEM đang có gì chờ. Không có cửa đó thì mỗi lần xem là một cái DM
+    thật vào chat admin — kiểu phiền khiến người ta thôi không kiểm nữa.
     """
     _init()
     from . import config, glossary
@@ -299,6 +309,10 @@ def cmd_glossary_digest(_) -> None:
         return
     print(body)
     print("-" * 40)
+    if args.dry_run:
+        print(f"[glossary] (dry-run) KHÔNG gửi. Chạy thật sẽ DM "
+              f"{len(config.ALERT_UNION_IDS)} người trong ALERT_UNION_IDS.")
+        return
     n = glossary.send_digest(config.GLOSSARY_MIN_COUNT, config.ALERT_UNION_IDS)
     print(f"[glossary] đã DM {n} admin" if n else
           "[glossary] KHÔNG gửi: ALERT_UNION_IDS trống — đặt trong v2/.env.")
@@ -586,9 +600,12 @@ def main() -> None:
                     help="chỉ in cái sắp gửi, không gửi, không ghi mốc")
     al.set_defaults(fn=cmd_alerts)
 
-    sub.add_parser("glossary-digest",
-                   help="DM admin thuật ngữ chờ duyệt (Task Scheduler gọi tuần)")\
-        .set_defaults(fn=cmd_glossary_digest)
+    gd = sub.add_parser(
+        "glossary-digest",
+        help="DM admin thuật ngữ chờ duyệt (Task Scheduler gọi tuần)")
+    gd.add_argument("--dry-run", action="store_true",
+                    help="chỉ in cái sắp gửi, không DM ai")
+    gd.set_defaults(fn=cmd_glossary_digest)
 
     sub.add_parser("scan").set_defaults(fn=cmd_scan)
 

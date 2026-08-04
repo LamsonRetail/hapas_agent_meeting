@@ -759,17 +759,64 @@ def contact_batch(open_ids: list[str]) -> dict[str, dict[str, Any]]:
     return out
 
 
-def base_fields(base_token: str, table_id: str) -> list[dict[str, Any]]:
-    """Field hiện có của table. Mỗi item: {id, name, type, ...}.
+# bitable/v1 trả `type` là SỐ; phần còn lại của file nói chuyện bằng TÊN
+# (`base_field_create` nhận "text"/"select"/...). Bảng này dịch ngược lại.
+_V1_FIELD_TYPES = {
+    1: "text", 2: "number", 3: "select", 4: "multi_select", 5: "datetime",
+    7: "checkbox", 11: "user", 13: "phone", 15: "url", 17: "attachment",
+    18: "single_link", 19: "lookup", 20: "formula", 21: "duplex_link",
+    1001: "created_time", 1002: "modified_time", 1003: "created_user",
+    1004: "modified_user", 1005: "auto_number",
+}
 
-    Đọc bằng base/v3 (`data.fields`), KHÔNG phải bitable/v1 (`data.items`, và
-    `field_name`/`type` số) — giữ cùng họ endpoint với phần còn lại của file.
+
+def base_fields(base_token: str, table_id: str) -> list[dict[str, Any]]:
+    """Field hiện có của table. Mỗi item: {id, name, type, options}.
+
+    Đọc bằng **bitable/v1**, KHÔNG phải base/v3 — ngược với phần còn lại của
+    file, và có lý do đo được (03/08/2026):
+    base/v3 `.../fields` **cắt cụt ở 20 field** bất kể `page_size`, KHÔNG trả
+    `page_token`, KHÔNG trả `has_more`. Dấu hiệu duy nhất là `data.total` (=25)
+    lệch với số item trả về (=20). Hậu quả nếu tin nó: `bitable.ensure_fields`
+    so theo TÊN trên danh sách thiếu, kết luận cột đã có là "chưa có", rồi TẠO
+    TRÙNG — bảng mọc thêm `Tóm tắt (1)`, `Người dự (1)`... và code ghi vào cột
+    rỗng trong khi người dùng nhìn cột cũ. Đã suýt dính đúng lúc bảng vượt 20
+    cột (thêm 6 cột gương của `jobs`).
+    v1 trả đủ 25 và có `page_token` thật, nên phân trang được.
     """
-    resp = _http().get(
-        f"/open-apis/base/v3/bases/{base_token}/tables/{table_id}/fields",
-        headers=_im_headers(), params={"page_size": 100},
-    )
-    return _check(resp, "base_fields").get("data", {}).get("fields") or []
+    out: list[dict[str, Any]] = []
+    token = ""
+    while True:
+        params: dict[str, Any] = {"page_size": 100}
+        if token:
+            params["page_token"] = token
+        resp = _http().get(
+            f"/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/fields",
+            headers=_im_headers(), params=params)
+        data = _check(resp, "base_fields").get("data", {})
+        for it in data.get("items") or []:
+            out.append({
+                "id": it.get("field_id"),
+                "name": it.get("field_name"),
+                "type": _V1_FIELD_TYPES.get(it.get("type"), it.get("type")),
+                "options": ((it.get("property") or {}).get("options") or []),
+            })
+        token = data.get("page_token") or ""
+        if not (data.get("has_more") and token):
+            return out
+
+
+def base_field_delete(base_token: str, table_id: str, field_id: str) -> None:
+    """Xoá MỘT field. KHÔNG hoàn tác được — dữ liệu trong cột đó mất theo.
+
+    Chỉ dùng cho cột đã xác minh RỖNG (xem `bitable._RENAMES`: cột di sản của
+    cửa duyệt cũ). Đổi tên để tái dùng luôn tốt hơn; xoá là đường cuối khi tên
+    mới đã bị một cột khác chiếm.
+    """
+    resp = _http().delete(
+        f"/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/fields/{field_id}",
+        headers=_im_headers())
+    _check(resp, "base_field_delete")
 
 
 def base_field_create(base_token: str, table_id: str,

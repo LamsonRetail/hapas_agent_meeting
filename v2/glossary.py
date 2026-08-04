@@ -43,7 +43,9 @@ def pending(who: dict[str, Any] | None, *, min_count: int = 0) -> str:
         return "Không có thuật ngữ nào đang chờ duyệt."
     lines = [
         f"- {r['term']}  (gặp {r['count']} cuộc)"
-        + (f" — vd: {r['example'][:60]}" if r.get("example") else "")
+        # `example` là TIÊU ĐỀ cuộc gần nhất, không phải câu trích — gọi đúng tên
+        # để admin không đọc nó như một dẫn chứng ngữ cảnh.
+        + (f" — gặp ở: {r['example'][:60]}" if r.get("example") else "")
         for r in rows
     ]
     return ("Thuật ngữ đang chờ duyệt (nhắn 'duyệt <từ>' hoặc 'bỏ <từ>', "
@@ -86,25 +88,55 @@ def send_digest(min_count: int, recipients: list[str]) -> int:
     return ok
 
 
+def _split_terms(terms: list[str] | str) -> list[str]:
+    """Chuỗi 'MCP, Anthropic' HOẶC list -> list từ, tách dấu phẩy ở CẢ HAI.
+
+    Tách ở đây chứ không chỉ ở `mcp_server._terms_arg`: chính `pending()` dặn
+    người dùng "nhiều từ cách nhau dấu phẩy", nên `approve(who, "MCP, Anthropic")`
+    mà im lặng coi cả câu là MỘT từ rồi báo "không thấy trong danh sách chờ" là
+    cái bẫy cho mọi caller khác (chạy tay, test, đường gọi mới).
+    """
+    if isinstance(terms, str):
+        terms = [terms]
+    out: list[str] = []
+    for chunk in (terms or []):
+        for t in str(chunk or "").split(","):
+            t = t.strip()
+            if t and t not in out:
+                out.append(t)
+    return out
+
+
 def _apply(who: dict[str, Any] | None, terms: list[str] | str,
            status: str, verb: str) -> str:
     if not _is_admin(who):
         return NOT_ADMIN
-    if isinstance(terms, str):
-        terms = [terms]
-    terms = [t.strip() for t in (terms or []) if t and t.strip()]
+    terms = _split_terms(terms)
     if not terms:
         return f"Cần nêu từ cần {verb}, ví dụ: '{verb} MCP, Anthropic'."
     done: list[str] = []
     miss: list[str] = []
+    revived: list[str] = []
     for t in terms:
+        row = db.glossary_get(t)
         got = db.glossary_set_status(t, status)
-        (done if got else miss).append(got or t)
+        if not got:
+            miss.append(t)
+            continue
+        done.append(got)
+        # Từ đã bị BỎ thì `pending()` không còn liệt kê, nên admin duyệt nó là
+        # đang gõ tay một từ họ không nhìn thấy — thường là quên mình từng bỏ.
+        # Vẫn cho làm (admin là người quyết), nhưng phải NÓI RA.
+        if status == "approved" and row and row.get("status") == "rejected":
+            revived.append(got)
     parts: list[str] = []
     if done:
         extra = (" Cuộc họp sau whisper sẽ ưu tiên viết đúng các từ này."
                  if status == "approved" else "")
         parts.append(f"Đã {verb}: {', '.join(done)}.{extra}")
+    if revived:
+        parts.append(f"(Lưu ý: {', '.join(revived)} trước đó đã bị BỎ — "
+                     f"giờ duyệt lại theo yêu cầu của bạn.)")
     if miss:
         parts.append(f"Không thấy trong danh sách chờ (bỏ qua): {', '.join(miss)}.")
     return " ".join(parts)

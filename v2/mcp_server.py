@@ -256,8 +256,10 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "asker_token": {"type": "string", "description": ASKER_DESC},
                 "minute_token": {"type": "string",
-                                 "description": "cuộc họp cần gửi biên bản "
-                                                "(lấy từ list/search)"},
+                                 "description": "cuộc họp cần gửi biên bản — "
+                                                "`minute_token` (chắc nhất, lấy "
+                                                "từ list/search) HOẶC tên cuộc "
+                                                "họp, hệ thống tự tra"},
             },
             "required": ["asker_token", "minute_token"],
         },

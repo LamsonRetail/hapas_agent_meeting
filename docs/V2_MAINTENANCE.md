@@ -3833,7 +3833,180 @@ Part B là "bắt thêm"; part A mới là phần chắc. `V2_GLOSSARY_ENABLED` 
 ### 38.4 Bật lên (sau khi kéo code)
 
 1. Restart whisper server `D:\whisper\run-server.bat` (lấy no_repeat + param `prompt`).
-2. Restart `v2 run` (code part A+B) và Hermes gateway (thấy 3 tool mới).
-3. Task Scheduler tuần cho `run-v2-glossary.bat` (lệnh `schtasks` trong comment file đó).
+2. **Áp `hermes/feishu-config.yaml` vào `%LOCALAPPDATA%\hermes\config.yaml`** rồi
+   `hermes gateway restart` — xem 38.5 (1): thiếu bước này thì 3 tool có tồn tại
+   cũng không ai gọi tới.
+3. Restart `v2 run` (code part A+B) và `v2 mcp` (thấy 3 tool mới).
+4. Task Scheduler tuần cho `run-v2-glossary.bat` (lệnh `schtasks` trong comment file đó).
 
-selftest: +14 (part A held/None-safe) +14 (part B) → tổng PASS 309.
+### 38.5 Kiểm luồng đầu-cuối rồi sửa (03/08/2026, cùng ngày)
+
+Chạy thử cả luồng ngay sau khi viết xong. selftest xanh nhưng luồng THẬT thì
+không đi được — và hai bug logic chỉ lộ ra khi lần theo đường đi, không phải khi
+đọc từng hàm.
+
+1. **Bot không có đường gọi 3 tool glossary** (chặn cứng, không phải lỗi code).
+   `hermes/feishu-config.yaml` không được sửa kèm: prompt vẫn ghi "Bạn CHỈ làm
+   đúng HAI việc" và liệt kê "nguồn dữ liệu DUY NHẤT" gồm 6 tool cũ. Admin nhắn
+   "duyệt MCP" rơi trúng khối "mọi thứ khác NGOÀI phạm vi → từ chối một câu".
+   ⇒ Bài học lặp lại: **thêm tool MCP là việc HAI file** — `mcp_server.py` cho
+   tool tồn tại, `feishu-config.yaml` cho nó được gọi. Cái sau không có test đỡ.
+2. **`count` đếm sai cuộc** (`orchestrator._collect_glossary`). Nó đứng trước
+   nhánh rẽ và chạy cả trên đường `_reuse`, nên một job đã có transcript mà chạy
+   lại (enqueue tay, phát hỏng nên về `queued`, tiến trình chết giữa chừng) trích
+   + đếm lại cho CÙNG một cuộc. `count` là "số CUỘC gặp" và là **bộ lọc nhiễu duy
+   nhất** của digest (≥ `MIN_COUNT`=2) → một cuộc chạy lại một lần là đủ đẩy từ
+   nghe-nhầm-một-lần lên digest như "gặp 2 cuộc". Sửa: chỉ trích khi `not done`.
+3. **Lời gọi LLM nằm chặn đường phát**: cùng chỗ đó, nó chạy TRƯỚC
+   `_deliver_requested` — người vừa hỏi transcript phải chờ thêm một lượt Hermes
+   (cả transcript, `LLM_TIMEOUT`=240s). Recap vốn cố tình đẩy xuống
+   `_backfill_recaps` cuối vòng đúng vì lý do này; part B phá lệ. Đã chuyển xuống
+   sau nhánh rẽ (vẫn phủ cả held lẫn cuộc có người hỏi).
+4. **Thuật ngữ bị chặt giữa chừng trong im lặng**: server giữ 180 từ CUỐI, mà
+   khối "Thuật ngữ" đứng ĐẦU hint (cố ý — tên người dự quý hơn nên nằm cuối để
+   sống sót). Đo: 40 người dự → cả part B biến mất khỏi prompt. Sửa ở
+   `transcribe._prompt_hint`: tự cắt DANH SÁCH thuật ngữ cho vừa ngân sách
+   `_HINT_WORD_BUDGET`=135 từ (bỏ từ ít gặp trước), tên đã kín ngân sách thì bỏ
+   hẳn khối thuật ngữ. Cắt từ nguyên vẹn, không để server chặt chữ.
+5. `glossary.approve(who, "MCP, Anthropic")` **không tách dấu phẩy** — chỉ
+   `mcp_server._terms_arg` tách, trong khi chính `pending()` dặn người dùng nhắn
+   như vậy. Đã đưa phép tách vào `glossary._split_terms` (dùng chung).
+6. `glossary-digest` **thiếu `--dry-run`** (khác `alerts`): mỗi lần chạy tay để
+   xem là một DM thật vào chat admin. Đã thêm.
+7. Duyệt lại từ đã BỎ giờ **nói ra** ("trước đó đã bị BỎ") thay vì im lặng —
+   `pending()` không liệt kê từ rejected nên admin đang gõ một từ họ không thấy.
+   Vẫn cho làm: admin là người quyết.
+8. **Bắt được nhờ chạy thật, không liên quan glossary**: log đổi tên thành
+   `v2-03-08-Mon.log` / `alerts-03-08-Mon.log`. Ba file `.bat` cắt `%DATE%` bằng
+   `for /f "tokens=1-3 delims=/-. "`, mà `%DATE%` của máy này ĐỔI ĐỊNH DẠNG trong
+   ngày 03/08 (từ `03/08/2026` sang `Mon 08/03/2026`) → công thức ra `03-08-Mon`.
+   Hỏng âm thầm đúng kiểu tệ nhất: log vẫn ghi đủ, chỉ là người lần lại một cuộc
+   họp mở `v2\data\logs` tìm `v2-2026-08-05.log` sẽ thấy **không có file**, rồi
+   kết luận hệ thống không chạy. Đã thay bằng `Get-Date -Format yyyy-MM-dd` ở cả
+   `run-v2-auto.bat`, `run-v2-alerts.bat`, `run-v2-glossary.bat`. Hai file
+   `*-03-08-Mon.log` giữ lại — đó là log thật của tối 03/08.
+
+selftest: +14 (part A held/None-safe) +14 (part B) +12 (kiểm luồng) → PASS 321.
+
+## 39. Base = GƯƠNG của bảng `jobs` (03/08/2026)
+
+Yêu cầu của user: *"base nhìn khác quá khó hiểu, quản trị trên Base cho dễ"*.
+Gốc của cái khó hiểu không phải tên cột mà là **phạm vi**: Base chỉ nhận record
+của job `delivered`/`held`, nên cuộc đang chờ dịch và cuộc HỎNG **không có dòng
+nào** — nhìn Base tưởng chúng không tồn tại, phải mở SQLite mới thấy (hai cuộc
+HAPAS thiếu quyền tải là ví dụ sống). Và cột `Trạng thái` nói về việc GỬI, không
+trả lời được "cuộc này đang ở bước nào".
+
+### 39.1 Đã đổi
+
+| Việc | Chi tiết |
+|---|---|
+| Phạm vi | `retry_missing_records` quét **mọi** status (không chỉ delivered/held) ⇒ mỗi job = một record |
+| Cột mới (gương của `jobs`) | `Tình trạng xử lý`, `Lỗi gần nhất`, `Số lần thử`, `Số người được mời`, `Phát hiện lúc`, `Dịch xong lúc`, `Gửi lúc` |
+| Đổi tên | `Trạng thái` → **`Tình trạng gửi`** (giữ nguyên nghĩa cũ; nay đứng cạnh `Tình trạng xử lý` nên phải gọi rõ tên) |
+| Tái dùng | `Người chốt` → `Lỗi gần nhất` (di sản cửa duyệt, 0/6 record có dữ liệu). Đổi tên **giữ nguyên field_id** nên view/filter cũ không gãy — luôn ưu tiên hơn xoá |
+| Xoá | `Chốt lúc` — sau khi rename bị chặn nhịp, `ensure_fields` đã tạo `Dịch xong lúc` mới nên tên đích bị chiếm; cột cũ rỗng nên xoá |
+| Đồng bộ liên tục | `bitable.sync_jobs()` chạy mỗi vòng `run`: 1 lời gọi đọc cả bảng, chỉ ghi record có `Tình trạng xử lý` lệch với SQLite |
+
+`Tình trạng gửi` **để TRỐNG** với job chưa phát: `delivery_status` của job
+`queued` trả `chưa ai cấp quyền` — nói dối, nó chưa tới lượt.
+
+### 39.2 Ba cái bẫy đo được khi áp lên Base thật
+
+1. **`base_fields` bị cắt cụt ở 20 field.** base/v3 `.../fields` trả đúng 20 item
+   bất kể `page_size`, **không** `page_token`, **không** `has_more`; dấu hiệu duy
+   nhất là `data.total`=25 lệch với số item=20. Tin nó thì `ensure_fields` so
+   theo TÊN trên danh sách thiếu → kết luận cột đã có là "chưa có" → **tạo trùng
+   cột**, và code ghi vào cột rỗng trong khi người dùng nhìn cột cũ. Chỉ lộ ra
+   khi bảng vượt 20 cột — đúng lúc thêm 6 cột gương. Đã chuyển sang **bitable/v1**
+   (trả đủ 25, có phân trang thật) và tự dịch `type` số → tên.
+2. **`Path("")` là `Path(".")` và `.exists()` của nó là True.** Job chưa dịch có
+   `transcript_path` rỗng → nấc cuối của `_tracking_fields` trỏ vào thư mục hiện
+   hành → `read_bytes()` ném `PermissionError`, **chết cả lượt `base-sync`** chứ
+   không chỉ mất một ô. Không lộ trước đây vì Base chỉ nhận job đã phát (luôn có
+   file). Sửa: dùng `is_file()` ở cả ba nấc.
+3. **Lark chặn nhịp `OpenAPIUpdateField`** (`800004135`): đổi tên 3 cột liên tiếp
+   thì cột thứ 2, 3 bị chặn. Đã thêm thử lại giãn cách 0/3/8 giây.
+
+### 39.3 Nhìn Base giờ trả lời được
+
+"Cuộc này đang ở bước nào" (`Tình trạng xử lý`) · "hỏng vì cái gì" (`Lỗi gần
+nhất`) · "thử mấy lần rồi" (`Số lần thử`) · "mời bao nhiêu người, gửi được cho
+mấy người" (`Số người được mời` vs `Số người nhận`) · "phát hiện / dịch xong /
+gửi lúc nào". Cột hiện ở CUỐI bảng vì Bitable xếp theo thứ tự tạo — kéo lại trên
+UI được, code không phụ thuộc thứ tự.
+
+selftest: +15 (nhóm 41) → **PASS 336**.
+
+## 40. Bốn lỗi bắt được khi user tự thử bot (04/08/2026)
+
+Tất cả đều lộ ra vì user ngồi nhắn thật với bot, không phải từ đọc code. Ghi
+lại vì cùng một *hình dạng* lỗi sẽ còn quay lại.
+
+### 40.1 Agent truyền TÊN vào chỗ đòi `minute_token`
+
+User nhắn *"gửi cho mình transcript CĐS flow backlog"*. Agent gọi
+`send_transcript_file` với **tên cuộc họp** thay vì token → tool trả *"cần
+minute_token của một cuộc họp có thật"* → agent diễn giải chệch thành **"bản
+ghi này chưa được nhận diện là một biên bản có thể xuất file"**, trong khi Base
+báo đã dịch xong. User tưởng hệ thống hỏng.
+
+KHÔNG phải đặc quyền admin: đo lại với danh tính người thường (Chi, có đủ quyền
+với cuộc đó) ra đúng câu ấy. Hay gặp nhất ở **tin nhắn đầu tiên** của hội thoại,
+khi agent chưa gọi `list_meetings` nên chưa có token trong tay.
+
+`sendfile._resolve_token` nay nhận token HOẶC tên, ba nấc:
+1. trùng khít (sau chuẩn hoá) → 2. chuỗi liền → 3. **đủ chữ, không cần đúng thứ tự**.
+
+Nấc 3 thêm sau ca thứ hai cùng đêm: *"workforce AI 23-07"* trong khi tên là
+*"07-23 | Workforce AI Weekly Meeting Buổi 3"* — đảo ngày/tháng. Sau chuẩn hoá
+`07-23` tách thành hai chữ `07` `23`, nên so theo **tập chữ** bắt được kiểu viết
+ngày ngược, thứ không luật thứ tự nào bắt nổi. Chuẩn hoá bỏ **dấu câu** nhưng
+**giữ dấu tiếng Việt** — `CDS` không được khớp `CĐS`.
+
+Giải tên KHÔNG nới quyền: xong vẫn qua `qa._may_see`. Trùng nhiều cuộc thì thu
+hẹp theo quyền trước, còn nhiều thì hỏi lại — và **chỉ liệt kê cuộc chính người
+đó được xem**.
+
+⚠️ **Bài học lớn hơn**: bản vá đầu tiên chỉ *viết lại câu chữ* của `NO_MEETING`,
+dặn thẳng trong output *"ĐỪNG nói 'không xuất được file'"* — **agent vẫn nói y
+hệt**. Chỉ thị bằng lời trong kết quả tool KHÔNG điều khiển được agent một cách
+đáng tin. Thứ điều khiển được là **dữ liệu hành động được**: nay khi tra trượt,
+tool trả kèm danh sách cuộc gần đúng có sẵn `minute_token` để nó gọi lại.
+
+### 40.2 Ô `File transcript` trên Base rỗng — ba lỗi nối nhau
+
+Triệu chứng: hai cuộc vừa dịch xong, `.docx` nằm sẵn trên đĩa, Base báo "đã dịch
+xong" mà ô file trống.
+
+1. **Gương mới làm lọt ô đắt (§39 tự gây ra).** Từ khi Base nhận record của mọi
+   job, record được tạo lúc job còn `queued` — chưa có transcript. Đến bước
+   `held` thì `write_draft` **thoát sớm** vì record đã tồn tại ⇒ ô file, số giây
+   whisper, tốc độ không ai điền, chỉ `base-sync` chạy tay mới vá. `sync_jobs`
+   nay tự phát hiện "job có transcript mà record chưa có file" và bổ sung — chỉ
+   chạm phần đắt (tra danh bạ + upload) khi THIẾU thật.
+2. **Sai người upload.** `_user_token` ưu tiên *chủ bản ghi*, nhưng upload vào
+   Base cần quyền **ghi Base** — hai miền quyền khác nhau bị lẫn. Đo trên cùng
+   một file: token admin OK, token Chi và Thiện đều `1061004 forbidden` (Base
+   chỉ chia sẻ tường minh cho admin). Hậu quả: **mọi cuộc do người khác chủ trì
+   đều mất ô file vĩnh viễn**, mà record vẫn ghi thành công nên không có gì báo
+   động. `_upload_candidates` nay xếp **admin trước**, thử lần lượt tới khi được,
+   vẫn giữ tenant token làm nấc cuối.
+3. **File 0 byte.** Nấc chọn file chỉ hỏi "có tồn tại không", nên một bản `.txt`
+   rỗng của cuộc họp cũ được chọn rồi Lark trả `1061002 params error` — hỏng
+   vĩnh viễn, lượt đồng bộ nào cũng thử lại. Nay đòi `is_file()` **và** `size>0`.
+
+Đo thật sau khi sửa: cuộc `Workforce AI Kick Off buổi 1` dịch xong lúc 00:56:44,
+**00:56:57 ô file đã tự điền** (13 giây, không ai chạy tay).
+
+### 40.3 Đừng giục người ta test khi chưa chốt xong tiến trình
+
+Hai lần user thử đều rơi vào khe giữa hai lần restart, nên chạy trên code CŨ và
+mình suýt kết luận sai là bản vá không ăn. Bằng chứng nằm ở
+`%LOCALAPPDATA%\hermes\logs\mcp-stderr.log` — mỗi lần gateway khởi động lại có
+một dòng `starting MCP server 'meetings'` kèm giờ. **So giờ dòng đó với giờ tin
+nhắn trước khi kết luận bất cứ điều gì.** `agent.log` thì cho biết agent có thật
+sự gọi tool không (`tool mcp__meetings__… completed`) — nếu không có dòng nào,
+nó đang trả lời theo trí nhớ hội thoại chứ không phải hệ thống hỏng.
+
+selftest: +21 → **PASS 364**.

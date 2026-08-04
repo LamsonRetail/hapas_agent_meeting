@@ -1794,6 +1794,17 @@ def _main() -> int:
     _bt._tracking_fields(_oldmeta)
     check("cuộc họp cũ: Base vẫn đính đúng bản .txt, không tụt xuống .json",
           len(_got37) == 1 and _got37[0].suffix == ".txt", str(_got37))
+    # File 0 byte: Lark trả `1061002 params error`, mà nấc chọn cũ chỉ hỏi "có
+    # tồn tại không" -> ô file hỏng vĩnh viễn, lượt đồng bộ nào cũng thử rồi
+    # trượt (đo 04/08/2026, cuộc 'test' 27/07 có .txt rỗng).
+    _got37.clear()
+    _emptymeta = meta(minute_token="obsgEMPTYTXT00000001", title="Hop txt rong",
+                      start=1785000000.0)
+    pipeline.legacy_txt_path(_emptymeta).write_text("", encoding="utf-8")
+    jobstore.create(_emptymeta, status="delivered")
+    _bt._tracking_fields(_emptymeta)
+    check(".txt RỖNG (0 byte) -> KHÔNG upload, không lặp lỗi params mỗi vòng",
+          not any(p.suffix == ".txt" for p in _got37), str(_got37))
     lark_api.base_media_upload, lark_api.contact_batch = _keep37b
 
     # =================================================================
@@ -2002,6 +2013,72 @@ def _main() -> int:
     check("hỏi transcript chưa có -> trả lời 'ưu tiên dịch/tự gửi'",
           "ưu tiên" in msg_ask.lower() or "tự gửi" in msg_ask.lower())
 
+    # (f2) send_transcript nhận cả TÊN cuộc họp, không chỉ minute_token
+    #      (sửa 04/08/2026 sau ca thật): agent gọi tool với TÊN là chuyện
+    #      thường — nó vừa đọc tên từ câu người dùng. Tool cũ trả "cần
+    #      minute_token", agent diễn giải chệch thành "bản ghi chưa được nhận
+    #      diện là biên bản có thể xuất file", và người dùng CÓ TOÀN QUYỀN
+    #      tưởng hệ thống hỏng. Không liên quan admin: đo trên người thường.
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgNAME00000000001",
+                         title="CĐS: Flow Backlog"), status="held", priority=1)
+    _w = {"union_id": "on_X", "open_id": "ou_X", "name": "Nguoi Thuong"}
+    for _q, _label in ((" CĐS: Flow Backlog ", "đúng tên, thừa khoảng trắng"),
+                       ("cđs flow backlog", "thường hoá + THIẾU dấu hai chấm"),
+                       ("flow backlog", "một phần tên"),
+                       ("obsgNAME00000000001", "chính là minute_token")):
+        _tok, _err = sendfile._resolve_token(_w, _q)
+        check(f"tra tên -> token: {_label}",
+              _tok == "obsgNAME00000000001", f"{_q!r} -> {_tok or _err[:40]}")
+    check("tên KHÔNG có thật -> báo KHÔNG TRA RA, và cấm agent diễn giải thành "
+          "'không xuất được file'",
+          sendfile._resolve_token(_w, "cuộc họp không tồn tại")[0] == ""
+          and "KHÔNG TRA RA" in sendfile.NO_MEETING
+          and "ĐỪNG nói" in sendfile.NO_MEETING)
+    check("giữ dấu tiếng Việt khi so ('CDS' KHÔNG khớp 'CĐS')",
+          sendfile._resolve_token(_w, "CDS flow backlog")[0] == "")
+
+    # (f3) ĐỦ CHỮ, sai thứ tự vẫn phải ra (ca thật thứ hai 04/08/2026): người
+    #      dùng gõ 'workforce AI 23-07' trong khi tên là '07-23 | Workforce AI
+    #      Weekly Meeting Buổi 3' — đảo ngày/tháng + thiếu đuôi.
+    jobstore.create(meta(minute_token="obsgWORD00000000001",
+                         title="07-23 | Workforce AI Weekly Meeting Buổi 3"),
+                    status="held", priority=1)
+    db.note_viewer("obsgWORD00000000001", "ou_X", "on_X", "Nguoi Thuong")
+    for _q in ("workforce AI 23-07", "buổi 3 workforce", "23-07 workforce"):
+        check(f"đủ chữ sai thứ tự vẫn tra ra: {_q!r}",
+              sendfile._resolve_token(_w, _q)[0] == "obsgWORD00000000001",
+              str(sendfile._resolve_token(_w, _q)))
+    check("thiếu chữ thì KHÔNG khớp bừa ('workforce buổi 9')",
+          sendfile._resolve_token(_w, "workforce buổi 9")[0] == "")
+
+    # (f4) Tra trượt -> kèm DANH SÁCH gần đúng có minute_token. Chỉ thị bằng
+    #      lời không điều khiển được agent (đã đo: dặn 'ĐỪNG nói không xuất được
+    #      file' mà nó vẫn nói y hệt) — dữ liệu hành động được thì có.
+    _, _hint = sendfile._resolve_token(_w, "workforce buổi 9")
+    check("tra trượt -> gợi ý kèm minute_token để agent gọi lại",
+          "obsgWORD00000000001" in _hint and "minute_token" in _hint, _hint[:100])
+    #      ...và gợi ý KHÔNG được lộ cuộc của người khác.
+    jobstore.create(meta(minute_token="obsgWORD00000000002",
+                         title="Workforce AI Kick Off buổi 1"),
+                    status="held", priority=1)      # KHÔNG note_viewer cho on_X
+    _, _hint2 = sendfile._resolve_token(_w, "workforce buổi 9")
+    check("gợi ý CHỈ nêu cuộc người hỏi được xem (không lộ cuộc người khác)",
+          "obsgWORD00000000002" not in _hint2, _hint2[:120])
+    # Tra tên KHÔNG được nới quyền: giải xong vẫn phải qua `qa._may_see`.
+    _msg_name = sendfile.send_transcript(_w, "cđs flow backlog")
+    check("tra được tên nhưng KHÔNG dự -> vẫn chặn ở cửa quyền như cũ",
+          "không có trong danh sách người dự" in _msg_name, _msg_name[:80])
+    # Trùng tên: chỉ nêu cuộc mà chính người đó được xem, và đòi minute_token.
+    jobstore.create(meta(minute_token="obsgNAME00000000002",
+                         title="CĐS: Flow Backlog"), status="held", priority=1)
+    for _t in ("obsgNAME00000000001", "obsgNAME00000000002"):
+        db.note_viewer(_t, "ou_X", "on_X", "Nguoi Thuong")
+    _tok2, _err2 = sendfile._resolve_token(_w, "cđs flow backlog")
+    check("hai cuộc trùng tên -> hỏi lại kèm minute_token, không đoán bừa",
+          _tok2 == "" and "minute_token" in _err2 and "obsgNAME00000000001" in _err2,
+          (_err2 or "")[:90])
+
     # (g) held mà ghi Base HỎNG lần đầu -> `retry_missing_records` PHẢI vá
     #     (sửa 03/08/2026): trước đó retry chỉ quét 'delivered', bỏ sót held
     #     vĩnh viễn -> cuộc mất trong list/search Base dù transcript nằm sẵn.
@@ -2046,6 +2123,176 @@ def _main() -> int:
           _bit.ST_HELD in _bit.STATUS_OPTIONS)
     check("ST_HELD KHÔNG lộ 'Base'/'held' thô cho người dùng",
           "Base" not in _bit.ST_HELD and "held" not in _bit.ST_HELD)
+
+    # =================================================================
+    part("41. Base là GƯƠNG của bảng jobs (quản trị trên Base, 03/08/2026)")
+    # =================================================================
+    # (a) MỌI status của jobs phải có nhãn đọc được — thiếu một cái là ô select
+    #     rỗng trên Base và người vận hành không biết cuộc đó đang ở đâu.
+    _statuses = {"detected", "queued", "transcribing", "recapping", "held",
+                 "delivered", "failed", "discarded", "awaiting_approval",
+                 "owner_only", "expired"}
+    check("mọi jobs.status đều có nhãn tiếng Việt trên Base",
+          _statuses <= set(_bit.JOB_STATUS_LABEL),
+          str(_statuses - set(_bit.JOB_STATUS_LABEL)))
+    check("nhãn KHÔNG lộ chữ máy ('held'/'queued') cho người đọc Base",
+          not any(k in v for k in ("held", "queued", "discarded")
+                  for v in _bit.JOB_STATUS_LABEL.values()))
+    check("JOB_STATUS_OPTIONS khử trùng (Base không nhận option lặp)",
+          len(_bit.JOB_STATUS_OPTIONS) == len(set(_bit.JOB_STATUS_OPTIONS)))
+    check("cột gương nằm trong SCHEMA (base-init tạo bảng mới cũng có)",
+          {_bit.F_JOB_STATUS, _bit.F_ERROR, _bit.F_ATTEMPTS, _bit.F_INVITEES,
+           _bit.F_DETECTED, _bit.F_TRANSCRIBED, _bit.F_DELIVERED}
+          <= {s["name"] for s in _bit.SCHEMA})
+
+    # (b) _job_fields soi ĐÚNG một dòng jobs
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgMIRROR00000001"),
+                    status="failed", priority=1)
+    with db.tx() as _c:
+        _c.execute("UPDATE jobs SET attempts=3, error='2091005 thieu quyen', "
+                   "invitee_count=7, transcribed_at=1785000000000 "
+                   "WHERE minute_token='obsgMIRROR00000001'")
+    _jf = _bit._job_fields(jobstore.get("obsgMIRROR00000001"))
+    check("gương: status -> nhãn 'HỎNG'",
+          _jf[_bit.F_JOB_STATUS] == _bit.JOB_STATUS_LABEL["failed"], str(_jf))
+    check("gương: mang theo lỗi + số lần thử + số người mời",
+          _jf[_bit.F_ERROR].startswith("2091005") and _jf[_bit.F_ATTEMPTS] == 3
+          and _jf[_bit.F_INVITEES] == 7, str(_jf))
+    check("gương: mốc thời gian là epoch ms (datetime của Base)",
+          _jf[_bit.F_TRANSCRIBED] == 1785000000000)
+    check("gương: mốc CHƯA có thì KHÔNG ghi ô (không đổ 1970)",
+          _bit.F_DELIVERED not in _jf and _bit.F_DETECTED in _jf)
+
+    # (c) hết lỗi thì ô lỗi phải bị XOÁ, không giữ chữ cũ
+    with db.tx() as _c:
+        _c.execute("UPDATE jobs SET error=NULL, status='held' "
+                   "WHERE minute_token='obsgMIRROR00000001'")
+    _jf2 = _bit._job_fields(jobstore.get("obsgMIRROR00000001"))
+    check("chạy lại thành công -> ô 'Lỗi gần nhất' về RỖNG (không nói dối)",
+          _jf2[_bit.F_ERROR] == "", str(_jf2))
+
+    # (d) job CHƯA phát thì KHÔNG có record record nào chưa tới lượt lại bị gán
+    #     'chưa ai cấp quyền' — đó là lý do cột `Tình trạng gửi` để trống.
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgMIRRORQ0000001"),
+                    status="queued", priority=1)
+    _created: list[dict] = []
+    keepEN2, keepRC = _bit.enabled, _bit.lark_api.base_record_create
+    _bit.enabled = lambda: True
+    _bit._fields_checked = True                  # khỏi gọi ensure_fields ra mạng
+    _bit.lark_api.base_record_create = lambda a, t, f: (_created.append(f), "rec")[1]
+    keepFind = _bit.lark_api.base_record_find
+    _bit.lark_api.base_record_find = lambda a, t, f, v: ""
+    keepTF = _bit._tracking_fields
+    _bit._tracking_fields = lambda m, **k: {}
+    _bit.write_draft(jobstore.meta_from_json(
+        jobstore.get("obsgMIRRORQ0000001")["meta_json"]), Recap(summary=""), 0)
+    _bit.enabled, _bit.lark_api.base_record_create = keepEN2, keepRC
+    _bit.lark_api.base_record_find, _bit._tracking_fields = keepFind, keepTF
+    check("job `queued` LÊN được Base (trước đây mất tăm)", len(_created) == 1)
+    check("job chưa phát -> cột 'Tình trạng gửi' để TRỐNG, không 'chưa ai cấp quyền'",
+          _bit.F_STATUS not in _created[0], str(_created[0].keys()))
+    check("job `queued` vẫn có cột 'Tình trạng xử lý' = đang chờ dịch",
+          _created[0].get(_bit.F_JOB_STATUS) == _bit.JOB_STATUS_LABEL["queued"])
+
+    # (e) retry_missing_records quét MỌI status, không chỉ delivered/held
+    wipe_jobs()
+    for _st in ("queued", "failed", "discarded", "held"):
+        jobstore.create(meta(minute_token=f"obsgALL{_st[:4].upper()}0000001"),
+                        status=_st, priority=1)
+    _seen: list[str] = []
+    keepEN3, keepWD4 = _bit.enabled, _bit.write_draft
+    _bit.enabled = lambda: True
+    _bit.write_draft = lambda m, r, n: (_seen.append(m.minute_token), "rec")[1]
+    _bit.retry_missing_records()
+    _bit.enabled, _bit.write_draft = keepEN3, keepWD4
+    check("Base nhận cả job queued/failed/discarded (không chỉ đã phát)",
+          len(_seen) == 4, f"{len(_seen)}: {_seen}")
+
+    # (f) cột cũ được TÁI DÙNG chứ không xoá — đổi tên giữ nguyên field_id
+    check("bảng đổi tên: 'Người chốt' -> 'Lỗi gần nhất', 'Chốt lúc' -> 'Dịch xong lúc'",
+          ("Người chốt", _bit.F_ERROR, "text") in _bit._RENAMES
+          and ("Chốt lúc", _bit.F_TRANSCRIBED, "datetime") in _bit._RENAMES)
+    check("'Trạng thái' đổi tên thành 'Tình trạng gửi' (tách khỏi tình trạng xử lý)",
+          _bit.F_STATUS == "Tình trạng gửi"
+          and ("Trạng thái", _bit.F_STATUS, "select") in _bit._RENAMES)
+
+    # (g) phép so quyết định "có ghi lại record không". Chỉ so trạng thái là
+    #     KHÔNG đủ: job thử lại đứng yên ở `queued` mà attempts/lỗi đổi mỗi
+    #     vòng — đúng lúc người vận hành cần nhìn Base thì nó lại đứng im.
+    _rec = {_bit.F_JOB_STATUS: "đang chờ dịch", _bit.F_ERROR: "",
+            _bit.F_ATTEMPTS: 1, _bit.F_INVITEES: 4}
+    check("không đổi gì -> KHÔNG ghi lại (khỏi đốt lời gọi mỗi 5 phút)",
+          not _bit._needs_push(_rec, dict(_rec)))
+    check("số lần thử tăng (trạng thái giữ nguyên) -> PHẢI ghi lại",
+          _bit._needs_push(_rec, dict(_rec, **{_bit.F_ATTEMPTS: 2})))
+    check("lỗi mới (trạng thái giữ nguyên) -> PHẢI ghi lại",
+          _bit._needs_push(_rec, dict(_rec, **{_bit.F_ERROR: "2091005"})))
+    check("trạng thái đổi -> PHẢI ghi lại",
+          _bit._needs_push(_rec, dict(_rec, **{_bit.F_JOB_STATUS: "đã gửi"})))
+    check("số 1 và 1.0 KHÔNG coi là lệch (Base trả float)",
+          not _bit._needs_push(_rec, dict(_rec, **{_bit.F_ATTEMPTS: 1.0})))
+    check("None trên Base vs '' muốn ghi -> KHÔNG lệch (khỏi ghi vô ích)",
+          not _bit._needs_push(dict(_rec, **{_bit.F_ERROR: None}), dict(_rec)))
+    check("mốc thời gian KHÔNG nằm trong phép so (Base trả chuỗi, ta gửi epoch)",
+          _bit.F_DETECTED not in _bit._DIFF_FIELDS
+          and _bit.F_TRANSCRIBED not in _bit._DIFF_FIELDS)
+
+    # (h) record tạo lúc job còn `queued` -> chưa có transcript. Khi dịch xong,
+    #     `write_draft` thoát sớm (record đã có) nên ô FILE không ai điền. Vòng
+    #     đồng bộ PHẢI tự vá, nếu không ô 'File transcript' rỗng vĩnh viễn —
+    #     đã gặp thật 04/08/2026 với hai cuộc vừa dịch xong.
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgFILE00000000001"),
+                    status="held", priority=1, )
+    with db.tx() as _c:
+        _c.execute("UPDATE jobs SET transcript_path='X:\\co\\that.json', "
+                   "whisper_seconds=12.0, audio_seconds=60.0, "
+                   "bitable_record_id='recFILE' WHERE minute_token=?",
+                   ("obsgFILE00000000001",))
+    _pushed: list[dict] = []
+    keepEN4 = _bit.enabled
+    keepRA, keepRU = _bit.lark_api.base_records_all, _bit.lark_api.base_record_update
+    keepTF2 = _bit._tracking_fields
+    _bit.enabled = lambda: True
+    # Record trên Base: trạng thái ĐÃ đúng, nhưng ô file + số giây whisper TRỐNG
+    _bit.lark_api.base_records_all = lambda a, t: [{
+        "_record_id": "recFILE", _bit.F_TOKEN: "obsgFILE00000000001",
+        _bit.F_JOB_STATUS: _bit.JOB_STATUS_LABEL["held"], _bit.F_ERROR: "",
+        _bit.F_ATTEMPTS: 0, _bit.F_INVITEES: 0}]
+    _bit.lark_api.base_record_update = lambda a, t, r, f: _pushed.append(f)
+    _bit._tracking_fields = lambda m, **k: {
+        _bit.F_TRANSCRIPT: [{"file_token": "ft"}], _bit.F_WHISPER_SEC: 12.0,
+        "_skip_file": k.get("skip_file")}
+    _bit.sync_jobs()
+    _bit.enabled, _bit._tracking_fields = keepEN4, keepTF2
+    _bit.lark_api.base_records_all, _bit.lark_api.base_record_update = keepRA, keepRU
+    check("trạng thái đã khớp nhưng THIẾU file -> vẫn ghi lại để vá ô file",
+          len(_pushed) == 1 and _bit.F_TRANSCRIPT in _pushed[0],
+          str(_pushed)[:120])
+    check("ô đã có file thì KHÔNG upload lại (khỏi sinh file_token rác)",
+          _pushed and _pushed[0].get("_skip_file") is False)
+
+    # (i) NGƯỜI upload attachment: admin (chủ Base) phải đứng TRƯỚC chủ bản ghi.
+    #     Hai miền quyền khác nhau — tải bản ghi từ Lark cần chủ bản ghi, ghi
+    #     file vào Base cần chủ Base. Đo thật 04/08: token Chi/Thiện đều
+    #     `1061004 forbidden`, chỉ admin upload được.
+    _adm_uid = config.QA_ADMIN_UNION_IDS[0] if config.QA_ADMIN_UNION_IDS else ""
+    add_user("ou_ADMIN_UP", _adm_uid or "on_admin_up", "Admin Base")
+    add_user("ou_CHUBANGHI", "on_chu_ban_ghi", "Chu Ban Ghi")
+    _mm_up = meta(minute_token="obsgUPLOAD000000001", owner_open_id="ou_CHUBANGHI",
+                  attendees=[Attendee(open_id="ou_CHUBANGHI",
+                                      union_id="on_chu_ban_ghi")])
+    _order = _bit._upload_candidates(_mm_up)
+    check("có ứng viên upload (không rỗng khi đã có người enroll)", bool(_order))
+    check("admin (chủ Base) đứng ĐẦU danh sách upload, TRƯỚC chủ bản ghi",
+          bool(_adm_uid) and _order and _order[0] == "ou_ADMIN_UP",
+          f"{_order[:3]}")
+    check("chủ bản ghi vẫn CÒN trong danh sách (dự phòng khi admin hỏng token)",
+          "ou_CHUBANGHI" in _order)
+    check("danh sách khử trùng (không thử cùng một người hai lần)",
+          len(_order) == len(set(_order)))
 
     # =================================================================
     part("40. Glossary tự cải thiện (part B): ứng viên, duyệt, tiêm prompt")
@@ -2111,6 +2358,104 @@ def _main() -> int:
           "Vercel" in glossary.digest_body(2) and "duyệt" in glossary.digest_body(2))
     check("digest body RỖNG khi không có gì chờ (>= min_count)",
           glossary.digest_body(5) == "")
+
+    # (h) CHUỖI nhiều từ cách dấu phẩy phải tách — chính `pending()` dặn người
+    # dùng nhắn vậy. Trước 03/08/2026 chỉ `mcp_server._terms_arg` tách, nên gọi
+    # thẳng `approve(who, "A, B")` im lặng báo "không thấy" dù cả hai đang chờ.
+    with db.tx() as _c:
+        _c.execute("DELETE FROM glossary_candidates")
+    for _t in ("Hermes", "Bitable"):
+        db.glossary_add_candidate(_t, "Cuộc A")
+    _msg_cs = glossary.approve(_admin, "Hermes, Bitable")
+    check("approve nhận CHUỖI 'A, B' -> tách dấu phẩy, duyệt cả hai",
+          "Hermes" in _msg_cs and "Bitable" in _msg_cs and "Không thấy" not in _msg_cs,
+          _msg_cs)
+    check("cả hai từ vào được danh sách đã duyệt",
+          set(db.glossary_approved_terms()) == {"Hermes", "Bitable"})
+
+    # (i) duyệt lại từ ĐÃ BỎ: vẫn cho (admin là người quyết) nhưng phải NÓI RA —
+    # `pending()` không còn liệt kê từ rejected nên admin đang gõ một từ họ không
+    # nhìn thấy, thường là quên mình từng bỏ.
+    db.glossary_add_candidate("Vercel", "Cuộc A")
+    glossary.reject(_admin, "Vercel")
+    _msg_rev = glossary.approve(_admin, "Vercel")
+    check("duyệt lại từ đã BỎ -> có cảnh báo 'trước đó đã bị BỎ'",
+          "đã bị BỎ" in _msg_rev and "Đã duyệt: Vercel" in _msg_rev, _msg_rev)
+
+    # (j) ngân sách prompt: cuộc ĐÔNG người thì THUẬT NGỮ bị cắt bớt Ở ĐÂY, và
+    # phải cắt theo TỪ NGUYÊN VẸN. Server gộp `vi-prompt.txt` + hint rồi giữ 180
+    # từ CUỐI, nên hint quá dài = khối "Thuật ngữ" bị chặt giữa chừng trong im
+    # lặng (cuộc ~40 người là mất sạch part B mà không ai biết).
+    _many_names = [f"Nguoi Du So {i}" for i in range(40)]
+    _many_terms = [f"ThuatNgu{i}" for i in range(40)]
+    _hint_big = transcribe._prompt_hint("Hop toan cong ty", _many_names, _many_terms)
+    check("cuộc RẤT đông (40 người, tên đã kín ngân sách) -> BỎ HẲN thuật ngữ",
+          "Thuật ngữ" not in _hint_big, f"{len(_hint_big.split())} từ")
+    check("cuộc đông người: GIỮ ĐỦ tên người dự (part A là phần chắc)",
+          all(n in _hint_big for n in _many_names))
+    # Cuộc VỪA: thuật ngữ phải bị cắt BỚT cho vừa ngân sách, không bị chặt giữa từ.
+    _hint_mid = transcribe._prompt_hint("Hop phong", _many_names[:24], _many_terms)
+    check("hint cuộc vừa không vượt ngân sách từ (server khỏi phải chặt)",
+          len(_hint_mid.split()) <= transcribe._HINT_WORD_BUDGET,
+          f"{len(_hint_mid.split())} từ")
+    _kept = ([] if "Thuật ngữ: " not in _hint_mid else
+             _hint_mid.split("Thuật ngữ: ", 1)[1].split(".")[0].split(", "))
+    check("cuộc vừa: thuật ngữ bị cắt BỚT, không đứt giữa từ",
+          0 < len(_kept) < len(_many_terms) and all(k in _many_terms for k in _kept),
+          f"giữ {len(_kept)}/{len(_many_terms)}: {_kept[-3:]}")
+    check("cuộc vừa: vẫn GIỮ ĐỦ tên người dự",
+          all(n in _hint_mid for n in _many_names[:24]))
+    _hint_small = transcribe._prompt_hint("Hop nhom", ["An", "Binh"],
+                                          ["MCP", "Anthropic"])
+    check("cuộc ít người: giữ NGUYÊN cả thuật ngữ lẫn tên",
+          "Thuật ngữ: MCP, Anthropic." in _hint_small
+          and "An, Binh" in _hint_small, _hint_small)
+
+    # (k) trích thuật ngữ CHỈ chạy khi VỪA phiên âm xong. Job đã có transcript mà
+    # chạy lại (enqueue tay / phát hỏng nên về `queued` / tiến trình chết giữa
+    # chừng) đi qua `_reuse` — trước 03/08/2026 nó trích + ĐẾM lại cho CÙNG một
+    # cuộc, đủ để một từ nghe nhầm MỘT lần leo lên digest như "gặp 2 cuộc", tức
+    # phá đúng bộ lọc nhiễu duy nhất của part B.
+    with db.tx() as _c:
+        _c.execute("DELETE FROM glossary_candidates")
+    _eg_calls: list[int] = []
+    keepEG = summarize.extract_glossary
+    summarize.extract_glossary = lambda text, title="": (
+        _eg_calls.append(1), ["ZzUngVien"])[1]
+    keepP2 = pipeline.run_transcription
+    keepWD2 = _bit.write_draft
+    _bit.write_draft = lambda m, r, n: "rec"
+
+    import json as _json2
+
+    def _fake_ok2(m):
+        t_ = Transcript(minute_token=m.minute_token, lang="vi", duration=60.0,
+                        engine="fake", segments=[Segment(0.0, 1.0, "xin chao")])
+        p = config.TRANSCRIPT_DIR / f"fake-{m.minute_token}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_json2.dumps(t_.to_json()), encoding="utf-8")
+        jobstore.set_status(m.minute_token, "recapping", transcript_path=str(p),
+                            audio_seconds=60.0, whisper_seconds=1.0)
+        return t_, p
+    pipeline.run_transcription = _fake_ok2
+
+    wipe_jobs()
+    jobstore.create(meta(minute_token="obsgGLOSS0000000001"), priority=1)
+    orchestrator.process_queue(dry_run=False)
+    _c1 = db.glossary_get("ZzUngVien")
+    check("phiên âm xong -> trích ứng viên (count 1)",
+          bool(_c1) and _c1["count"] == 1, str(_c1))
+    # Chạy LẠI đúng job đó: có transcript_path nên `_reuse` nạp lại, không dịch lại.
+    jobstore.set_status("obsgGLOSS0000000001", "queued")
+    orchestrator.process_queue(dry_run=False)
+    _c2 = db.glossary_get("ZzUngVien")
+    check("chạy LẠI cùng cuộc (đường _reuse) -> KHÔNG trích lại",
+          len(_eg_calls) == 1, f"{len(_eg_calls)} lần gọi")
+    check("chạy LẠI cùng cuộc -> count GIỮ NGUYÊN 1 (không tự lên digest)",
+          _c2 and _c2["count"] == 1, str(_c2))
+    summarize.extract_glossary = keepEG
+    pipeline.run_transcription = keepP2
+    _bit.write_draft = keepWD2
 
     # =================================================================
     part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")
