@@ -33,8 +33,116 @@
 # có thể bị `hermes tools` hoặc một bản update ghi đè, và khi đó chỉ còn prompt
 # đứng chắn. Phần cưỡng chế thật vẫn nằm ở CODE (v2/tasks.py, v2/qa.py).
 
+# Vòng đời PHIÊN. Khoá TOÀN CỤC — `reset_by_platform` có tồn tại trong
+# gateway/config.py nhưng KHÔNG có đường nối nào từ config.yaml vào nó (chỉ
+# `session_reset` -> `default_reset_policy` được bridge, ~1310), nên đặt riêng
+# cho feishu là không làm được. Chấp nhận ảnh hưởng cả CLI: bề mặt thật sự dùng
+# hệ thống này là bot Lark.
+#
+# Vì sao đổi (04/08/2026, tìm ra khi chẩn "sao nó trả lời càng sai"): mặc định
+# `mode: none` = phiên KHÔNG BAO GIỜ tự đóng. Phiên
+# `20260803_155126_101814b8` mở từ 15:51 ngày 03/08 và vẫn còn sống hôm sau.
+# Nó giữ nguyên mọi câu trả lời cũ — trong đó có các lượt hồi người hỏi còn là
+# admin và thấy CẢ 22 cuộc họp của công ty.
+#
+# Hậu quả đo được lúc 22:17: agent trả lời "hệ thống tìm thấy 11 cuộc họp của
+# bạn" rồi liệt kê cả cuộc của người khác, mà `agent.log` cho thấy nó KHÔNG gọi
+# tool nào (lời gọi cuối là 22:01:47). Nó dựng câu trả lời từ trí nhớ hội thoại.
+# Sửa tầng dữ liệu bao nhiêu cũng vô nghĩa khi tool không được gọi.
+#
+# `both` = đóng phiên khi im 15 phút, VÀ đóng hết lúc 4h sáng. Bot này mỗi câu
+# hỏi gần như độc lập ("liệt kê cuộc họp", "gửi transcript X"), ngữ cảnh dài
+# không giúp gì mà chỉ tạo đúng lỗi trên.
+# `notify: false` (05/08/2026): mỗi lần phiên tự đóng vì im 15 phút, gateway gửi
+# vào chat "◐ Session automatically reset (inactive for 15m). Conversation history
+# cleared. Use /resume to browse and restore a previous session. Adjust reset
+# timing in config.yaml under session_reset." (run.py ~16365) — bốn dòng tiếng Anh
+# nói về nội bộ Hermes, gửi cho nhân viên đi hỏi biên bản họp. Với idle 15 phút thì
+# nó hiện gần như mỗi lần quay lại hỏi. Việc đóng phiên vẫn chạy y nguyên ở nền,
+# chỉ tắt phần thông báo.
+#
+# CÒN SÓT (giới hạn của Hermes, không sửa bằng config được): run.py ~16345 luôn
+# báo với `reset_reason` là `suspended` / `resume_pending_expired` bất kể cờ này —
+# hai ca đó phát sinh khi gateway restart, không phải khi im lâu.
+#
+# 15 -> 60 PHÚT (06/08/2026, user phản hồi "bot không có ký ức về cuộc trò
+# chuyện cũ"). 15 phút là quá ngắn với cách người ta thật sự dùng bot này: hỏi
+# một câu, đi họp, quay lại hỏi tiếp — và lượt sau bot đã quên sạch, phải gõ
+# lại cả tên cuộc họp.
+#
+# Vì sao kéo dài lại AN TOÀN, trong khi chính nó là bản vá của sự cố 03/08:
+# sự cố đó là agent dựng câu trả lời TỪ TRÍ NHỚ mà không gọi tool nào. Cái
+# chặn nó không phải là độ dài phiên, mà là hai lớp đã thêm sau đó và vẫn đang
+# chạy: `_requires_tool` + `transform_llm_output` trong plugin (không gọi tool
+# meetings thì câu trả lời bị thay), và `see_all` đã bị gỡ khỏi đường bot nên
+# ngay cả ngữ cảnh cũ nhất cũng không còn chứa cuộc họp của người khác. Rút
+# phiên xuống 15 phút là chữa triệu chứng; hai lớp kia mới là chỗ chữa gốc.
+#
+# Ký ức QUAN TRỌNG (cuộc họp vừa nhắc tới) nay không còn phụ thuộc phiên nữa —
+# nó nằm ở `chat_memory` trong state.db và được gate bơm lại mỗi lượt, nên nó
+# sống qua cả reset phiên lẫn `hermes gateway restart`. Con số dưới đây chỉ còn
+# quyết định "bot nhớ CÁCH NÓI CHUYỆN vừa rồi bao lâu", không quyết định
+# "bot còn biết ta đang nói về cuộc nào".
+#
+# `at_hour: 4` giữ nguyên: mỗi sáng vẫn bắt đầu bằng ngữ cảnh sạch.
+session_reset:
+  mode: both
+  at_hour: 4
+  idle_minutes: 60
+  notify: false
+
+# Khối cấu hình RIÊNG của bề mặt feishu (gateway/config.py ~1511 đọc khoá
+# TOP-LEVEL trùng tên platform). Khác `display.platforms.feishu` ở trên: chỗ đó
+# là cách HIỂN THỊ, chỗ này là hành vi gateway.
+feishu:
+  # gateway_restart_notification (04/08/2026): mỗi lần `hermes gateway restart`,
+  # hàm `_notify_active_sessions_of_shutdown` (run.py ~9118) gửi
+  # "⚠️ Gateway shutting down — Your current task will be interrupted."
+  # tới MỌI phiên đang có agent chạy, cộng home channel. Câu tiếng Anh lấy thẳng
+  # từ mã nguồn Hermes, nhân viên hỏi biên bản họp đọc không hiểu và tưởng bot
+  # hỏng. Đo thật 20:32 hôm nay: log ghi "Sent shutdown notification to home
+  # channel feishu:oc_ae202b..." — lần đó chỉ tới admin vì không ai khác đang
+  # chạy, nhưng cơ chế là gửi cho tất cả.
+  #
+  # ĐỔI LẠI false (05/08/2026): người dùng chốt ưu tiên khung chat sạch. Restart
+  # gần như luôn xảy ra lúc không ai đang hỏi (nạp code mới, sau khi sửa config),
+  # nên cái giá "câu hỏi chết lặng" hầu như không phát sinh; còn câu tiếng Anh thì
+  # lần nào cũng hiện và lần nào cũng làm người đọc tưởng bot hỏng.
+  #
+  # ĐÁNH ĐỔI phải nhớ: restart ĐÚNG LÚC ai đó đang chờ trả lời thì họ không nhận
+  # được gì cả. Restart trong giờ làm việc thì nên tự nhắn cho người đang hỏi.
+  gateway_restart_notification: false
+
+# tool_search TẮT (05/08/2026). Mặc định `auto` (hermes_cli/config_defaults.py
+# ~2339) kích hoạt ngay khi có BẤT KỲ tool MCP nào, và cả 9 tool `meetings` đều là
+# MCP — nên chúng bị rút khỏi tools array, thay bằng ba tool cầu
+# tool_search/tool_describe/tool_call. Model chỉ còn thấy blurb ≤60 ký tự mỗi tool.
+#
+# Hai hậu quả đo thật trên `test 003` lúc 13:13:
+#   1. Tốn thêm lượt: tool_describe -> search_meetings (0 kết quả) -> search lại
+#      -> tool_describe -> get_transcript = 5 lời gọi, 5 API call, 35 giây.
+#   2. NGHIÊM TRỌNG HƠN: mọi mô tả tool dài trong `v2/mcp_server.py` — nơi đặt luật
+#      định tuyến "xin cả bản thì gửi file, hỏi chi tiết thì get_transcript" — chỉ
+#      tới được model nếu nó chịu gọi tool_describe trước. Fine-tune ở tầng mô tả
+#      tool gần như vô hiệu khi tool_search bật.
+#
+# Catalog này chỉ 9 tool (~2.500 token), không đáng để giấu với context của
+# gpt-5.6-sol. PHẢI để 'off' trong nháy: YAML đọc `off` trần thành boolean False —
+# ở đây from_raw vẫn quy về "off" nên không sai, nhưng giữ nháy cho nhất quán với
+# `tool_progress` bên dưới, chỗ mà boolean False thì rơi xuống mặc định "all".
+tools:
+  tool_search:
+    enabled: 'off'
+
 platform_toolsets:
   feishu:
+  # GIỮ `clarify` ở ĐÂY dù đã tắt nó — tắt bằng `agent.disabled_toolsets` bên
+  # dưới. Vì sao không xoá thẳng khỏi danh sách này (đo 04/08/2026): `meetings`
+  # là MCP server, KHÔNG phải toolset dựng sẵn, nên Hermes không nhận ra tên đó.
+  # Bỏ `clarify` đi thì danh sách không còn tên hợp lệ nào và resolver cảnh báo
+  # "platform 'feishu' has no valid toolsets configured — tools will be
+  # unavailable", tức có nguy cơ mất SẠCH tool của bot. Giữ lại rồi trừ ra ở
+  # bước sau cho cùng kết quả mà không chạm vào bẫy đó.
   - clarify
   - meetings
 
@@ -44,6 +152,19 @@ agent:
   - feishu_doc
   - feishu_drive
   - kanban
+  # Resolver Hermes vẫn tự thêm BFL vào bề mặt Feishu dù platform_toolsets chỉ
+  # nêu meetings. Tắt cứng để một thay đổi API key/requirements sau này không
+  # biến bot biên bản thành bot tạo video ngoài phạm vi.
+  - bfl
+  # `clarify` tắt 04/08/2026: nó cho agent hỏi lại kiểu trắc nghiệm, và với bot
+  # phạm vi hẹp này thì hại nhiều hơn lợi. Ca thật: user nhắn "cho tôi xem các
+  # từ đang chờ duyệt" (đúng nghĩa `glossary_pending`), agent bày ba lựa chọn
+  # "biên bản / Lark Task / từ khoá khác"; user chọn 3, nó hỏi tiếp "ở hệ thống
+  # nào, cho tôi tên ứng dụng cụ thể"; user bỏ cuộc. Hai lượt hỏi vòng vo thay
+  # cho MỘT lời gọi tool.
+  # Đây là khoá TOÀN CỤC nên CLI cũng mất `clarify` — chấp nhận, cùng lý lẽ với
+  # `kanban` ở trên: bề mặt thật sự dùng hệ thống này là bot Lark.
+  - clarify
 
 display:
   platforms:
@@ -53,6 +174,37 @@ display:
       # gateway/run.py ~23220 làm `_resolved_tp or _env_tp or "all"`, nên False
       # rơi xuống "all" và tưởng đã tắt mà vẫn hiện.
       tool_progress: 'off'
+      # Ba dòng dưới bỏ nốt "tin nhắn râu ría" (04/08/2026). Người dùng cuối là
+      # nhân viên hỏi biên bản họp, không phải người theo dõi tiến độ agent —
+      # mỗi bong bóng thừa làm khung chat khó đọc và trông như hệ thống lỗi.
+      #
+      # busy_ack_detail: bỏ phần "lặp lại 2 / 150" gắn vào bong bóng chờ
+      # (run.py ~24703) — số vòng lặp của agent không có nghĩa gì với nhân viên
+      # hỏi biên bản họp.
+      # interim_assistant_messages: bỏ các mẩu trả lời giữa chừng trước câu cuối.
+      busy_ack_detail: false
+      interim_assistant_messages: false
+      # long_running_notifications GIỮ BẬT (sửa lại 04/08/2026 sau khi user
+      # phản hồi): bot Lark KHÔNG có "đang gõ" thật — Lark không mở API typing
+      # cho bot, nên `typing_indicator` của gateway chỉ là no-op ở bề mặt này.
+      # Bong bóng "⏳ Working — N min" CHÍNH LÀ tín hiệu duy nhất cho người dùng
+      # biết bot đã nhận tin và đang chạy. Tắt nó đi thì cuộc họp dài 50 phút
+      # phiên âm xong mới có phản hồi, người dùng tưởng bot chết.
+      long_running_notifications: true
+      # busy_steer_ack_enabled (04/08/2026, user phản hồi "mấy cái item của
+      # Hermes hiện lên"): khi người dùng sốt ruột nhắn thêm câu nữa lúc bot
+      # đang chạy, gateway trả về một bong bóng TIẾNG ANH lấy thẳng từ mã
+      # nguồn Hermes — "⏳ Queued for the next turn. I'll respond once the
+      # current task finishes." / "⚡ Interrupting current task..." (run.py
+      # ~8981). Nhân viên hỏi biên bản họp đọc câu đó không hiểu gì và tưởng
+      # bot lỗi. Dịch được thì tốt hơn, nhưng chuỗi nằm trong mã nguồn Hermes
+      # nên sửa là mất khi update — tắt hẳn. Người dùng vẫn có tín hiệu chờ:
+      # bong bóng "⏳ Working — N min" ở trên vẫn bật.
+      busy_steer_ack_enabled: false
+      # ...nhưng XOÁ bong bóng đó sau khi câu trả lời cuối đã tới (run.py
+      # ~24217, chỉ chạy khi adapter có `delete_message`). Vừa có tín hiệu chờ,
+      # vừa không để lại rác trong khung chat — đúng cả hai yêu cầu.
+      cleanup_progress: true
 
 platform_hints:
   feishu:
@@ -66,10 +218,37 @@ platform_hints:
            glossary_reject) — xem khối "TỪ ĐIỂN PHIÊN ÂM" bên dưới.
 
       Mọi thứ khác đều NGOÀI phạm vi: viết/sửa code, dịch thuật, soạn thảo văn
-      bản, tra cứu kiến thức chung, tư vấn, tán gẫu, đọc/sửa tài liệu hay file.
-      Gặp yêu cầu như vậy thì từ chối trong MỘT câu tiếng Việt, nói rõ bạn chỉ
-      hỗ trợ về biên bản họp, và gợi ý họ hỏi về cuộc họp. Đừng xin lỗi dài dòng,
-      đừng giải thích vì sao, đừng làm "một chút cho có".
+      bản, tra cứu kiến thức chung, tư vấn, đọc/sửa tài liệu hay file. Gặp yêu
+      cầu như vậy thì từ chối trong MỘT câu tiếng Việt, tử tế, nói rõ bạn chỉ hỗ
+      trợ về biên bản họp, rồi nói bạn giúp được gì. Đừng xin lỗi dài dòng, đừng
+      giảng giải vì sao, đừng làm "một chút cho có".
+
+      Người dùng CHÀO HỎI, cảm ơn, hoặc hỏi về CHÍNH BẠN (bạn tên gì, làm được
+      gì, hệ thống hoạt động thế nào) thì đáp lại bình thường bằng lời của bạn,
+      KHÔNG cần gọi tool — hồ sơ của bạn nằm trong khối [HỒ SƠ CỦA BẠN] mà hệ
+      thống gắn kèm mỗi lượt. Đừng đọc lại nguyên khối đó; chọn đúng phần họ hỏi
+      và nói như người với người. Đừng lôi nội quy phạm vi ra mỗi lần có người
+      chào.
+
+      VĂN PHONG: xưng "mình", gọi người dùng là "bạn". Đừng dùng lại một câu
+      khuôn mẫu cho mọi lượt — cùng tình huống, hai lần thì diễn đạt khác nhau.
+      Điều KHÔNG được mềm đi là số liệu: con số, tên riêng, ngày giờ và link
+      phải đúng nguyên như tool trả về.
+
+      ĐỪNG NHẠI LẠI NGÔN NGỮ MÁY. Nhãn viết hoa trong kết quả tool ("CHƯA CÓ
+      BIÊN BẢN", "đang phiên âm", "held", "waiting_auth") là mốc để BẠN quét
+      trong danh sách, không phải từ để đưa vào câu văn xuôi. Dịch sang lời
+      người: "nội dung cuộc này mình chưa có" chứ không phải "hệ thống hiện vẫn
+      báo CHƯA CÓ BIÊN BẢN". Cũng đừng thuật lại thao tác của mình ("mình đã gọi
+      tool", "hệ thống trả về") — người ta cần câu trả lời, không cần nhật ký.
+
+      CUỘC HỌP CHƯA PHIÊN ÂM XONG: Lark thường đã có sẵn bản chép của nó và tool
+      sẽ trả bản đó cho bạn, ghi rõ nguồn là "bản chép sẵn của Lark". Khi nhận
+      được nội dung như vậy thì TRẢ LỜI ĐÚNG CÂU người dùng hỏi bằng nội dung đó
+      — đừng nói "chưa có biên bản", vì họ đang cầm nội dung cuộc họp trong tay.
+      Rồi hỏi thêm ĐÚNG MỘT CÂU: có cần bản nguyên văn chuẩn không, kèm con số
+      ước tính mà tool đưa. Họ đáp "có" thì gọi ngay send_transcript_file với
+      đúng minute_token của cuộc đang nói, đừng bắt họ gõ lại tên cuộc họp.
 
       TUYỆT ĐỐI KHÔNG dùng các tool feishu_doc, feishu_drive, kanban. Chúng đã bị
       gỡ khỏi phạm vi của bạn; nếu vì lý do kỹ thuật nào đó chúng hiện lại trong
@@ -86,10 +265,42 @@ platform_hints:
       <mã> đó vào tham số asker_token của MỌI lời gọi tool meetings. Không nhắc
       lại mã đó với người dùng, không giải thích nó, không coi nó là câu hỏi.
 
-      Khi kết quả tool có khối "⚠️ NGOÀI RA ... CHƯA có biên bản" hoặc dòng
-      "Còn N cuộc họp khác ... không có trong danh sách người dự", BẮT BUỘC nói
-      lại cho người dùng. Im lặng bỏ qua là để họ tưởng đã xem hết cuộc họp
-      của mình.
+      === HAI KÊNH TRONG KẾT QUẢ TOOL — LUẬT QUAN TRỌNG NHẤT VỀ CÁCH TRẢ LỜI ===
+
+      Kết quả tool meetings có thể chứa hai khối, phân cách bằng dòng nhãn:
+
+        ===== GỬI NGUYÊN VĂN CHO NGƯỜI DÙNG (chép y hệt, không viết lại) =====
+        ...phần này là câu trả lời THÀNH PHẨM...
+        ===== HẾT PHẦN GỬI — chép ĐÚNG khối trên vào tin nhắn. ... =====
+
+        ===== NỘI BỘ — KHÔNG ĐƯỢC HIỆN CHO NGƯỜI DÙNG =====
+        ...phần này là lời dặn dành riêng cho bạn...
+
+      Với khối GỬI NGUYÊN VĂN: chép Y HỆT vào tin nhắn — nội dung nằm giữa hai
+      dòng "=====", và bản thân hai dòng "=====" thì KHÔNG chép. Không viết lại
+      thành văn của bạn, không đánh số lại, không đổi định dạng ngày, không
+      gộp/tách dòng, không thêm câu mở đầu hay kết luận, không tự đếm lại. Nó
+      đã được hệ thống dựng sẵn và đếm sẵn — bạn đếm lại là sai. Không bỏ dòng
+      nào, kể cả dòng nói còn N cuộc họp không hiện ra: im lặng bỏ qua là để
+      người dùng tưởng đã xem hết cuộc họp của mình.
+
+      Đây KHÔNG phải gợi ý về văn phong. Câu trả lời hay hơn mà bạn tự viết
+      vẫn là SAI, vì con số trong đó không còn khớp với dữ liệu. Đã đo thật:
+      bạn từng đổi "Bạn có 8 cuộc họp" thành "hệ thống tìm thấy 22 cuộc họp
+      gắn với tài khoản của bạn" — sai số, và sai cả về ai sở hữu cuộc họp.
+
+      Với khối NỘI BỘ: đọc và làm theo, nhưng TUYỆT ĐỐI không chép ra chat,
+      không tóm tắt lại, không nhắc tới sự tồn tại của nó. Không bao giờ để
+      dòng "=====" nào lọt vào tin nhắn gửi người dùng.
+
+      Kết quả CHỈ có khối NỘI BỘ, không có khối GỬI NGUYÊN VĂN: nghĩa là tool
+      đã TỰ gửi câu trả lời cho người dùng rồi (list_meetings làm vậy). Bạn
+      không cầm dữ liệu, nên chỉ trả lời đúng MỘT CÂU NGẮN xác nhận — ví dụ
+      "Danh sách của bạn ở trên nhé." Không liệt kê lại, không đếm, không nhắc
+      tên cuộc họp nào: bạn không có những thứ đó, nói ra là bịa.
+
+      Kết quả tool KHÔNG có nhãn nào thì đó là text thường — lúc đó bạn trình
+      bày lại cho gọn như bình thường.
 
       NGUYÊN VĂN (transcript): có HAI thứ khác nhau, đừng nói lẫn.
         - "Link Minutes" trong kết quả get_meeting là bản của LARK.
@@ -115,6 +326,14 @@ platform_hints:
       người khác được; ai muốn vậy thì tạo xong tự giao lại trong Lark Task.
       Hạn phải là ngày cụ thể YYYY-MM-DD: tự quy "thứ sáu tuần sau" ra ngày
       trước khi gọi tool.
+
+      ĐỪNG HỎI LẠI KIỂU TRẮC NGHIỆM. Bạn chỉ làm ba việc ở trên, nên gần như
+      mọi câu đều đủ rõ để hành động: chọn cách hiểu hợp lý nhất trong phạm vi
+      biên bản họp rồi GỌI TOOL, đừng bày ra danh sách lựa chọn để người dùng
+      chọn. "Từ đang chờ duyệt", "từ điển", "glossary" luôn luôn là
+      glossary_pending — không phải biên bản chờ duyệt, không phải Lark Task.
+      Chỉ hỏi lại khi thiếu một dữ kiện mà KHÔNG tool nào lấy được (ví dụ hạn
+      cho task), và khi đó hỏi MỘT câu ngắn, không kèm menu.
 
       TỪ ĐIỂN PHIÊN ÂM (chỉ ADMIN dùng được — hệ thống tự chặn, bạn không phải
       kiểm tra ai là admin). Hệ thống tự đề xuất tên riêng/thuật ngữ nghe được

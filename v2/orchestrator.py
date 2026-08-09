@@ -25,12 +25,57 @@ import time
 from datetime import datetime, timezone
 
 from . import (alerts, backup, cards, config, db, jobstore, lark_api, meetings,
-               pipeline, summarize, tokenstore, transcribe)
+               pipeline, summarize, tokenstore, transcribe, whisper_supervisor)
 from .models import MeetingMeta
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _explicit_viewer(meta: MeetingMeta, open_id: str = "",
+                     union_id: str = "") -> bool:
+    """True khi metadata job tự chứng minh người này thuộc cuộc họp.
+
+    `minutes/search(participant_ids=...)` KHÔNG phải bằng chứng tham dự: đo thật
+    05/08/2026 cho thấy nó vẫn trả bản ghi được chia sẻ/đọc được của người khác.
+    Chỉ owner thật từ `minutes_get.owner_id` hoặc attendee đã resolve từ Calendar
+    / VC mới được dùng cho ACL, gửi tự động và welcome.
+    """
+    ids = {x for x in (open_id, union_id) if x}
+    if not ids:
+        return False
+    trusted = {meta.owner_open_id} if meta.owner_open_id else set()
+    # Metadata cũ `calendar[near…]` được dựng chỉ vì gần giờ và đã ghép nhầm
+    # sự kiện thật. Owner từ minutes_get vẫn dùng được; attendee của nguồn này
+    # thì không. Tìm chuỗi con vì row bị cách ly mang tiền tố
+    # `unsafe_near_rejected:` — near khi đó không còn ở đầu chuỗi.
+    if "calendar[near" not in (meta.participants_source or ""):
+        trusted |= {x for a in meta.attendees
+                    for x in (a.open_id, a.union_id) if x}
+    return bool(ids & trusted)
+
+
+def _verified_job_viewer(minute_token: str, open_id: str = "",
+                         union_id: str = "") -> MeetingMeta | None:
+    """Trả metadata khi job xác nhận viewer; dữ liệu thiếu/méo thì đóng."""
+    row = jobstore.get(minute_token)
+    if not row:
+        return None
+    try:
+        meta = jobstore.meta_from_json(row["meta_json"])
+    except Exception:                       # job cũ méo: không đoán quyền
+        return None
+    return meta if _explicit_viewer(meta, open_id, union_id) else None
+
+
+def _note_verified_viewer(minute_token: str, open_id: str, union_id: str = "",
+                          name: str = "") -> MeetingMeta | None:
+    """Chỉ ghi dấu reader sau khi metadata độc lập xác nhận quan hệ cuộc họp."""
+    meta = _verified_job_viewer(minute_token, open_id, union_id)
+    if meta is not None:
+        db.note_viewer(minute_token, open_id, union_id, name)
+    return meta
 
 
 # =====================================================================
@@ -54,20 +99,25 @@ def enqueue_minute(reader_open_id: str, minute_token: str,
     try:
         token = tokenstore.get_access_token(reader_open_id)
         meta = meetings.build_meta(token, minute_token, raw_item)
-        meta.owner_open_id = meta.owner_open_id or reader_open_id
         meetings.resolve_participants(token, meta)
 
         if not meta.attendees and config.FALLBACK_TO_OWNER:
-            # Họp mở tay/không có lịch -> gửi cho chính người phát hiện.
+            # Chỉ fallback khi API đã xác minh người phát hiện là CHỦ THẬT.
+            # Thiếu owner tuyệt đối không được lấy reader thay vào: reader có
+            # thể chỉ là người được share bản ghi, và fallback đó từng biến họ
+            # thành owner + người nhận biên bản của người khác.
             u = tokenstore.list_users(active_only=False)
             info = next((x for x in u if x["open_id"] == reader_open_id), None)
-            if info and info.get("union_id"):
+            if (meta.owner_open_id == reader_open_id
+                    and info and info.get("union_id")):
                 from .models import Attendee
                 meta.attendees = [Attendee(open_id=reader_open_id,
                                            union_id=info["union_id"],
                                            name=info.get("name", ""))]
-                meta.owner_open_id = reader_open_id
                 meta.participants_source += " -> fallback:owner"
+            elif not meta.owner_open_id:
+                print(f"[enqueue] {minute_token}: không rõ owner; KHÔNG fallback "
+                      f"sang reader {reader_open_id[:12]}…")
 
         jobstore.create(meta, status="queued", priority=priority)
         print(f"[enqueue] {meta.title}  ({minute_token})  "
@@ -78,7 +128,7 @@ def enqueue_minute(reader_open_id: str, minute_token: str,
         # được làm hỏng enqueue: báo hỏng thì job vẫn còn, vòng sau vẫn dịch.
         if notify:
             try:
-                _notify_minute(meta, token)
+                _notify_minute(meta)
             except Exception as exc:          # noqa: BLE001
                 print(f"[notify] {minute_token} báo hỏng (bỏ qua): {exc}")
         return True
@@ -89,18 +139,31 @@ def enqueue_minute(reader_open_id: str, minute_token: str,
         return False
 
 
-def _notify_minute(meta: MeetingMeta, access_token: str) -> None:
+def _notify_minute(meta: MeetingMeta) -> None:
     """Báo NGAY khi họp xong: tóm tắt Minute Lark + link + lời mời transcript.
 
     Gửi cho người dự đã enroll (`_recipients`). KÉO: KHÔNG kèm transcript
     whisper (đang chạy nền -> held, chờ hỏi). Gate theo SEND_MODE — dry-run thì
     chỉ in. Lấy Minute hỏng thì vẫn gửi, chỉ thiếu phần tóm tắt.
+
+    KHÔNG còn nhận `access_token` (07/08/2026): token của người phát hiện ra
+    cuộc họp gần như không bao giờ là token đọc được bản chép. Việc chọn token
+    nay là của `larktext`, chỗ duy nhất biết cả thang ứng viên.
     """
     recips, _ = _recipients(meta)
     if not recips:
         return
+    # THỬ TỪNG token ứng viên, không chỉ token của người tình cờ phát hiện ra
+    # cuộc họp (sửa 07/08/2026). Bản cũ gọi thẳng `minutes_transcript` bằng
+    # `access_token` — token của reader — mà quyền đọc bản chép thì gắn với CHỦ
+    # bản ghi. Nên với phần lớn cuộc họp, lời gọi đó hỏng, `minute_text` thành
+    # rỗng, thẻ "Họp xong" đi ra không có tóm tắt, và không ai hỏi lại lần nào
+    # nữa. Đó chính là gốc của "vào Lark thì có đủ text mà bot bảo không đọc
+    # được". `larktext` dùng đúng thang ứng viên của `download_recording` và
+    # lưu lại kết quả, nên câu hỏi đầu tiên của người dùng cũng dùng lại được.
     try:
-        minute_text = lark_api.minutes_transcript(access_token, meta.minute_token)
+        from . import larktext
+        minute_text = larktext.fetch(meta)
     except Exception as exc:                  # noqa: BLE001 — báo vẫn phải gửi
         minute_text = ""
         print(f"[notify] {meta.minute_token} không lấy được Minute Lark "
@@ -133,14 +196,76 @@ def _notify_minute(meta: MeetingMeta, access_token: str) -> None:
           f"{ok}/{len(recips)} người")
 
 
+ENROLL_FAST_POLL_S = 5
+
+
+def _sleep_with_fast_enroll(total: float) -> None:
+    """Ngủ hết `total` giây, nhưng kéo hộp thư OAuth mỗi 5 giây KHI có người
+    đang cấp quyền dở.
+
+    Vì sao (user chốt 05/08/2026): luồng thật là "bấm nút → đồng ý → nhận ngay
+    danh sách 7 ngày". Vòng run ngủ `POLL_INTERVAL` = 300 giây, nên trước đây
+    người dùng bấm xong ngồi nhìn khung chat trống tới 5 phút và tưởng hỏng.
+
+    Chỉ poll nhanh khi `has_live_nonce()` — không có ai enroll dở thì đây vẫn là
+    một giấc ngủ dài, không tốn thêm lời gọi mạng nào. Nonce hết hạn là tự về
+    nhịp cũ, nên một người bỏ dở giữa chừng không làm hệ thống poll mãi mãi.
+
+    KHÔNG được ném: đây nằm trong vòng lặp chính, một lỗi hộp thư không được
+    làm chết orchestrator.
+
+    `oauth` phải import CỤC BỘ: module này không import nó ở cấp file (vòng
+    `run` cũng làm vậy, dòng ~1234) vì `oauth` import ngược lại `orchestrator`.
+    Bản đầu của hàm này quên mất và `try` nuốt luôn `NameError`, nên poll nhanh
+    chết âm thầm — log chỉ có một dòng "không kiểm được nonce" mỗi 5 phút.
+    """
+    from . import oauth
+    end = time.monotonic() + max(0.0, total)
+    while True:
+        remain = end - time.monotonic()
+        if remain <= 0:
+            return
+        try:
+            fast = oauth.has_live_nonce()
+        except Exception as exc:              # noqa: BLE001 — xem docstring
+            print(f"[enroll] không kiểm được nonce (ngủ bình thường): {exc}")
+            fast = False
+        if not fast:
+            time.sleep(remain)
+            return
+        time.sleep(min(ENROLL_FAST_POLL_S, remain))
+        if time.monotonic() >= end:
+            return
+        try:
+            oauth.poll_pending()
+        except Exception as exc:              # noqa: BLE001 — xem docstring
+            print(f"[enroll] kéo nhanh hộp thư hỏng (bỏ qua): {exc}")
+
+
 def welcome_and_backlog(info: dict) -> None:
-    """Sau khi một người enroll: chào + liệt kê cuộc họp 7 ngày của họ + tạo
+    """Sau khi một người enroll: chào + liệt kê cuộc họp gần đây của họ + tạo
     backlog (priority 0) để dịch dần + `note_viewer` để họ pull được.
 
     KÉO: KHÔNG tự gửi transcript nào. Người mới nhắn 'gửi transcript [tên]' thì
     `sendfile` nâng cực cao + tự gửi. Gọi từ `oauth.poll_pending` (đường tự phục
     vụ — người vừa nhắn bot, nhắn lại cho họ là đúng). KHÔNG được ném: enroll đã
     xong rồi, một phép quét hỏng không được làm hỏng việc đó.
+
+    HAI CỬA SỔ KHÁC NHAU, đừng gộp (06/08/2026):
+
+      `ENROLL_BACKFILL_DAYS` — quét lùi bao nhiêu ngày để TẠO BACKLOG.
+      `LOOKBACK_DAYS`        — liệt kê bao nhiêu ngày trong THẺ CHÀO.
+
+    Vì sao phải tách: người dùng muốn ai kết nối cũng có sẵn 90 ngày cuộc họp
+    cũ, nhưng một thẻ chào liệt kê 90 ngày là vài chục dòng ngay ở tin nhắn đầu
+    tiên — không ai đọc. Nạp nền thì im lặng và có ích; liệt kê hết thì ồn và
+    vô dụng. Backlog vẫn `priority=0` + `notify=False` nên cuộc mới luôn chen
+    trước và không ai bị nhắn về cuộc họp từ tháng 3.
+
+    Mặc định `ENROLL_BACKFILL_DAYS = LOOKBACK_DAYS`, tức KHÔNG đổi hành vi cho
+    tới khi người vận hành tự đặt trong `.env`. Đọc `docs/CURRENT_CONTEXT.md`
+    §11c trước khi nới: nới lên 90 làm mỗi người mới nạp thêm vài chục job vào
+    một máy phiên âm bằng CPU.
     """
     union_id = info.get("union_id", "")
     open_id = info.get("open_id", "")
@@ -148,20 +273,22 @@ def welcome_and_backlog(info: dict) -> None:
     if not union_id:
         return
     titles: list[str] = []
+    # Chỉ tính lần một: mốc phân giới cho THẺ CHÀO. Cuộc cũ hơn mốc này vẫn
+    # được tạo backlog, chỉ không xuất hiện trong tin nhắn chào.
+    now_ms = _now_ms()
+    welcome_from_ms = now_ms - config.LOOKBACK_DAYS * 86_400_000
+    days = max(config.ENROLL_BACKFILL_DAYS, config.LOOKBACK_DAYS)
     try:
         token = tokenstore.get_access_token(open_id)
-        end = _now_ms()
-        start = end - config.LOOKBACK_DAYS * 86_400_000
-        items = lark_api.minutes_list(token, start, end, open_id)
+        items = lark_api.minutes_list(
+            token, now_ms - days * 86_400_000, now_ms, open_id)
     except Exception as exc:                  # noqa: BLE001 — xem docstring
         items = []
-        print(f"[welcome] {name}: không quét được minute 7 ngày: {exc}")
+        print(f"[welcome] {name}: không quét được minute {days} ngày: {exc}")
     for it in items:
         mt = it.get("token") or it.get("minute_token")
         if not mt:
             continue
-        db.note_viewer(mt, open_id, union_id, name)   # để họ pull được
-        titles.append(it.get("title") or it.get("topic") or mt)
         # Tạo backlog nếu chưa có job: priority 0, KHÔNG báo "họp xong".
         if not (db.is_claimed(mt) or jobstore.get(mt)):
             try:
@@ -169,25 +296,169 @@ def welcome_and_backlog(info: dict) -> None:
             except Exception as exc:          # noqa: BLE001
                 print(f"[welcome] backlog {mt} hỏng (bỏ qua): {exc}")
 
+        # Search hit chỉ là ứng viên phát hiện. Chỉ đưa vào welcome và cấp quyền
+        # pull nếu job metadata xác nhận owner/attendee thật.
+        meta = _note_verified_viewer(mt, open_id, union_id, name)
+        if meta is None:
+            print(f"[welcome] {name}: bỏ {mt} khỏi danh sách — search thấy nhưng "
+                  "metadata không xác nhận owner/attendee")
+            continue
+        # Cuộc cũ hơn cửa sổ thẻ chào: đã tạo backlog ở trên rồi, chỉ không nêu
+        # ra ở tin nhắn đầu. `meta.start` là giây; không có giờ thì coi như cũ
+        # và im lặng — thà thiếu một dòng còn hơn nói sai "trong 7 ngày qua".
+        if (meta.start or 0) * 1000 < welcome_from_ms:
+            continue
+        titles.append(meta.title or mt)
+
+    # `oauth.complete()` đã thử đánh thức theo owner/attendees có sẵn. Quét trên
+    # vừa ghi lại viewer đã được metadata xác nhận, nên thử LẠI ở đây để cứu
+    # job liên quan. Idempotent; không gửi transcript và
+    # tuyệt đối không tự gửi link OAuth cho ai.
+    try:
+        released = jobstore.release_waiting_auth(open_id, union_id)
+        if released:
+            print(f"[welcome] {name}: {len(released)} job chờ quyền -> backlog")
+    except Exception as exc:                  # noqa: BLE001 — chào hỏng không phá enroll
+        print(f"[welcome] không đánh thức được job chờ quyền cho {name}: {exc}")
+
+    # Danh sách dựng bằng CHÍNH bộ dựng của bot (`qa.list_text`) chứ không tự
+    # ghép tên nữa (05/08/2026). Lý do: bản cũ chỉ có bullet tên cuộc, không
+    # link Minutes, không nói có bản gỡ băng — trong khi hỏi bot thì lại thấy
+    # đủ. Hai định dạng cho cùng một dữ liệu là hai chỗ phải nhớ sửa, và đã
+    # lệch thật. Dùng chung thì chân trang "có bản gỡ băng đầy đủ" tự có mặt.
+    from . import askers, qa
+    body = ""
     if titles:
-        shown = "\n".join(f"• {t}" for t in titles[:15])
-        more = f"\n…và {len(titles) - 15} cuộc nữa" if len(titles) > 15 else ""
-        body = (f"Xong rồi {name}! Mình thấy bạn có {len(titles)} cuộc họp trong "
-                f"7 ngày qua:\n\n{shown}{more}\n\n"
-                f"Cần bản transcript chuẩn (whisper) cuộc nào thì nhắn: "
-                f"gửi transcript [tên cuộc] — mình ưu tiên dịch và tự gửi ngay. "
-                f"Từ giờ họp xong mình cũng tự gửi Minute + tóm tắt cho bạn.")
+        try:
+            who = askers.find_enrolled(open_id)
+            if who:
+                # PHẢI truyền `since` (sửa 05/08/2026): `list_text` không lọc
+                # thời gian thì trả về MỌI cuộc họp người đó được xem, trong khi
+                # câu ngay bên trên nói "7 ngày qua". Đo thật: thẻ chào ghi 7
+                # cuộc, gồm cả cuộc ngày 27/07 — tức 9 ngày trước.
+                since = datetime.fromtimestamp(
+                    (_now_ms() - config.LOOKBACK_DAYS * 86_400_000) / 1000
+                ).strftime("%Y-%m-%d")
+                body = qa.list_text(who, since=since)
+        except Exception as exc:              # noqa: BLE001 — chào hỏng không phá enroll
+            print(f"[welcome] {name}: dựng danh sách hỏng, dùng bản rút gọn: {exc}")
+        if not body:
+            shown = "\n".join(f"• {t}" for t in titles[:15])
+            more = f"\n…và {len(titles) - 15} cuộc nữa" if len(titles) > 15 else ""
+            body = (f"Mình thấy bạn có {len(titles)} cuộc họp trong 7 ngày "
+                    f"qua:\n\n{shown}{more}")
+        body += ("\n\nTừ giờ họp xong mình tự gửi Minute + tóm tắt cho bạn.")
     else:
-        body = (f"Xong rồi {name}! Từ giờ họp xong mình sẽ tự gửi Minute + tóm "
-                f"tắt cho bạn. Cần bản transcript chuẩn (whisper) cuộc nào thì "
-                f"nhắn: gửi transcript [tên cuộc].")
+        body = ("Hiện chưa thấy cuộc họp nào của bạn trong 7 ngày qua. Từ giờ "
+                "họp xong mình sẽ tự gửi Minute + tóm tắt cho bạn.")
+
     if not config.SEND_MODE:
         print(f"[welcome] (dry-run) chào {name}: {len(titles)} cuộc, backlog đã tạo")
         return
+
     try:
-        lark_api.im_send_text(union_id, body, id_type="union_id")
+        from . import cards
+        lark_api.im_send_card(union_id, cards.welcome_card(name, body),
+                              id_type="union_id")
     except lark_api.LarkError as exc:
-        print(f"[welcome] không nhắn được cho {name}: {exc}")
+        print(f"[welcome] thẻ chào hỏng ({exc}) — gửi lại bằng text")
+        try:
+            lark_api.im_send_text(union_id, f"Xong rồi {name}!\n\n{body}",
+                                  id_type="union_id")
+        except lark_api.LarkError as exc2:
+            print(f"[welcome] không nhắn được cho {name}: {exc2}")
+
+
+def backfill_missing(days: int, *, dry_run: bool = True,
+                     priority: int = 0) -> list[dict]:
+    """Nạp bù cuộc họp CŨ HƠN cửa sổ quét thường. Trả danh sách đã/sẽ nạp.
+
+    Vì sao cần một lệnh riêng (đo 05/08/2026): `scan_once` chỉ nhìn lùi
+    `LOOKBACK_DAYS` (=7) mỗi vòng, và đó là TOÀN BỘ khả năng bắt bù của hệ thống
+    — `config.LOOKBACK_DAYS` đã ghi rõ hệ quả. Hệ thống bắt đầu chạy ~30/07 nên
+    mọi cuộc họp trước 23/07 chưa bao giờ lọt vào tầm nhìn và sẽ không bao giờ
+    lọt nữa. Đo thật trên tenant này: Lark có 71 minute trong 180 ngày mà chính
+    nó xếp một người đã enroll là người dự, DB chỉ có 23 — thiếu 48 cuộc, trải
+    từ 05/03 tới 28/07, gồm cả HỌP BOD và Review Q2/Chiến lược Q3.
+
+    KHÔNG nới `LOOKBACK_DAYS` để chữa việc này. Nới là mỗi vòng quét, mãi mãi,
+    kéo về 150 item/người cho một việc chỉ cần làm một lần — và tệ hơn: vòng
+    quét gọi `enqueue_minute` với `notify=True`, tức mọi người dự đã enroll sẽ
+    nhận thẻ "họp xong" cho những cuộc từ tháng 3.
+
+    Ba ràng buộc, cưỡng chế bằng code:
+
+     1. `notify=False` LUÔN LUÔN, không phụ thuộc `SEND_MODE`. Đây là nạp bù dữ
+        liệu cũ, không phải phát hiện cuộc họp mới — không tin nào được gửi.
+     2. `priority=0` (backlog): cuộc họp MỚI và người đang hỏi transcript vẫn
+        chen lên trước, `_process_queue` chỉ chạy 1 backlog mỗi vòng.
+     3. Nguồn là `minutes_list(..., participant_open_id=oid)` — bản lọc THEO
+        NGƯỜI. Không dùng nhánh không-lọc (`SCAN_ALL_VISIBLE`): nó kéo cả cuộc
+        của phòng khác mà không ai trong hệ thống dự (đã bật rồi tắt 04/08).
+
+    Quyền: giống hệt `welcome_and_backlog` — `_note_verified_viewer` chỉ ghi dấu
+    khi metadata job tự xác nhận owner/attendee, nên nạp bù KHÔNG nới ACL cho ai.
+    """
+    users = tokenstore.list_users(active_only=True)
+    if not users:
+        print("[backfill] chưa có ai enroll — không có token nào để đọc Lark")
+        return []
+
+    end = _now_ms()
+    start = end - max(1, int(days)) * 86_400_000
+    found: dict[str, dict] = {}
+    for u in users:
+        oid = u["open_id"]
+        try:
+            token = tokenstore.get_access_token(oid)
+        except Exception as exc:              # noqa: BLE001 — một token chập không làm mù cả lượt
+            print(f"[backfill] {u['name'] or oid}: bỏ qua ({exc})")
+            continue
+        for it in lark_api.minutes_list(token, start, end, oid):
+            mt = it.get("token") or it.get("minute_token")
+            if not mt:
+                continue
+            rec = found.setdefault(mt, {"minute_token": mt, "item": it,
+                                        "readers": []})
+            rec["readers"].append(u)
+
+    todo = [r for mt, r in found.items()
+            if not (db.is_claimed(mt) or jobstore.get(mt))]
+    print(f"[backfill] {days} ngày: Lark có {len(found)} minute, "
+          f"DB đã có {len(found) - len(todo)}, cần nạp {len(todo)}")
+    if dry_run:
+        for r in todo:
+            it = r["item"]
+            title = (it.get("topic") or it.get("title")
+                     or it.get("display_info") or "").split("\n", 1)[0].strip()
+            import html as _html
+            print(f"  (thử khô) {r['minute_token']}  {_html.unescape(title)[:56]}")
+        return todo
+
+    done: list[dict] = []
+    for r in todo:
+        mt = r["minute_token"]
+        # Mượn token của TỪNG người thấy minute này, theo thứ tự, tới khi có ai
+        # dựng được job. Chủ bản ghi là người chắc chắn đọc được nhất nhưng ta
+        # chưa biết đó là ai trước khi `build_meta` chạy — nên cứ thử lần lượt.
+        for u in r["readers"]:
+            try:
+                ok = enqueue_minute(u["open_id"], mt, r["item"],
+                                    priority=priority, notify=False)
+            except Exception as exc:          # noqa: BLE001 — một cuộc hỏng không dừng cả lượt
+                print(f"[backfill] {mt} mượn {u['open_id'][:12]}… hỏng: {exc}")
+                continue
+            if not ok:
+                continue
+            _note_verified_viewer(mt, u["open_id"], u.get("union_id", ""),
+                                  u.get("name", ""))
+            done.append(r)
+            break
+        else:
+            print(f"[backfill] {mt}: không người nào dựng được job — bỏ qua")
+    print(f"[backfill] đã nạp {len(done)}/{len(todo)} job (priority={priority}, "
+          f"KHÔNG gửi tin cho ai)")
+    return done
 
 
 def scan_once() -> int:
@@ -217,20 +488,42 @@ def scan_once() -> int:
             print(f"[scan] {u['name'] or oid}: lỗi khi lấy token, bỏ qua người "
                   f"này trong vòng này: {exc}")
             continue
-        # Lọc theo chính người này: minute nào họ có dự thì họ có quyền đọc.
+        # HAI NGUỒN, cố ý tách bạch:
+        #  (1) lọc theo chính người này -> ứng viên mà tài khoản này tìm thấy.
+        #      Nó KHÔNG tự chứng minh họ có dự; Search vẫn có thể trả bản ghi
+        #      được share của người khác. Quyền chỉ được ghi sau khi job metadata
+        #      xác nhận owner/attendee.
+        #  (2) không lọc người -> mọi minute token này MỞ XEM ĐƯỢC. Chỉ để NẠP.
+        #      Cần vì Lark không xếp người ta vào `participant_ids` của mọi bản
+        #      ghi họ thực sự dự: đo trên tài khoản BOD ra 5 so với 7, hai cuộc
+        #      chênh đều có ghi hình và người đó khẳng định có ngồi họp. Trước
+        #      đây chúng rơi khỏi hệ thống không để lại dấu vết nào.
+        # Gộp nguồn (2) mà VẪN note_viewer là mở toang quyền: người chỉ được
+        # chia sẻ bản ghi sẽ thành "người dự" và kéo được biên bản. Đừng gộp.
         items = lark_api.minutes_list(token, start, end, oid)
+        mine = {it.get("token") or it.get("minute_token") for it in items}
+        if config.SCAN_ALL_VISIBLE:
+            extra = [it for it in lark_api.minutes_list(token, start, end, "")
+                     if (it.get("token") or it.get("minute_token")) not in mine]
+            if extra:
+                print(f"[scan] {u['name'] or oid}: +{len(extra)} minute chỉ MỞ "
+                      f"XEM ĐƯỢC (không nằm trong danh sách người dự của Lark)")
+            items = items + extra
         for it in items:
             mt = it.get("token") or it.get("minute_token")
             if not mt:
                 continue
-            # Ghi nhận NGƯỜI NHẬN trước mọi cửa bỏ qua bên dưới. Đây là danh
-            # sách người vừa THAM DỰ (chính Lark khẳng định qua
-            # `participant_ids`) vừa ĐÃ CẤP QUYỀN — nguồn người nhận chính từ
-            # 02/08/2026. Người thứ hai thấy cùng cuộc họp thì `is_claimed` chặn
-            # họ tạo job thứ hai, nhưng họ VẪN phải được ghi là người nhận; đặt
-            # dòng này sau cửa đó là mất đúng những người ta cần nhất.
-            db.note_viewer(mt, oid, u.get("union_id", ""), u.get("name", ""))
+            if mt not in mine:
+                # Nguồn (2): nạp thôi, KHÔNG ghi là người xem.
+                if not (db.is_claimed(mt) or jobstore.get(mt)):
+                    waited = (_now_ms() - db.note_seen(mt)) / 60_000
+                    if waited >= config.SETTLE_MINUTES and enqueue_minute(oid, mt, it):
+                        created += 1
+                        db.clear_seen(mt)
+                continue
             if db.is_claimed(mt) or jobstore.get(mt):
+                _note_verified_viewer(mt, oid, u.get("union_id", ""),
+                                      u.get("name", ""))
                 continue
             # Chờ Lark liên kết bản ghi với cuộc họp trước khi tra người dự;
             # hỏi sớm thì vc recording trả rỗng -> mất danh sách người được
@@ -243,6 +536,8 @@ def scan_once() -> int:
             if enqueue_minute(oid, mt, it):
                 created += 1
                 db.clear_seen(mt)
+                _note_verified_viewer(mt, oid, u.get("union_id", ""),
+                                      u.get("name", ""))
     print(f"[{datetime.now():%H:%M:%S}] scan xong, {created} job mới")
     return created
 
@@ -327,6 +622,18 @@ def _process_queue(dry_run: bool | None = None) -> None:
             try:
                 t, _ = pipeline.run_transcription(meta)
                 recap = None
+            except pipeline.WaitingForAuth as exc:
+                # Chưa có token của người có thể tải: park, KHÔNG retry mỗi vòng,
+                # KHÔNG alert/DM mời OAuth. Chỉ `oauth.complete()` của chính một
+                # người liên quan mới trả job về backlog.
+                if dry_run:
+                    print(f"[queue] {token} (dry-run) đang CHỜ người có quyền tự "
+                          f"OAuth: {exc}")
+                    continue
+                jobstore.set_status(token, "waiting_auth", error=str(exc), priority=0)
+                print(f"[queue] {token} -> waiting_auth (không tự gửi link, không "
+                      f"retry nóng): {exc}")
+                continue
             except pipeline.MediaDenied as exc:
                 # Ngược hẳn với hai nhánh dưới: cái này KHÔNG tự khỏi. Không ai
                 # được phép tải bản ghi thì vòng sau, và vòng sau nữa, vẫn vậy.
@@ -384,14 +691,27 @@ def _process_queue(dry_run: bool | None = None) -> None:
         # ĐÃ CÓ transcript. Rẽ theo priority (mô hình KÉO, 03/08/2026):
         #   cực cao (2) = có người HỎI  -> gửi transcript cho đúng họ
         #   thường (1) / backlog (0)    -> GIỮ (held), chờ người dự tự hỏi
-        # Không còn broadcast recap+transcript cho mọi người dự nữa. `recap` từ
-        # `_reuse` (nếu có) bỏ qua: người hỏi transcript thì nhận transcript.
+        # Không còn broadcast recap+transcript cho mọi người dự nữa.
         _ = recap
         if priority >= 2:
             _deliver_requested(meta, t, dry_run=dry_run)
         elif dry_run:
             print(f"[queue] (dry-run) {token} -> sẽ GIỮ (held), chờ người hỏi")
         else:
+            # TÓM TẮT LẠI TỪ NGUYÊN VĂN trước khi ghi Base (user chốt
+            # 05/08/2026). Trước đây nhánh này không gọi LLM lần nào:
+            # `_base_record_held` dùng lại `recap_json` mà `_notify_minute` đã
+            # ghi từ VĂN BẢN MINUTE CỦA LARK. Tức mọi cuộc đi đường kéo có
+            # transcript whisper nằm trên đĩa nhưng tóm tắt hiển thị khắp nơi
+            # (Base, get_meeting, câu kèm file) lại phân tích từ bản Lark —
+            # bản kém chi tiết hơn hẳn. Người dùng gọi đúng tên vấn đề này.
+            #
+            # `_recap_step` trả None = LLM chớp tắt, job giữ `queued` để vòng
+            # sau làm lại. Không được set `held` lúc đó: set rồi thì không còn
+            # đường nào quay lại làm tóm tắt, và cuộc họp kẹt vĩnh viễn với bản
+            # tóm tắt từ Minute — đúng cái đang đi sửa.
+            if _recap_step(meta, t, attempts, dry_run=dry_run) is None:
+                continue
             # Viết .docx để đính vào Base; set held; ghi record Base (nguồn bot
             # Q&A đọc — không có thì 'gửi transcript [tên]' tra không ra cuộc).
             try:
@@ -400,7 +720,8 @@ def _process_queue(dry_run: bool | None = None) -> None:
                 print(f"[queue] {token} viết .docx hỏng (bỏ qua): {exc}")
             jobstore.set_status(token, "held", transcribed_at=_now_ms())
             _base_record_held(token, meta)
-            print(f"[queue] {token} dịch xong -> held + Base (chờ người dự hỏi)")
+            print(f"[queue] {token} dịch xong -> tóm tắt lại từ nguyên văn "
+                  f"-> held + Base (chờ người dự hỏi)")
 
         # Trích thuật ngữ ứng viên cho glossary (part B). HAI ràng buộc, cả hai
         # đều là lỗi đã sửa 03/08/2026 chứ không phải phòng xa:
@@ -683,7 +1004,7 @@ RERESOLVE_MAX_READERS = 2
 # Nguồn người dự coi là ĐÃ TRA ĐƯỢC. Mọi giá trị khác — `agenda_failed`,
 # `no_match`, `no_calendar_event`, `no_event_in_window`, `no_start_time`, và cả
 # `… -> fallback:owner` — đều là "chưa biết ai dự".
-_SOURCE_RESOLVED = "calendar["
+_SOURCE_RESOLVED = ("calendar[verified]", "calendar[title]")
 
 
 def _needs_reresolve(source: str) -> bool:
@@ -741,6 +1062,86 @@ def _maybe_reresolve(meta: MeetingMeta, *, dry_run: bool) -> MeetingMeta:
     return meta
 
 
+def reverify_after_enroll(info: dict) -> list[str]:
+    """Xác minh lại ACL của các minute cũ ngay sau khi một user OAuth.
+
+    Một job có thể đã được tạo trước khi token có scope VC mới, khi Lark chưa gắn
+    recording vào cuộc họp, hoặc khi API chập chờn. Khi đó ``meta_json`` giữ nguồn
+    ``near``/``no_match`` và người thực sự dự họp bị ẩn mãi, dù lần OAuth sau đã đủ
+    quyền để chứng minh quan hệ event -> VC recording -> minute.
+
+    Đây là đường sửa quyền nên cố ý chặt hơn ``_maybe_reresolve``:
+
+    * chỉ xét minute mà Lark trả về trong search có lọc chính open_id vừa OAuth;
+    * chỉ ghi khi recording khớp chính xác minute token (``calendar[verified]``);
+    * chính open_id/union_id vừa OAuth phải có trong attendee đã xác minh;
+    * ``calendar[title]`` hay gần giờ đơn thuần không bao giờ đủ ở đường này.
+
+    Không enqueue, không gửi tin, không gửi transcript. Lỗi API chỉ làm bỏ qua lần
+    sửa này; enroll vẫn thành công và job cũ vẫn giữ nguyên theo fail-closed.
+    """
+    open_id = info.get("open_id", "")
+    union_id = info.get("union_id", "")
+    name = info.get("name", "")
+    if not (open_id and union_id):
+        return []
+
+    try:
+        token = tokenstore.get_access_token(open_id)
+        end = _now_ms()
+        start = end - config.LOOKBACK_DAYS * 86_400_000
+        items = lark_api.minutes_list(token, start, end, open_id)
+    except Exception as exc:                  # noqa: BLE001 - không được làm hỏng OAuth
+        # ASCII-only: đường `v2 complete` có thể chạy từ PowerShell cp1252, nơi một
+        # ký tự tiếng Việt trong log cũng đủ ném UnicodeEncodeError sau khi DB đã ghi.
+        print(f"[reverify-enroll] {open_id}: minute scan failed: {exc!a}")
+        return []
+
+    upgraded: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        minute_token = item.get("token") or item.get("minute_token")
+        if not minute_token or minute_token in seen:
+            continue
+        seen.add(minute_token)
+
+        row = jobstore.get(minute_token)
+        if not row:
+            continue                         # vòng scan/backlog chịu trách nhiệm tạo job
+        try:
+            current = jobstore.meta_from_json(row["meta_json"])
+        except Exception:
+            continue                         # metadata méo: không đoán quyền
+
+        if _explicit_viewer(current, open_id, union_id):
+            db.note_viewer(minute_token, open_id, union_id, name)
+            continue
+        if (current.participants_source or "").startswith("calendar[verified]"):
+            continue                         # đã verified mà user không có mặt: giữ nguyên
+
+        fresh = jobstore.meta_from_json(jobstore.meta_to_json(current))
+        try:
+            meetings.resolve_participants(token, fresh)
+        except Exception as exc:              # noqa: BLE001 - giữ ACL cũ khi API lỗi
+            print(f"[reverify-enroll] {minute_token}: resolve failed: {exc!a}")
+            continue
+
+        if not (fresh.participants_source or "").startswith("calendar[verified]"):
+            continue
+        if not _explicit_viewer(fresh, open_id, union_id):
+            print(f"[reverify-enroll] {minute_token}: recording matched but "
+                  f"{open_id} is absent from VC attendees; ACL unchanged")
+            continue
+
+        jobstore.update_meta(minute_token, fresh)
+        db.note_viewer(minute_token, open_id, union_id, name)
+        upgraded.append(minute_token)
+        print(f"[reverify-enroll] {minute_token}: {current.participants_source!a} -> "
+              f"{fresh.participants_source!a} ({len(fresh.attendees)} attendees)")
+
+    return upgraded
+
+
 def _recipients(meta: MeetingMeta) -> tuple[list[str], int]:
     """(union_id sẽ nhận biên bản, số người dự KHÔNG nhận vì chưa cấp quyền).
 
@@ -749,20 +1150,9 @@ def _recipients(meta: MeetingMeta) -> tuple[list[str], int]:
     người chưa bao giờ cấp quyền cho hệ thống và không biết nó tồn tại. Đo thật
     trên cuộc `Workforce AI Weekly`: 30 người dự, 3 người đã cấp quyền.
 
-    Hợp HAI nguồn, cả hai đều đã qua cửa "phải enroll":
-      (1) `meta.attendees` — người dự tra được từ lịch + người thật sự vào phòng
-          họp VC (xem `meetings.resolve_participants`).
-      (2) `db.viewers_of()` — người đã enroll mà minute này xuất hiện trong
-          `minutes/search` của chính họ, tức LARK khẳng định họ có dự.
-
-    Vì sao cần cả (2) chứ không chỉ (1): chuỗi tra người dự sót thật, và sót âm
-    thầm — `no_match`, `fallback:owner`, họp mời bằng group chat, sự kiện lịch
-    đã bị xoá (`193001`). Nguồn (2) không phụ thuộc bất kỳ thứ nào trong đó.
-    Nó cũng cho một bất biến dễ kiểm: minute chỉ vào được hệ thống qua vòng quét
-    của một người vừa dự vừa đã cấp quyền, nên người đó luôn nằm trong (2).
-
-    KHÔNG nới ra "gửi cho cả người chưa enroll nếu họ có trong (1)". Đó chính là
-    hành vi vừa bỏ.
+    Nguồn duy nhất: `meta.attendees` đã resolve từ lịch/VC, rồi giao với tập
+    người đã enroll. `minute_viewers` chỉ nói token của ai TÌM/ĐỌC được bản ghi;
+    nó không chứng minh tham dự và tuyệt đối không được dùng để phát nội dung.
     """
     enrolled = {u["union_id"]: (u.get("name") or u["union_id"])
                 for u in tokenstore.list_users(active_only=True)
@@ -770,7 +1160,9 @@ def _recipients(meta: MeetingMeta) -> tuple[list[str], int]:
 
     out: list[str] = []
     skipped = 0
-    for a in meta.attendees:
+    attendees = ([] if "calendar[near" in (meta.participants_source or "")
+                 else meta.attendees)
+    for a in attendees:
         if not a.union_id:
             continue
         if a.union_id in enrolled:
@@ -778,10 +1170,6 @@ def _recipients(meta: MeetingMeta) -> tuple[list[str], int]:
                 out.append(a.union_id)
         else:
             skipped += 1
-    for v in db.viewers_of(meta.minute_token):
-        uid = v.get("union_id") or ""
-        if uid and uid in enrolled and uid not in out:
-            out.append(uid)
     return out, skipped
 
 
@@ -844,9 +1232,16 @@ def _base_record_held(token: str, meta: MeetingMeta) -> None:
     tra không ra. Trước khi có mô hình kéo, record được ghi trong `_deliver_now`;
     giờ đường đó bị bỏ nên phải ghi ở ĐÂY.
 
-    Dùng lại tóm tắt Minute đã lưu ở `_notify_minute` (recap_json) — khỏi gọi LLM
-    lần hai. Backlog không có thì để tóm tắt giữ chỗ; transcript vẫn đính, bot vẫn
-    tra được. Ghi Base là việc PHỤ: hỏng thì bỏ qua, không làm chết vòng.
+    Đọc `recap_json` của job. Từ 05/08/2026 caller đã chạy `_recap_step` trên
+    NGUYÊN VĂN whisper ngay trước khi gọi hàm này, nên thứ đọc được ở đây là bản
+    tóm tắt từ nguyên văn — không còn là bản tóm tắt từ Minute của Lark do
+    `_notify_minute` ghi lúc mới phát hiện cuộc họp.
+
+    Vẫn giữ đường đọc `recap_json` chứ không nhận Recap qua tham số: `_deliver_
+    requested` và các đường gửi bù cũng gọi hàm này, và job là nguồn sự thật
+    chung của tất cả. Không có gì đọc được thì để tóm tắt giữ chỗ; transcript vẫn
+    đính, bot vẫn tra được. Ghi Base là việc PHỤ: hỏng thì bỏ qua, không làm chết
+    vòng.
     """
     import json as _json
     from .models import ActionItem, Recap
@@ -1037,7 +1432,20 @@ def run() -> None:
 
         try:
             if not config.PAUSED:
+                # Wrapper cũ chỉ bật Whisper đúng lúc khởi động; nó rớt giữa
+                # chừng thì orchestrator vẫn sống và job nằm chờ vô hạn. Chạy
+                # supervisor mỗi vòng, trước queue. Hàm này fail-safe: không
+                # ném, không kill process sống và không spawn cho URL từ xa.
+                whisper_supervisor.ensure_running()
                 scan_once()
+                # Đẩy cuộc VỪA phát hiện lên Base NGAY, trước khi vào hàng đợi
+                # (sửa 04/08/2026). Trước đó Base chỉ được cập nhật ở CUỐI
+                # `_process_queue`, mà một cuộc họp 3,8 giờ nuốt cả lượt xử lý
+                # ~35 phút — trong suốt thời gian đó mọi cuộc mới phát hiện
+                # không có dòng nào trên Base, người vận hành nhìn vào tưởng
+                # quét sót. Rẻ khi không có gì đổi: job đã có record thì bỏ qua,
+                # `sync_jobs` chỉ ghi record lệch.
+                _backfill_base()
                 process_queue()
         except KeyboardInterrupt:
             print("\nDừng.")
@@ -1072,4 +1480,4 @@ def run() -> None:
             status_push.heartbeat(
                 next_scan_at_ms=_now_ms() + config.POLL_INTERVAL * 1000)
 
-        time.sleep(config.POLL_INTERVAL)
+        _sleep_with_fast_enroll(config.POLL_INTERVAL)

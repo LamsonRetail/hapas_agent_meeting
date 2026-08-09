@@ -33,6 +33,15 @@ _RE_OWNER = re.compile(r"Owner:\s*(.+?)\s+Start time:")
 # là UTC thì lệch 8 TIẾNG và mọi phép so "gần giờ nhất" sai hoàn toàn.
 _LARK_DESC_TZ = timezone(timedelta(hours=8))
 
+# Tiền tố đánh dấu một `participants_source` đã bị CÁCH LY: nó được ghép chỉ vì
+# gần giờ và không được dùng làm bằng chứng tham dự nữa. Giữ chuỗi gốc phía sau
+# để còn truy vết được nó từng ghép vào sự kiện nào.
+#
+# ⚠️ Các phép kiểm ACL tìm `"calendar[near" in src` (chuỗi con, KHÔNG phải
+# `startswith`) chính là vì tiền tố này đẩy `calendar[near…]` vào GIỮA chuỗi —
+# xem `jobstore.release_waiting_auth` và `orchestrator._explicit_viewer`.
+REJECTED_PREFIX = "unsafe_near_rejected:"
+
 
 def _epoch(dt: datetime) -> float:
     return dt.replace(tzinfo=_LARK_DESC_TZ).timestamp()
@@ -50,6 +59,15 @@ def explain_source(src: str) -> str:
     """
     if not src:
         return "không rõ nguồn người nhận"
+    if src.startswith(REJECTED_PREFIX):
+        # Nguồn bị CÁCH LY ngày 05/08/2026: ghép chỉ vì gần giờ, đã kéo nhầm 22
+        # người của một cuộc khác vào ACL. Phải dịch ở đây, nếu không cột `Nguồn
+        # người nhận` trên Base hiện nguyên chuỗi máy `unsafe_near_rejected:…`
+        # — người vận hành đọc không ra, mà đây đúng là ô họ nhìn để trả lời
+        # "vì sao người này nhận được biên bản". Nói RÕ là đã loại: bản thân
+        # dòng "khớp theo GIỜ" đọc như một nguồn hợp lệ.
+        return ("ĐÃ LOẠI (ghép chỉ vì gần giờ — KHÔNG cấp quyền cho ai) · "
+                + explain_source(src[len(REJECTED_PREFIX):]))
     if src.startswith("calendar[verified]"):
         return "đã xác minh khớp cuộc họp · " + _tail(src)
     if src.startswith("calendar[title]"):
@@ -144,8 +162,8 @@ def build_meta(access_token: str, minute_token: str,
     #   - câu báo lỗi khi thiếu quyền tải chỉ tay nhầm người cần đi nhờ.
     #
     # `minutes_get` CÓ trả `owner_id`, nên hỏi thêm một lời gọi. Chỉ một lần cho
-    # mỗi cuộc họp mới, không đáng kể. Hỏng thì để rỗng như cũ — caller vẫn lấp
-    # bằng người phát hiện, tức không tệ hơn trước.
+    # mỗi cuộc họp mới, không đáng kể. Hỏng thì để rỗng và caller phải fail-closed;
+    # tuyệt đối không lấp bằng người phát hiện vì họ có thể chỉ được share bản ghi.
     owner_open_id = info.get("owner_id", "") or ""
     if not owner_open_id and raw_item is not None:
         try:
@@ -154,13 +172,20 @@ def build_meta(access_token: str, minute_token: str,
         except lark_api.LarkError as exc:
             print(f"[meetings] không tra được chủ bản ghi {minute_token} ({exc})")
 
+    # Gỡ escape HTML (04/08/2026): Lark Minutes trả `Review HRIS &amp; feedback`
+    # và `Lê Quý Thiện - Technical &amp; AI Automation Leader`. Hai chuỗi này đi
+    # thẳng vào Base rồi chảy ra BẢY đường người dùng đọc — thẻ biên bản, cảnh
+    # báo DM, Lark Task, file .docx, sendfile, cột Base, bot hỏi đáp. Gỡ ở ĐÂY,
+    # tức nguồn, thay vì vá bảy chỗ hiển thị. Dữ liệu cũ đã dọn một lần bằng tay.
+    import html as _html
+
     return MeetingMeta(
         minute_token=minute_token,
-        title=title or "(không tiêu đề)",
+        title=_html.unescape(title) if title else "(không tiêu đề)",
         start=start,
         duration_sec=duration,
         owner_open_id=owner_open_id,
-        owner_name=owner_name,
+        owner_name=_html.unescape(owner_name),
         app_link=(info.get("url") or (info.get("meta_data", {}) or {})
                   .get("app_link", "")),
     )
@@ -383,8 +408,6 @@ def resolve_participants(access_token: str, meta: MeetingMeta) -> MeetingMeta:
         print(f"[meetings] không lấy được meeting_id ({exc})")
         mids = {}
 
-    strict = config.CAL_STRICT_MINUTES * 60
-
     for ev in cands:
         event_id = ev["event_id"]
         name = ev.get("summary") or event_id
@@ -419,13 +442,13 @@ def resolve_participants(access_token: str, meta: MeetingMeta) -> MeetingMeta:
         elif cand_mids:
             # Xác minh được mà KHÔNG khớp = cuộc họp khác. Bỏ, không đoán tiếp.
             continue
-        elif same_title or gap_min * 60 <= strict:
-            # Không xác minh được (sự kiện không có VC, hoặc API không trả).
-            # Chỉ chấp nhận khi bằng chứng gián tiếp đủ mạnh: trùng CHÍNH XÁC
-            # tên, hoặc sát giờ. Ngoài ra thì THÀ KHÔNG BIẾT còn hơn gửi biên
-            # bản cho sai người (V1 fail-closed; V2 trước đây fail-open và đã
-            # ghép một minute thử 59 giây với buổi đào tạo cách 33 tiếng).
-            how = "title" if same_title else f"near{gap_min:.0f}m"
+        elif same_title:
+            # Không xác minh được recording (sự kiện không có VC, hoặc API
+            # không trả): chỉ tên khớp CHÍNH XÁC mới đủ dùng. Gần giờ đơn thuần
+            # là không an toàn — dữ liệu thật 05/08/2026 đã ghép `Daily CDP
+            # Checkin` với `HAPAS | PROJECT TRANG SỨC...` cách 19 phút và kéo
+            # nhầm 22 attendee vào ACL. Thà bỏ sót còn hơn lộ biên bản.
+            how = "title"
         else:
             continue
 

@@ -140,18 +140,35 @@ class Recap:
     # Nếu LLM không dựng được cấu trúc, giữ nguyên văn recap ở đây.
     raw: str = ""
 
+    # Ký tự đầu dòng cho danh sách. `•` là KÝ TỰ THẬT, không phải cú pháp
+    # markdown — và đó là lý do dùng nó (sửa 05/08/2026).
+    #
+    # Chuỗi này đi vào `cards.recap_card` / `cards.minute_notice_card`, tức vào
+    # `lark_md`. Mà `lark_md` chỉ hiểu **đậm** và [nhãn](url) — KHÔNG có danh
+    # sách, không có heading, không có nghiêng. Nên `- item` hiện ra đúng một
+    # dấu gạch ngang, và `_Tên_` hiện ra đúng hai dấu gạch dưới. Người dùng đã
+    # báo "nhiều chỗ chả thấy markdown gì cả" — đây là một trong các chỗ đó.
+    #
+    # `•` thì hiện thành dấu chấm tròn ở MỌI đường: lark_md, tin text trần,
+    # và bản `post` mà Hermes gửi. Một ký tự chạy đúng ở cả ba chỗ đáng giá hơn
+    # một cú pháp chỉ đúng ở một chỗ. Cùng ký tự với `bitable._bullets`, để nội
+    # dung trên Base và nội dung trong thẻ trông giống nhau.
+    BULLET = "• "
+
     def to_markdown(self) -> str:
         parts = [self.summary.strip()]
         if self.decisions:
             parts.append("\n**Quyết định đã chốt**")
-            parts.extend(f"- {d}" for d in self.decisions)
+            parts.extend(f"{self.BULLET}{d}" for d in self.decisions)
         if self.action_items:
             parts.append("\n**Việc cần làm**")
             for a in self.action_items:
-                line = f"- {a.task}"
+                line = f"{self.BULLET}{a.task}"
                 if a.owner:
-                    line += f"  — _{a.owner}_"
+                    # KHÔNG `_nghiêng_`: lark_md không có nghiêng, người dùng
+                    # nhận về đúng hai dấu gạch dưới quanh tên đồng nghiệp.
+                    line += f" — {a.owner}"
                 if a.due:
-                    line += f"  ({a.due})"
+                    line += f" (hạn {a.due})"
                 parts.append(line)
         return "\n".join(parts).strip()

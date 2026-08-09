@@ -85,7 +85,40 @@ async function listNewest() {
     .sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
 }
 
+/**
+ * URL công khai của `status/latest.json` — SUY RA, không hỏi Blob.
+ *
+ * Vì sao (04/08/2026): mỗi lần MỞ TRANG cũ đều gọi `list()`, mà `list()` là
+ * thao tác ĐẮT. Trang lại tự tải lại mỗi 60 giây, nên một tab để quên đốt ~1
+ * thao tác/phút VĨNH VIỄN — đo thật trên dashboard Vercel: ~10 thao tác/phút
+ * khi có vài tab mở, tức cạn hạn mức tháng trong vài ngày mà không ai đụng vào
+ * hệ thống. Đây mới là nguồn tiêu thật, không phải nhịp đẩy 2 giờ/lần của máy.
+ *
+ * Token có dạng `vercel_blob_rw_<STORE_ID>_<random>`, còn file ghi bằng
+ * `addRandomSuffix:false` nên pathname cố định => URL đoán được. Tải thẳng URL
+ * đó là thao tác ĐƠN GIẢN (data transfer), không tính vào hạn mức advanced.
+ */
+function publicBlobUrl(pathname) {
+  const tok = process.env.BLOB_READ_WRITE_TOKEN || "";
+  const m = tok.match(/^vercel_blob_rw_([^_]+)_/);
+  if (!m) return "";
+  return `https://${m[1].toLowerCase()}.public.blob.vercel-storage.com/${pathname}`;
+}
+
 async function loadSnapshot() {
+  // Đường RẺ trước: tải thẳng URL suy ra được.
+  const direct = publicBlobUrl(LATEST);
+  if (direct) {
+    try {
+      const r = await fetch(direct, { cache: "no-store" });
+      if (r.ok) return await r.json();
+      // 404 = chưa có snapshot nào; đừng rơi xuống list() cho tốn thêm.
+      if (r.status === 404) return null;
+    } catch { /* mạng chớp -> thử đường cũ */ }
+  }
+  // Đường CŨ, tốn `list()`: chỉ dùng khi không suy ra được URL (đổi định dạng
+  // token) hoặc fetch hỏng. Giữ lại để trang không chết, KHÔNG phải để dùng
+  // thường xuyên.
   const blobs = await listNewest();
   if (!blobs.length) return null;
   const resp = await fetch(blobs[0].url, { cache: "no-store" });
@@ -297,7 +330,13 @@ function render(s) {
           + " (" + new Date(av).toLocaleString('vi-VN') + ")";
       }
       tick(); setInterval(tick,1000);
-      setTimeout(function(){location.reload()}, 60000);
+      // Tải lại 5 PHÚT/lần, và CHỈ khi tab đang được nhìn (sửa 04/08/2026).
+      // Bản cũ reload cứng mỗi 60s kể cả tab nền: một tab để quên là một lượt
+      // gọi API mỗi phút mãi mãi. Máy chỉ đẩy snapshot mỗi 2 giờ nên tải lại
+      // dày hơn thế cũng chẳng có gì mới để xem.
+      setInterval(function(){
+        if (document.visibilityState === "visible") location.reload();
+      }, 300000);
     </script>`;
   return page("Trạng thái V2", body);
 }

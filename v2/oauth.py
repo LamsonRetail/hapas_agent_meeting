@@ -14,7 +14,7 @@ from __future__ import annotations
 import secrets
 import time
 
-from . import config, db, lark_api, tokenstore
+from . import cloudflare_relay, config, crypto, db, lark_api, tokenstore
 
 
 def _now_ms() -> int:
@@ -28,6 +28,10 @@ def start(open_id: str = "") -> tuple[str, str]:
     khi đó chỉ ràng buộc bằng nonce.
     """
     nonce = secrets.token_urlsafe(24)
+    # Cloudflare uses a stateless short link. Sign state only after the relay
+    # URL is explicitly enabled; saving the Queue token alone changes nothing.
+    if config.CF_RELAY_URL:
+        nonce = cloudflare_relay.make_state(nonce, config.OAUTH_NONCE_TTL)
     with db.tx() as c:
         c.execute("DELETE FROM oauth_nonce WHERE expires_at < ?", (_now_ms(),))
         c.execute(
@@ -48,14 +52,25 @@ def start_or_reuse(open_id: str, min_ttl_s: int = 3600) -> tuple[str, str]:
     `min_ttl_s`: chỉ dùng lại nonce còn sống lâu hơn ngần này, để không gửi cho
     người ta một link sắp chết.
     """
-    row = db.conn().execute(
+    rows = db.conn().execute(
         "SELECT nonce FROM oauth_nonce WHERE open_id=? AND expires_at > ? "
-        "ORDER BY expires_at DESC LIMIT 1",
+        "ORDER BY expires_at DESC",
         (open_id, _now_ms() + min_ttl_s * 1000),
-    ).fetchone() if open_id else None
-    if row:
-        return lark_api.authorize_url(row["nonce"]), row["nonce"]
+    ).fetchall() if open_id else []
+    for row in rows:
+        # During migration, old Vercel nonces can remain alive for their
+        # already-sent links. Never reuse one in a new Cloudflare URL: the
+        # Worker correctly rejects unsigned legacy state.
+        if state_reusable(row["nonce"]):
+            return lark_api.authorize_url(row["nonce"]), row["nonce"]
     return start(open_id)
+
+
+def state_reusable(state: str) -> bool:
+    """Whether an existing invite state matches the currently active relay."""
+    if not config.CF_RELAY_URL:
+        return True
+    return cloudflare_relay.verify_state(state)
 
 
 def complete(code: str, state: str) -> dict:
@@ -73,23 +88,49 @@ def complete(code: str, state: str) -> dict:
             c.execute("DELETE FROM oauth_nonce WHERE nonce=?", (state,))
         raise RuntimeError("phiên enroll đã hết hạn, bấm lại link")
 
-    out = lark_api.exchange_code(code)
-    access = out["access_token"]
-    refresh = out.get("refresh_token")
-    if not refresh:
-        raise RuntimeError(
-            "Lark không trả refresh_token. Gần như chắc chắn thiếu scope "
-            "'offline_access' trong OAUTH_SCOPES (v2/.env). Thêm vào, chạy lại "
-            "`python -m v2 enroll-url`, bấm Đồng ý lần nữa rồi complete.")
+    # OAuth code is one-time. Checkpoint the encrypted token pair immediately
+    # after exchange so a crash/user_info failure can resume without reusing
+    # an already-consumed code. The checkpoint is local SQLite only.
+    pending = db.conn().execute(
+        "SELECT * FROM oauth_exchange_pending WHERE state=?", (state,)).fetchone()
+    if pending:
+        access = crypto.decrypt(pending["access_enc"])
+        refresh = crypto.decrypt(pending["refresh_enc"])
+        expires_in = int(pending["expires_in"])
+        refresh_expires_in = int(pending["refresh_expires_in"])
+        scopes = pending["scopes"] or ""
+    else:
+        out = lark_api.exchange_code(code)
+        access = out["access_token"]
+        refresh = out.get("refresh_token")
+        if not refresh:
+            raise RuntimeError(
+                "Lark không trả refresh_token. Gần như chắc chắn thiếu scope "
+                "'offline_access' trong OAUTH_SCOPES (v2/.env). Thêm vào, chạy lại "
+                "`python -m v2 enroll-url`, bấm Đồng ý lần nữa rồi complete.")
+        expires_in = int(out.get("expires_in", 7200))
+        refresh_expires_in = int(out.get("refresh_token_expires_in", 30 * 86400))
+        scopes = out.get("scope", "")
+        with db.tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO oauth_exchange_pending"
+                "(state,access_enc,refresh_enc,expires_in,refresh_expires_in,scopes,exchanged_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (state, crypto.encrypt(access), crypto.encrypt(refresh), expires_in,
+                 refresh_expires_in, scopes, _now_ms()),
+            )
     info = tokenstore.enroll(
         access, refresh,
-        int(out.get("expires_in", 7200)),
-        int(out.get("refresh_token_expires_in", 30 * 86400)),
-        scopes=out.get("scope", ""),
+        expires_in,
+        refresh_expires_in,
+        scopes=scopes,
     )
 
     with db.tx() as c:
         c.execute("DELETE FROM oauth_nonce WHERE nonce=?", (state,))
+        # Usually removed by the FK cascade. Keep this explicit for old SQLite
+        # databases/connections where foreign_keys may have been toggled off.
+        c.execute("DELETE FROM oauth_exchange_pending WHERE state=?", (state,))
 
     # Hai việc dọn/kiểm sau khi enroll, đặt ở ĐÂY chứ không ở caller (sửa
     # 02/08/2026). `complete()` là chỗ nghẽn DUY NHẤT mà cả ba đường enroll đều
@@ -110,6 +151,28 @@ def complete(code: str, state: str) -> dict:
             gate.clear_invite(info["union_id"])
         except Exception as exc:          # noqa: BLE001 — dọn hỏng không được
             print(f"[enroll] không xoá được lời mời cũ: {exc}")   # làm hỏng enroll
+    # Token mới có thể vừa bổ sung scope VC mà job cũ chưa từng có. Xác minh lại
+    # trước khi đánh thức waiting_auth để người dự thật không bị kẹt vĩnh viễn ở
+    # metadata near/no_match cũ. Hàm này chỉ ghi khi recording khớp minute VÀ chính
+    # người vừa OAuth nằm trong attendee VC; không gửi tin và không enqueue.
+    try:
+        from . import orchestrator
+        upgraded = orchestrator.reverify_after_enroll(info)
+        if upgraded:
+            print(f"[enroll] xác minh lại ACL cho {len(upgraded)} minute cũ")
+    except Exception as exc:              # noqa: BLE001 - sửa ACL hỏng không phá enroll
+        print(f"[enroll] không xác minh lại được minute cũ: {exc}")
+
+    # Chỉ đánh thức job có quan hệ ID với CHÍNH người vừa tự OAuth. Không gửi
+    # lời mời cho ai khác; việc gửi link vẫn chỉ do `gate` làm khi họ nhắn bot.
+    try:
+        from . import jobstore
+        released = jobstore.release_waiting_auth(
+            info.get("open_id", ""), info.get("union_id", ""))
+        if released:
+            print(f"[enroll] {len(released)} job chờ quyền -> backlog priority 0")
+    except Exception as exc:              # noqa: BLE001 — cứu backlog hỏng không phá enroll
+        print(f"[enroll] không đánh thức được job chờ quyền: {exc}")
     return info
 
 
@@ -135,6 +198,13 @@ def short_link(url: str) -> str:
     Không dùng bit.ly/tinyurl: link enroll không nên đi qua bên thứ ba. Ở đây nó
     nằm trên chính hạ tầng dự án, cùng bearer với dashboard.
     """
+    from urllib.parse import parse_qs, urlsplit
+
+    # No KV/write is needed: the short URL carries the signed one-time state.
+    if config.CF_RELAY_URL:
+        state = (parse_qs(urlsplit(url).query).get("state") or [""])[0]
+        return cloudflare_relay.short_link(state)
+
     import secrets
     import httpx
 
@@ -207,8 +277,87 @@ def has_live_nonce() -> bool:
         (_now_ms(),)).fetchone() is not None
 
 
+def _announce_completed(info: dict, notify: bool) -> None:
+    """Run the user-facing tail shared by both remote callback transports."""
+    name = info.get("name") or info.get("open_id")
+    union_id = info.get("union_id", "")
+    print(f"[enroll] ✓ {name} đã cấp quyền")
+    if union_id and notify:
+        try:
+            from . import orchestrator
+            orchestrator.welcome_and_backlog(info)
+        except Exception as exc:          # noqa: BLE001 - token was already stored
+            print(f"[enroll] chào/backlog hỏng cho {name}: {exc}")
+
+
+def _terminal_cloudflare_error(exc: Exception, state: str, attempts: int) -> bool:
+    """Return True when retrying the same one-time code cannot help."""
+    # Missing/expired nonce is authoritative and also handles a duplicate after
+    # a prior success whose ACK response was lost.
+    row = db.conn().execute(
+        "SELECT expires_at FROM oauth_nonce WHERE nonce=?", (state,)).fetchone()
+    if not row or _now_ms() > int(row["expires_at"]):
+        return True
+    detail = str(exc).lower()
+    if "refresh_token" in detail or "offline_access" in detail:
+        return True  # code was already exchanged and cannot be used again
+    return attempts >= config.CF_QUEUE_MAX_ATTEMPTS
+
+
+def _poll_cloudflare(*, notify: bool, force: bool) -> list[dict]:
+    """Pull Queue messages and ACK only after terminal/success processing."""
+    if not force and not has_live_nonce():
+        return []
+    try:
+        messages = cloudflare_relay.pull_messages()
+    except Exception as exc:              # noqa: BLE001 - never kill the run loop
+        print(f"[enroll] không đọc được Cloudflare Queue: {exc}")
+        return []
+
+    done: list[dict] = []
+    ack: list[str] = []
+    retry: list[str] = []
+    for message in messages:
+        item = message.body
+        if item.get("fail"):
+            fail = item["fail"] if isinstance(item["fail"], dict) else {}
+            print("[enroll] ⚠ CÓ NGƯỜI BẤM LINK MÀ LARK TỪ CHỐI: "
+                  f"{fail.get('error')} — {fail.get('error_description') or ''}")
+            ack.append(message.lease_id)
+            continue
+
+        code, state = item.get("code"), item.get("state")
+        if item.get("version") != 1 or not isinstance(code, str) or not isinstance(state, str):
+            print("[enroll] Cloudflare Queue có message sai định dạng — đã loại")
+            ack.append(message.lease_id)
+            continue
+
+        try:
+            info = complete(code, state)
+        except Exception as exc:          # noqa: BLE001 - classify ACK vs retry
+            if _terminal_cloudflare_error(exc, state, message.attempts):
+                print(f"[enroll] state={state[:12]}… lỗi vĩnh viễn — đã loại: {exc}")
+                ack.append(message.lease_id)
+            else:
+                print(f"[enroll] state={state[:12]}… lỗi tạm thời — Queue sẽ thử lại: {exc}")
+                retry.append(message.lease_id)
+            continue
+
+        _announce_completed(info, notify)
+        done.append(info)
+        ack.append(message.lease_id)
+
+    try:
+        cloudflare_relay.settle_messages(ack=ack, retry=retry)
+    except Exception as exc:              # noqa: BLE001 - Queue is at-least-once
+        # If ACK is unconfirmed, a duplicate can return. complete() consumed
+        # the nonce, so the duplicate is terminal and cannot enroll/send twice.
+        print(f"[enroll] không xác nhận được Cloudflare Queue; message có thể giao lại: {exc}")
+    return done
+
+
 def poll_pending(*, notify: bool = True, force: bool = False) -> list[dict]:
-    """Lấy các code đang chờ ở Vercel rồi enroll. Trả danh sách người vừa xong.
+    """Lấy code ở Cloudflare và vét link Vercel cũ rồi enroll.
 
     Lỗi mạng KHÔNG ném ra ngoài: hàm này chạy trong vòng `run`, một cú Vercel
     502 không được phép làm chết orchestrator.
@@ -228,10 +377,16 @@ def poll_pending(*, notify: bool = True, force: bool = False) -> list[dict]:
     """
     import httpx
 
+    done: list[dict] = []
+    if cloudflare_relay.queue_enabled():
+        # Keep polling Vercel below as a migration drain for links that were
+        # already sent before cutover. New states go only through Cloudflare.
+        done.extend(_poll_cloudflare(notify=notify, force=force))
+
     if not (config.OAUTH_PULL_URL and config.STATUS_PUSH_SECRET):
-        return []
+        return done
     if not force and not has_live_nonce():
-        return []
+        return done
 
     try:
         resp = httpx.get(
@@ -241,13 +396,12 @@ def poll_pending(*, notify: bool = True, force: bool = False) -> list[dict]:
         )
         if resp.status_code != 200:
             print(f"[enroll] hộp thư trả {resp.status_code}: {resp.text[:120]}")
-            return []
+            return done
         items = (resp.json() or {}).get("pending") or []
     except Exception as exc:      # noqa: BLE001 — mạng hỏng không được làm chết vòng run
         print(f"[enroll] không đọc được hộp thư: {exc}")
-        return []
+        return done
 
-    done: list[dict] = []
     for it in items:
         # Lark từ chối ở bước Đồng ý: không có code, chỉ có lý do. Nói TO —
         # đây là bằng chứng duy nhất rằng có người đã bấm mà hỏng. Trước
@@ -268,21 +422,6 @@ def poll_pending(*, notify: bool = True, force: bool = False) -> list[dict]:
             print(f"[enroll] state={state[:8]}… bỏ qua: {exc}")
             continue
 
-        name = info.get("name") or info.get("open_id")
-        union_id = info.get("union_id", "")
-        # Kiểm scope + xoá lời mời đã chạy trong `complete()` — xem chú thích ở
-        # đó. Còn lại đây chỉ việc RIÊNG của đường tự phục vụ: người này vừa
-        # nhắn bot nên nhắn lại cho họ là đúng. Đường admin dán tay thì không:
-        # DM bất ngờ cho người không hỏi gì là chuyện khác.
-        print(f"[enroll] ✓ {name} đã cấp quyền")
-        if union_id and notify:
-            # Chào + liệt kê cuộc họp 7 ngày + tạo backlog (priority 0). Đặt
-            # trong orchestrator để dùng enqueue/meetings/jobstore; import cục
-            # bộ tránh vòng import. Chào/backlog hỏng KHÔNG làm hỏng enroll.
-            try:
-                from . import orchestrator
-                orchestrator.welcome_and_backlog(info)
-            except Exception as exc:          # noqa: BLE001
-                print(f"[enroll] chào/backlog hỏng cho {name}: {exc}")
+        _announce_completed(info, notify)
         done.append(info)
     return done

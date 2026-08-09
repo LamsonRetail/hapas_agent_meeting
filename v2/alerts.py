@@ -126,13 +126,26 @@ def _send(text: str) -> bool:
 # =====================================================================
 
 
+# Mã lỗi KHÔNG đáng DM. Job vẫn `failed`, vẫn hiện trên Base và vẫn nói lý do
+# cho ai hỏi tới cuộc họp đó (`qa.row_pending`) — chỉ là không đánh thức người
+# vận hành giữa ngày.
+#
+# Vì sao `empty_transcript` nằm đây (user chốt 05/08/2026, sau khi nhận 3 DM
+# liền trong một phút): bản ghi không có tiếng nói thì KHÔNG có việc gì để làm.
+# Không phải lỗi hạ tầng — whisper chết thì `_check_whisper` mới là mục báo, và
+# nó báo bằng một tin duy nhất thay vì một tin cho mỗi cuộc họp. Cảnh báo nào
+# cũng nổ thì người ta tắt thông báo của bot, rồi lúc hỏng thật cũng không đọc.
+SILENT_FAIL_CODES = frozenset({jobstore.ERR_EMPTY_TRANSCRIPT})
+
+
 def _text_failed(row: dict) -> str:
     return (
         "[V2] Job THẤT BẠI — cuộc họp này sẽ KHÔNG có biên bản\n"
         f"Cuộc họp: {row.get('title') or '(không tên)'}\n"
         f"minute_token: {row['minute_token']}\n"
         f"Đã thử: {row.get('attempts')}/{config.MAX_ATTEMPTS}\n"
-        f"Lỗi cuối: {(row.get('error') or '(không ghi lại)')[:300]}\n\n"
+        f"Lỗi cuối: {jobstore.error_text(row.get('error')) or '(không ghi lại)'}"[:300]
+        + "\n\n"
         "Sửa xong nguyên nhân thì trả job về hàng đợi:\n"
         f'  sqlite3 "{config.DB_PATH}" "UPDATE jobs SET status=\'queued\', '
         f"attempts=0 WHERE minute_token='{row['minute_token']}';\"\n"
@@ -155,6 +168,15 @@ def _check_failed_jobs(out: list[tuple[str, str, Any]]) -> None:
 
     for row in failed:
         key = f"job_failed:{row['minute_token']}"
+        if jobstore.error_code(row.get("error")) in SILENT_FAIL_CODES:
+            # In ra log thì vẫn in — dấu vết phải còn để chẩn về sau. Chỉ không
+            # DM. Và KHÔNG ghi mốc chống spam: mốc là để nhớ "đã báo rồi", mà ở
+            # đây có báo đâu; ghi vào là sau này bỏ mã khỏi danh sách im lặng
+            # thì job cũ vĩnh viễn không được báo lần nào.
+            print(f"[alert] {row['minute_token']} failed "
+                  f"({jobstore.error_code(row.get('error'))}) — KHÔNG DM, "
+                  f"không có việc gì cho người vận hành làm")
+            continue
         # Vân tay = attempts: job được cứu rồi failed lại thì attempts khác ->
         # báo lại. Cùng attempts = vẫn đúng cái hỏng cũ -> im.
         fp = str(row.get("attempts") or 0)
@@ -167,9 +189,10 @@ def _check_failed_jobs(out: list[tuple[str, str, Any]]) -> None:
 #  2. Whisper không gọi được (Việc 2b — watchdog kiểu log + cảnh báo)
 # =====================================================================
 #
-# CỐ Ý không tự bật lại whisper. V2 không nên đi mở cửa sổ Windows: nó chạy
-# dưới quyền người đăng nhập, spawn tiến trình từ vòng lặp là thứ không kiểm
-# được bằng test và hỏng âm thầm. Ở đây chỉ làm cho cái hỏng NHÌN THẤY ĐƯỢC.
+# Đường cảnh báo này CỐ Ý không tự bật tiến trình: nó còn được gọi bởi Scheduled
+# Task `python -m v2 alerts`, chạy song song với orchestrator. Quyền tự cứu chỉ ở
+# whisper_supervisor trong MỘT `v2 run` đã giữ OS mutex; nhờ vậy đường báo độc lập
+# không thể vô tình bật trùng model CPU.
 
 _WHISPER_SINCE = "whisper_down_since"      # mốc bắt đầu hỏng (epoch ms)
 _WHISPER_SENT = "whisper_down_alerted"     # đã DM cho lần hỏng này chưa
@@ -215,7 +238,8 @@ def _check_whisper(out: list[tuple[str, str, Any]]) -> None:
         f"TRANSCRIBE_URL: {config.TRANSCRIBE_URL}\n"
         f"Job đang chờ: {n_queued} — KHÔNG mất, và attempts KHÔNG tăng "
         "(lỗi hạ tầng không tính lần thử).\n"
-        "Bật lại: E:\\whisper\\run-server.bat rồi `python -m v2 doctor`.\n"
+        f"Vòng `v2 run` sẽ tự bật lại bằng: {config.WHISPER_START_SCRIPT}\n"
+        "Nếu vẫn lỗi, chạy script trên bằng tay rồi `python -m v2 doctor`.\n"
         "Whisper sống lại là job trong hàng đợi tự đi tiếp, không phải làm gì thêm."
     )))
 

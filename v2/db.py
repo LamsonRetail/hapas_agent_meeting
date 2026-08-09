@@ -84,6 +84,21 @@ CREATE TABLE IF NOT EXISTS oauth_nonce (
     expires_at  INTEGER
 );
 
+-- Checkpoint sau khi Lark đã đổi authorization code nhưng trước khi user_info/
+-- ghi bảng tokens hoàn tất. Code OAuth dùng một lần: nếu máy chết ở khe này mà
+-- không checkpoint, retry chỉ nhận "code đã dùng" và mất phiên. Token checkpoint
+-- luôn mã hóa Fernet, chỉ ở local, và tự xóa theo nonce.
+CREATE TABLE IF NOT EXISTS oauth_exchange_pending (
+    state               TEXT PRIMARY KEY,
+    access_enc          TEXT NOT NULL,
+    refresh_enc         TEXT NOT NULL,
+    expires_in          INTEGER NOT NULL,
+    refresh_expires_in  INTEGER NOT NULL,
+    scopes              TEXT,
+    exchanged_at        INTEGER NOT NULL,
+    FOREIGN KEY (state) REFERENCES oauth_nonce(nonce) ON DELETE CASCADE
+);
+
 -- Hàng đợi job. status theo máy trạng thái ở V2_ARCHITECTURE §5.
 CREATE TABLE IF NOT EXISTS jobs (
     minute_token TEXT PRIMARY KEY,
@@ -137,6 +152,17 @@ CREATE TABLE IF NOT EXISTS alert_state (
     updated_at INTEGER
 );
 
+-- Chống gửi lặp cho các tin trực tiếp không gắn với một meeting/delivery cụ thể
+-- (hiện là list_meetings). Bền qua restart MCP/gateway; fingerprint là SHA-256,
+-- không lưu thêm nội dung cuộc họp vào bảng điều khiển.
+CREATE TABLE IF NOT EXISTS outbound_dedup (
+    channel     TEXT NOT NULL,
+    recipient   TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    reserved_at INTEGER NOT NULL,
+    PRIMARY KEY (channel, recipient)
+);
+
 -- "Vé phiên" của người đang hỏi bot (v2/askers.py). Vì sao phải có bảng thay vì
 -- truyền thẳng union_id: MCP server là MỘT tiến trình dùng chung, lời gọi tool
 -- không mang danh tính, nên vé đi đường vòng qua tin nhắn (plugin Hermes chèn) và
@@ -171,6 +197,30 @@ CREATE TABLE IF NOT EXISTS transcript_requests (
     name         TEXT,
     requested_at INTEGER,
     PRIMARY KEY (minute_token, requester)
+);
+
+-- KÝ ỨC HỘI THOẠI (06/08/2026) — cuộc họp mà một người VỪA nhắc tới khi hỏi bot.
+--
+-- Vì sao cần một bảng, trong khi Hermes đã có lịch sử phiên: lịch sử đó chết khi
+-- phiên tự đóng (im 1 tiếng, hoặc 4h sáng) và khi `hermes gateway restart`. Sau
+-- mỗi lần đó, câu tiếp nối kiểu "gửi nguyên văn cuộc đó" mất hết chỗ dựa và bot
+-- phải bắt người ta gõ lại cả tên cuộc họp — đúng cái người dùng gọi là "không
+-- có ký ức".
+--
+-- Bảng này KHÔNG phải nguồn quyền và KHÔNG phải nguồn nội dung:
+--   * chỉ ghi sau khi `qa._may_see` đã cho qua, nên nó không chứa gì mà chính
+--     người đó chưa được xem — ghi vào đây không nới quyền cho ai;
+--   * chỉ có token + tiêu đề + mốc thời gian. Không tóm tắt, không nguyên văn.
+--     Câu trả lời vẫn phải gọi tool và vẫn qua ACL như trước;
+--   * đọc ra để bơm vào prompt, agent dùng nó để HIỂU câu hỏi tiếp nối, không
+--     phải để dựng câu trả lời.
+-- Khoá kép (người, cuộc) nên nhắc lại một cuộc chỉ đẩy mốc, không sinh dòng mới.
+CREATE TABLE IF NOT EXISTS chat_memory (
+    union_id     TEXT NOT NULL,
+    minute_token TEXT NOT NULL,
+    title        TEXT,
+    touched_at   INTEGER,
+    PRIMARY KEY (union_id, minute_token)
 );
 
 -- Thuật ngữ/tên riêng ứng viên cho glossary whisper (part B, 03/08/2026).
@@ -244,10 +294,34 @@ def _migrate() -> None:
                           ("recap_fails", "INTEGER DEFAULT 0"),
                           # 2=cực cao (có người hỏi), 1=thường (cuộc mới),
                           # 0=backlog (7 ngày lúc enroll). Job cũ mặc định 1.
-                          ("priority", "INTEGER DEFAULT 1")):
+                          ("priority", "INTEGER DEFAULT 1"),
+                          # Sổ sách cache bản chép sẵn của Lark (v2/larktext.py,
+                          # 07/08/2026). Chữ THẬT nằm trên đĩa
+                          # (`larktext.path_of`), ba cột này chỉ để biết đã lấy
+                          # được chưa và lần thử gần nhất lúc nào — nhờ
+                          # `lark_tried_at` mà một cuộc không đọc được không bị
+                          # nã lại hàng chục lời gọi Lark ở MỖI câu hỏi.
+                          ("lark_chars", "INTEGER"),
+                          ("lark_at", "INTEGER"),
+                          ("lark_tried_at", "INTEGER")):
             if col not in have:
                 c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
                 print(f"[db] thêm cột jobs.{col}")
+
+        # 05/08/2026: thiếu người có token tải recording không phải job hỏng.
+        # Park sáu job cũ (và mọi bản cùng hình dạng) để không retry nóng/DM mời
+        # OAuth. Khi một người liên quan TỰ nhắn bot + OAuth, jobstore mới đánh
+        # thức đúng job của họ về backlog priority 0.
+        cur = c.execute(
+            "UPDATE jobs SET status='waiting_auth', priority=0 "
+            "WHERE status='failed' AND ("
+            "error LIKE '%không có người dự nào đã enroll để đọc bản ghi%' OR "
+            "(error LIKE '%không ai được phép tải bản ghi này%' AND "
+            " error LIKE '%cấp quyền cho hệ thống%'))"
+        )
+        if cur.rowcount:
+            print(f"[db] {cur.rowcount} job thiếu quyền -> waiting_auth "
+                  f"(chờ người liên quan tự OAuth)")
 
 
 @contextmanager
@@ -262,6 +336,44 @@ def tx() -> Iterator[sqlite3.Connection]:
         raise
     else:
         c.execute("COMMIT")
+
+
+# ------------------------------------------ chống gửi lặp bền qua process restart
+
+
+def try_reserve_outbound(channel: str, recipient: str, fingerprint: str,
+                         within_seconds: int) -> bool:
+    """Đặt chỗ gửi nguyên tử. False nếu cùng nội dung vừa được đặt chỗ/gửi.
+
+    Đặt chỗ trước network call để hai MCP process không cùng vượt qua phép kiểm.
+    Caller phải gọi ``release_outbound`` khi gửi hỏng để lần sau được thử lại ngay.
+    """
+    now = _now_ms()
+    cutoff = now - max(0, int(within_seconds)) * 1000
+    with tx() as c:
+        row = c.execute(
+            "SELECT fingerprint, reserved_at FROM outbound_dedup "
+            "WHERE channel=? AND recipient=?", (channel, recipient),
+        ).fetchone()
+        if (row and row["fingerprint"] == fingerprint
+                and int(row["reserved_at"] or 0) >= cutoff):
+            return False
+        c.execute(
+            "INSERT INTO outbound_dedup(channel, recipient, fingerprint, reserved_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(channel,recipient) DO UPDATE SET "
+            "fingerprint=excluded.fingerprint, reserved_at=excluded.reserved_at",
+            (channel, recipient, fingerprint, now),
+        )
+        return True
+
+
+def release_outbound(channel: str, recipient: str, fingerprint: str) -> None:
+    """Bỏ đúng reservation vừa tạo khi network call hỏng; không xoá lượt mới hơn."""
+    with tx() as c:
+        c.execute(
+            "DELETE FROM outbound_dedup WHERE channel=? AND recipient=? "
+            "AND fingerprint=?", (channel, recipient, fingerprint),
+        )
 
 
 # --------------------------------------------------- chống trùng minute
@@ -312,7 +424,10 @@ def clear_seen(minute_token: str) -> None:
 
 def note_viewer(minute_token: str, open_id: str, union_id: str = "",
                 name: str = "") -> None:
-    """Ghi nhận: người đã enroll này nhìn thấy minute đó trong Minutes của họ.
+    """Ghi nhận: token người này tìm/đọc được minute đó.
+
+    KHÔNG phải bằng chứng tham dự và không được dùng cho ACL/người nhận. Lark
+    Minutes Search có thể trả cả bản ghi được chia sẻ của người khác.
 
     Idempotent (`INSERT OR IGNORE` trên khóa kép) — gọi mỗi vòng quét là bình
     thường. Giữ `seen_at` của LẦN ĐẦU, không cập nhật: nó trả lời "từ bao giờ ta
@@ -329,7 +444,7 @@ def note_viewer(minute_token: str, open_id: str, union_id: str = "",
 
 
 def viewers_of(minute_token: str) -> list[dict]:
-    """Người đã enroll mà Lark báo là có dự cuộc họp này (thứ tự thấy trước)."""
+    """Người đã enroll từng tìm/đọc được minute này (thứ tự thấy trước)."""
     rows = conn().execute(
         "SELECT open_id, union_id, name, seen_at FROM minute_viewers "
         "WHERE minute_token=? ORDER BY seen_at", (minute_token,)).fetchall()
@@ -385,6 +500,72 @@ def clear_transcript_requests(minute_token: str) -> None:
     with tx() as c:
         c.execute("DELETE FROM transcript_requests WHERE minute_token=?",
                   (minute_token,))
+
+
+# --- Ký ức hội thoại: cuộc họp người này VỪA nhắc tới ----------------
+#
+# Đọc chú thích bảng `chat_memory` trong _SCHEMA trước khi sửa: đây không phải
+# nguồn quyền, không phải nguồn nội dung, và không được biến thành hai thứ đó.
+
+# Ký ức cũ hơn ngần này thì không còn giúp hiểu câu hỏi tiếp nối nữa, chỉ làm
+# prompt dài và làm bot nhắc tới một cuộc họp người ta đã quên. Tự dọn lúc ghi,
+# không cần cron riêng.
+CHAT_MEMORY_TTL_DAYS = 7
+
+
+def remember_meeting(union_id: str, minute_token: str, title: str = "") -> None:
+    """Ghi 'người này vừa nhắc tới cuộc họp đó'. Gọi SAU khi đã kiểm quyền.
+
+    Idempotent theo cặp (người, cuộc): nhắc lại chỉ đẩy `touched_at`, nên bảng
+    lớn theo số cuộc họp người ta thật sự hỏi, không theo số tin nhắn.
+    """
+    union_id = (union_id or "").strip()
+    minute_token = (minute_token or "").strip()
+    if not union_id or not minute_token:
+        return
+    now = _now_ms()
+    cutoff = now - CHAT_MEMORY_TTL_DAYS * 86_400_000
+    with tx() as c:
+        c.execute("DELETE FROM chat_memory WHERE touched_at < ?", (cutoff,))
+        c.execute(
+            "INSERT INTO chat_memory(union_id, minute_token, title, touched_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(union_id, minute_token) DO UPDATE SET "
+            "  title=COALESCE(NULLIF(excluded.title,''), chat_memory.title), "
+            "  touched_at=excluded.touched_at",
+            (union_id, minute_token, (title or "").strip(), now),
+        )
+
+
+def recent_meetings(union_id: str, limit: int = 3) -> list[dict]:
+    """Cuộc họp người này vừa nhắc tới, mới nhất trước. Bỏ mục đã quá TTL.
+
+    Lọc TTL khi đọc chứ không chỉ dựa vào lần dọn lúc ghi: người ngừng hỏi một
+    tháng thì không có lần ghi nào để dọn, và ký ức cũ đó vẫn sẽ được bơm vào
+    prompt của lần quay lại.
+    """
+    union_id = (union_id or "").strip()
+    if not union_id:
+        return []
+    cutoff = _now_ms() - CHAT_MEMORY_TTL_DAYS * 86_400_000
+    # Chốt phụ `rowid DESC`: `touched_at` chỉ tới mili-giây, và hai lần ghi
+    # trong cùng một lượt xử lý VẪN trùng mốc thật (đã làm selftest chập chờn
+    # ngay hôm thêm bảng này). Trùng mốc mà không có chốt phụ thì thứ tự do
+    # SQLite tự chọn — tức "cuộc vừa nhắc tới" có thể ra sai, đúng thứ khối ký
+    # ức tồn tại để trả lời.
+    rows = conn().execute(
+        "SELECT minute_token, title, touched_at FROM chat_memory "
+        "WHERE union_id=? AND touched_at >= ? "
+        "ORDER BY touched_at DESC, rowid DESC LIMIT ?",
+        (union_id, cutoff, max(1, int(limit))),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def forget_meetings(union_id: str) -> int:
+    """Xoá ký ức của một người (đường vận hành khi họ yêu cầu). Trả số dòng xoá."""
+    with tx() as c:
+        return c.execute("DELETE FROM chat_memory WHERE union_id=?",
+                         (union_id,)).rowcount
 
 
 # --- Glossary ứng viên (part B: whisper tự cải thiện) ---------------

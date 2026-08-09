@@ -186,6 +186,22 @@ KEY_BACKUP_PATH = Path(_get(
 TRANSCRIBE_URL = _get("TRANSCRIBE_URL", "http://localhost:8000")
 # Ngôn ngữ gợi ý cho Whisper (để trống -> tự phát hiện).
 TRANSCRIBE_LANG = _get("TRANSCRIBE_LANG", "vi")
+# Vòng `run` tự cứu Whisper LOCAL khi tiến trình chết. Script mặc định nằm cạnh
+# repo (`D:\\MeetingxLark` -> `D:\\whisper` trên máy hiện tại), không đóng đinh
+# ký tự ổ đĩa; máy khác có thể đặt lại bằng WHISPER_START_SCRIPT. Endpoint từ xa
+# không bao giờ được spawn từ đây, kể cả khi cờ đang bật.
+_WHISPER_SCRIPT_DEFAULT = (
+    _ROOT.parent.parent / "whisper" /
+    ("run-server.bat" if os.name == "nt" else "run-server.sh")
+)
+WHISPER_AUTOSTART = _get_bool("WHISPER_AUTOSTART", True)
+WHISPER_START_SCRIPT = Path(_get(
+    "WHISPER_START_SCRIPT", str(_WHISPER_SCRIPT_DEFAULT)))
+# Chặn vòng lặp spawn khi script/cấu hình hỏng. Process còn sống nhưng health lỗi
+# thì KHÔNG kill và KHÔNG bật bản thứ hai; cooldown chủ yếu bảo vệ ca process vừa
+# thoát ngay sau khi được bật.
+WHISPER_RESTART_COOLDOWN = max(
+    60, _get_int("WHISPER_RESTART_COOLDOWN", 15 * 60))
 # KHÔNG thêm lại hằng "tên engine" ở đây: transcribe.py lấy tên model THẬT từ
 # /status của server (faster-whisper/<model>). Một hằng số dán cứng sẽ nói dối
 # hồ sơ transcript ngay lần đầu ai đó đổi model trong run-server.bat.
@@ -222,6 +238,25 @@ POLL_INTERVAL = _get_int("POLL_INTERVAL", 300)     # giây giữa 2 vòng quét
 # = 150 minute/người/vòng, thừa sức cho 7 ngày), và minute đã xử lý bị loại ngay
 # bằng `db.is_claimed` / `jobstore.get` trước khi tốn bất kỳ lời gọi nào khác.
 LOOKBACK_DAYS = _get_int("LOOKBACK_DAYS", 7)
+
+# Quét lùi bao nhiêu ngày khi MỘT NGƯỜI VỪA KẾT NỐI, để tạo backlog cuộc họp cũ
+# của riêng họ (`orchestrator.welcome_and_backlog`). KHÁC `LOOKBACK_DAYS`:
+#   LOOKBACK_DAYS        chạy MỖI VÒNG, cho MỌI người, mãi mãi.
+#   ENROLL_BACKFILL_DAYS chạy MỘT LẦN, cho MỘT người, lúc họ vào.
+# Vì chỉ chạy một lần nên nới cửa sổ này rẻ hơn hẳn nới `LOOKBACK_DAYS` — đó
+# đúng là lý do tách ra (06/08/2026, user muốn "ai cũng có 90 ngày cuộc họp cũ"
+# thay vì chỉ vài người được chạy `backfill` bằng tay).
+#
+# MẶC ĐỊNH = LOOKBACK_DAYS, tức KHÔNG đổi hành vi cho tới khi tự đặt trong .env.
+# Trước khi đặt 90, đọc `docs/CURRENT_CONTEXT.md` §11c và cân nhắc:
+#   - job vào `priority=0` + `notify=False`, nên cuộc mới vẫn chen trước và
+#     không ai bị nhắn về cuộc họp từ tháng 3 — phần đó an toàn;
+#   - nhưng phiên âm chạy bằng CPU: một buổi đào tạo 2-3 tiếng tốn ~25 phút
+#     máy. Mỗi người mới có thể thêm vài chục cuộc vào hàng đợi đó;
+#   - và cuộc nào mà CHỦ BẢN GHI chưa kết nối thì sẽ dừng ở `waiting_auth` dù
+#     có nạp về — Lark không đưa nội dung cho token nào khác (đo 06/08/2026,
+#     xem `v2/coverage.py`). Đo trước bằng `python -m v2 coverage --days 90`.
+ENROLL_BACKFILL_DAYS = _get_int("ENROLL_BACKFILL_DAYS", LOOKBACK_DAYS)
 SETTLE_MINUTES = _get_int("SETTLE_MINUTES", 3)     # chờ Lark liên kết bản ghi
 CAL_WINDOW_HOURS = _get_int("CAL_WINDOW_HOURS", 3)
 # Khi KHÔNG xác minh được sự kiện <-> cuộc họp bằng meeting_id (thiếu scope),
@@ -292,6 +327,13 @@ QA_ADMIN_UNION_IDS = [s.strip() for s in
 # đây là "im lặng bao lâu thì phải xin vé mới", không phải giới hạn hội thoại.
 QA_TOKEN_TTL = _get_int("QA_TOKEN_TTL", 900)
 
+# Tên bot tự xưng khi có người hỏi "bạn là ai" (06/08/2026). Chỉ TÊN nằm ở env;
+# phần mô tả việc làm được / luồng / giới hạn nằm trong `v2/profile.py` để nó
+# được version-control và được selftest kiểm nội dung. Đọc qua `_get` chứ không
+# `os.environ` trực tiếp: mọi env của V2 nằm trong `v2/.env`, và chỉ `_get` mới
+# nạp file đó.
+BOT_NAME = _get("V2_BOT_NAME", "").strip() or "Thư Ký"
+
 # ------------------------------------------ glossary tự cải thiện (part B)
 #
 # Thuật ngữ/tên riêng đã DUYỆT được nhồi vào initial_prompt whisper — gửi ĐỘNG
@@ -299,6 +341,25 @@ QA_TOKEN_TTL = _get_int("QA_TOKEN_TTL", 900)
 # của server: file đó chỉ đọc lúc startup nên ghi vào sẽ phải restart mỗi lần
 # duyệt. Ứng viên do Hermes trích sau mỗi cuộc, admin duyệt QUA BOT (nhắn 'duyệt
 # <từ>'). Người duyệt = QA_ADMIN_UNION_IDS; digest tuần gửi tới ALERT_UNION_IDS.
+# Quét CẢ minute chỉ "mở xem được" chứ không riêng minute Lark xếp mình là
+# người dự (04/08/2026, user chốt). Vì sao cần: Lark KHÔNG xếp một người vào
+# `participant_ids` của mọi bản ghi họ thực sự dự — đo trên tài khoản BOD, lọc
+# theo người ra 5 cuộc, chỉ lọc thời gian ra 7; hai cuộc chênh là cuộc có ghi
+# hình mà người đó khẳng định có ngồi họp. Trước khi có cờ này, chúng biến mất
+# khỏi hệ thống mà không dấu vết nào.
+#
+# ⚠️ Cờ này chỉ nới NGUỒN NẠP, KHÔNG nới quyền xem: `db.note_viewer` vẫn chỉ ghi
+# cho minute qua bộ lọc người dự, nên cuộc nạp bằng đường rộng mà không ai được
+# Lark xác nhận có dự thì KHÔNG ai nhận thẻ báo và KHÔNG ai kéo được biên bản
+# (trừ admin). Đổi điều đó là đổi mô hình phân quyền — đừng làm ở đây.
+# MẶC ĐỊNH TẮT (đổi lại 04/08/2026, cùng ngày bật). Bật lên nửa ngày rồi tắt vì
+# đo được cái giá: danh sách "mở xem được" của một người kéo theo cả cuộc của
+# phòng khác — CDP, BI Dashboard, HRIS — mà KHÔNG ai trong hệ thống dự. Chúng
+# tốn CPU phiên âm, nằm trên Base, và làm danh sách của admin lẫn lộn tới mức
+# không đọc được. Đổi lại chỉ vớt được 1 cuộc thật trong 7 ngày.
+# Bật khi cần quét rộng một đợt (vd đi tìm cuộc bị sót), rồi tắt lại.
+SCAN_ALL_VISIBLE = _get_bool("V2_SCAN_ALL_VISIBLE", False)
+
 GLOSSARY_ENABLED = _get_bool("V2_GLOSSARY_ENABLED", True)
 # Chỉ nổi ứng viên gặp >= ngần này CUỘC trong digest (cắt nhiễu nghe-nhầm một lần).
 GLOSSARY_MIN_COUNT = _get_int("V2_GLOSSARY_MIN_COUNT", 2)
@@ -365,6 +426,19 @@ OAUTH_PULL_URL = _get(
     (STATUS_PUSH_URL.rsplit("/api/", 1)[0] + "/api/oauth-pending")
     if STATUS_PUSH_URL else "",
 )
+
+# Cloudflare Worker + Queue thay hộp thư Vercel Blob. Các ID/URL không bí mật;
+# Queue API token và khóa HMAC chỉ nằm ở máy local. CF_RELAY_URL để trống cho tới
+# lúc cutover: nhờ vậy có thể lưu/kiểm token trước mà restart app cũng không đổi luồng.
+CF_RELAY_URL = _get("CF_RELAY_URL", "").rstrip("/")
+CF_ACCOUNT_ID = _get("CF_ACCOUNT_ID", "")
+CF_QUEUE_ID = _get("CF_QUEUE_ID", "")
+CF_QUEUE_API_TOKEN = _get("CF_QUEUE_API_TOKEN", "")
+OAUTH_STATE_SECRET = _get("OAUTH_STATE_SECRET", "")
+CF_QUEUE_TIMEOUT = _get_int("CF_QUEUE_TIMEOUT", 20)
+CF_QUEUE_BATCH_SIZE = _get_int("CF_QUEUE_BATCH_SIZE", 10)
+CF_QUEUE_VISIBILITY_SECONDS = _get_int("CF_QUEUE_VISIBILITY_SECONDS", 120)
+CF_QUEUE_MAX_ATTEMPTS = _get_int("CF_QUEUE_MAX_ATTEMPTS", 5)
 # Giãn cách tối thiểu giữa 2 lần đẩy trong vòng run() (giây). 0 = mỗi vòng.
 #
 # Mặc định 7200 chứ KHÔNG phải 0 (đổi 02/08/2026): mỗi lần đẩy là một thao tác
@@ -442,15 +516,17 @@ def ensure_dirs() -> None:
 
 def summary() -> str:
     """Chuỗi tóm tắt cấu hình để in lúc khởi động (không lộ secret)."""
-    def mask(s: str) -> str:
-        return (s[:6] + "…") if s else "(trống)"
     return (
         f"domain={LARK_DOMAIN} app_id={APP_ID} "
-        f"app_secret={mask(APP_SECRET)} fernet={'có' if FERNET_KEY else 'TRỐNG'}\n"
+        f"app_secret={'(đã đặt)' if APP_SECRET else '(trống)'} "
+        f"fernet={'có' if FERNET_KEY else 'TRỐNG'}\n"
         f"redirect_uri={OAUTH_REDIRECT_URI or '(chưa đặt)'}\n"
-        f"transcribe={TRANSCRIBE_URL} llm={LLM_MODEL if LLM_API_KEY else '(không có key)'}\n"
+        f"transcribe={TRANSCRIBE_URL} "
+        f"(autostart={'bật' if WHISPER_AUTOSTART else 'tắt'}) "
+        f"llm={LLM_MODEL if LLM_API_KEY else '(không có key)'}\n"
         f"poll={POLL_INTERVAL}s lookback={LOOKBACK_DAYS}d settle={SETTLE_MINUTES}m "
         f"send={'THẬT' if SEND_MODE else 'dry-run'} paused={PAUSED}\n"
+        f"oauth_relay={'Cloudflare ' + CF_RELAY_URL if CF_RELAY_URL else ('Vercel ' + OAUTH_PULL_URL if OAUTH_PULL_URL else '(tắt)')}\n"
         f"dashboard={STATUS_PUSH_URL or '(tắt)'}\n"
         f"base={'bảng ' + BITABLE_TABLE_ID if BITABLE_APP_TOKEN else '(tắt)'} "
         f"cảnh báo={str(len(ALERT_UNION_IDS)) + ' người' if ALERT_UNION_IDS else '(tắt)'}"

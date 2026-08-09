@@ -6,13 +6,16 @@ CLI orchestrator V2.
     python -m v2 enroll [--port 8080]   # OAuth qua callback LOCAL (localhost)
     python -m v2 enroll-url             # chỉ in link OAuth (dùng với Vercel)
     python -m v2 complete --code X --state Y   # hoàn tất thủ công (Vercel/xa)
+    python -m v2 cloudflare-config --account-id X --queue-id Y  # nhập Queue token ẩn
     python -m v2 scan                   # quét 1 lần
     python -m v2 enqueue --token T [--reader ou_x]  # nạp 1 minute tay (test)
+    python -m v2 backfill --days 180 [--yes]   # nạp bù cuộc họp cũ hơn LOOKBACK_DAYS
     python -m v2 process [--send]       # xử lý hàng đợi 1 lần
     python -m v2 run [--ws] [--send]    # vòng lặp chính
     python -m v2 alerts [--dry-run]     # kiểm + gửi cảnh báo DM một lượt
     python -m v2 users                  # ai đã enroll (kể cả đã thu hồi)
     python -m v2 revoke --open-id ou_X --yes   # thu hồi quyền một người
+    python -m v2 unauth --union-id on_X --yes  # xoá quyền để cấp lại từ đầu (tự test)
     python -m v2 push-status [--print]  # đẩy snapshot lên dashboard Vercel
     python -m v2 base-init              # tạo Base "nội dung đã chốt" (1 lần)
     python -m v2 base-sync              # đổ lại ô theo dõi + cột Trạng thái
@@ -44,6 +47,33 @@ def cmd_genkey(_) -> None:
     print("# -> đặt vào V2_FERNET_KEY trong v2/.env", file=sys.stderr)
 
 
+def cmd_cloudflare_config(args) -> None:
+    """Verify and save the scoped Queue token without echoing it to screen."""
+    from . import cloudflare_relay
+    try:
+        token = None
+        if args.token_stdin:
+            token = sys.stdin.readline().strip()
+        elif args.token_dialog:
+            import tkinter as tk
+            from tkinter import simpledialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            try:
+                token = simpledialog.askstring(
+                    "Cloudflare Queue token",
+                    "Dán token vào đây rồi bấm OK (ký tự được che):",
+                    show="*", parent=root) or ""
+            finally:
+                root.destroy()
+        cloudflare_relay.configure_interactive(
+            args.account_id, args.queue_id, token=token)
+    except RuntimeError as exc:
+        print(f"Không lưu cấu hình: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
 def cmd_status(_) -> None:
     _init()
     print(config.summary())
@@ -51,10 +81,9 @@ def cmd_status(_) -> None:
     print(tokenstore.auth_report())
     print("\nHàng đợi:")
     counts: dict[str, int] = {}
-    # 4 status cuối là di sản của cửa duyệt đã bỏ — job mới không vào đó nữa,
-    # nhưng job cũ trong DB vẫn phải hiện ra.
-    for st in ("queued", "transcribing", "recapping", "delivered", "failed",
-               "awaiting_approval", "owner_only", "expired", "discarded"):
+    # Danh sách nằm ở `jobstore.ALL_STATUSES`, KHÔNG gõ lại ở đây: bản cũ gõ tay
+    # và quên `held`, nên bảng này cộng ra 61 trong khi DB có 72 job.
+    for st in jobstore.ALL_STATUSES:
         rows = jobstore.by_status(st)
         if rows:
             counts[st] = len(rows)
@@ -121,6 +150,17 @@ def cmd_complete(args) -> None:
 def cmd_doctor(_) -> None:
     from . import doctor
     sys.exit(doctor.run())
+
+
+def cmd_profile(_) -> None:
+    """In đúng hồ sơ mà bot đang dùng để tự giới thiệu.
+
+    Không cần `_init()`: hồ sơ là hằng số trong code, không đọc DB. Có lệnh này
+    để người vận hành đối chiếu được "bot nói gì về mình" mà không phải đi hỏi
+    bot rồi đoán xem câu trả lời có phải LLM tự bịa không.
+    """
+    from . import profile
+    print(profile.text())
 
 
 def cmd_gate(args) -> None:
@@ -271,6 +311,55 @@ def cmd_revoke(args) -> None:
         print(f"Còn {len(still_active)} người active.")
 
 
+def cmd_unauth(args) -> None:
+    """XOÁ HẲN quyền của một người để họ cấp lại từ đầu — dành cho việc TỰ TEST.
+
+    Khác `revoke` ở chỗ dùng vào việc gì:
+      * `revoke` = khoá gấp một người, giữ lại dòng `tokens` với status
+        `revoked` làm dấu vết ai từng có quyền;
+      * `unauth` = xoá sạch dấu vết auth của CHÍNH MÌNH để diễn lại luồng người
+        mới. Giữ `revoked` thì cửa vào tra ra "người này đã bị thu hồi" và đi
+        nhánh khác — không diễn lại được cảnh người lạ nhắn bot lần đầu.
+
+    XOÁ: dòng `tokens` + lời mời đang treo (`enroll_invites`). Lời mời phải xoá
+    theo, nếu không `gate.check` thấy nonce còn hạn và chỉ nhắc "bấm link cũ đi"
+    thay vì gửi link mới.
+
+    GIỮ NGUYÊN: jobs, transcript, người dự, record Base, ứng viên glossary. Cấp
+    quyền lại là dùng được ngay toàn bộ dữ liệu cũ — `tokens` chỉ là chìa khoá
+    đọc Lark, không phải nơi chứa dữ liệu họp.
+    """
+    _init()
+    from . import db
+    users = tokenstore.list_users(active_only=False)
+    key = args.union_id or args.open_id
+    who = next((u for u in users
+                if u.get("union_id") == key or u.get("open_id") == key), None)
+    if not who:
+        print(f"Không thấy ai có {key} trong bảng tokens. "
+              f"Xem: python -m v2 users", file=sys.stderr)
+        sys.exit(1)
+    name = who.get("name") or who["open_id"]
+    if not args.yes:
+        print(f"Sẽ XOÁ quyền của: {name} ({who['open_id']})")
+        print("  Giữ nguyên: biên bản, transcript, người dự, record Base.")
+        print("  Người đó nhắn bot lần sau sẽ nhận link cấp quyền mới.")
+        print("Thêm --yes để làm thật.", file=sys.stderr)
+        sys.exit(1)
+    with db.tx() as c:
+        n_tok = c.execute("DELETE FROM tokens WHERE open_id=?",
+                          (who["open_id"],)).rowcount
+        n_inv = c.execute("DELETE FROM enroll_invites WHERE union_id=?",
+                          (who.get("union_id") or "",)).rowcount
+        n_ses = c.execute("DELETE FROM qa_sessions WHERE open_id=?",
+                          (who["open_id"],)).rowcount
+    print(f"✓ Đã xoá quyền: {name}")
+    print(f"  tokens {n_tok} dòng · lời mời {n_inv} · vé phiên {n_ses}")
+    left = [u for u in tokenstore.list_users(active_only=True)]
+    print(f"  còn {len(left)} người active.")
+    print("Giờ nhắn bot bằng chính tài khoản đó — nó sẽ gửi link cấp quyền mới.")
+
+
 def cmd_alerts(args) -> None:
     """Chạy một lượt kiểm cảnh báo ngay, không phải chờ vòng `run`.
 
@@ -343,27 +432,62 @@ def cmd_enqueue(args) -> None:
     print("Đã nạp job." if ok else "Không nạp (đã có/đã khóa hoặc lỗi).")
 
 
+def cmd_coverage(args) -> None:
+    """Chỉ đọc: không tạo job, không đổi status, không nhắn ai."""
+    _init()
+    from . import coverage
+    sys.exit(coverage.report(args.days))
+
+
+def cmd_backfill(args) -> None:
+    """Nạp bù cuộc họp cũ hơn cửa sổ quét thường. Mặc định THỬ KHÔ.
+
+    Đòi `--yes` để ghi thật, cùng lý lẽ với `revoke`/`unauth`: nó tạo hàng chục
+    job và từng ấy record trên Base, rồi whisper sẽ phiên âm dần ở nền — không
+    phải thứ nên chạy vì gõ nhầm. Xem `orchestrator.backfill_missing` để biết vì
+    sao KHÔNG chữa bằng cách nới `LOOKBACK_DAYS`.
+    """
+    _init()
+    rows = orchestrator.backfill_missing(args.days, dry_run=not args.yes,
+                                         priority=args.priority)
+    if not args.yes:
+        print(f"\nThử khô: {len(rows)} cuộc SẼ được nạp. Thêm --yes để làm thật.")
+        print("Chúng vào backlog (priority 0), KHÔNG gửi tin cho ai; vòng `run` "
+              "phiên âm dần, mỗi vòng một cuộc.")
+
+
 def cmd_process(args) -> None:
     _init()
     orchestrator.process_queue(dry_run=not args.send)
 
 
 def cmd_run(args) -> None:
-    _init()
-    if args.send:
-        config.SEND_MODE = True
-    if args.ws:
-        # Cấu hình hiện tại: Hermes dùng CÙNG app_id (docs §12). Lark không từ
-        # chối kết nối thứ hai nên không có lỗi nào báo — chỉ là Hermes lặng lẽ
-        # mất tin nhắn. Nói to ở đây vì đó là lỗi im lặng duy nhất còn lại.
-        print("!" * 60)
-        print("[!] --ws: nếu Hermes đang chạy trên cùng app_id, TẮT cờ này.")
-        print("    Lark nhận cả 2 kết nối, không báo lỗi, nhưng Hermes có thể")
-        print("    mất tin nhắn. V2 không cần --ws (polling là nguồn sự thật).")
-        print("!" * 60)
-        from . import ws_listener
-        ws_listener.start_in_thread()
-    orchestrator.run()
+    # Khóa TRƯỚC `_init()`: process thua không được mở DB, chạy migration hay
+    # khởi tạo bất kỳ side effect nào. Batch vẫn quét process để báo sớm, nhưng
+    # mutex này mới là hàng rào nguyên tử chống hai lần phát.
+    from . import singleton
+    try:
+        run_lock = singleton.acquire(config.DB_PATH)
+    except singleton.AlreadyRunning as exc:
+        print(f"[x] V2 run đã có tiến trình khác: {exc}", file=sys.stderr)
+        raise SystemExit(singleton.EXIT_ALREADY_RUNNING)
+
+    with run_lock:
+        _init()
+        if args.send:
+            config.SEND_MODE = True
+        if args.ws:
+            # Cấu hình hiện tại: Hermes dùng CÙNG app_id (docs §12). Lark không từ
+            # chối kết nối thứ hai nên không có lỗi nào báo — chỉ là Hermes lặng lẽ
+            # mất tin nhắn. Nói to ở đây vì đó là lỗi im lặng duy nhất còn lại.
+            print("!" * 60)
+            print("[!] --ws: nếu Hermes đang chạy trên cùng app_id, TẮT cờ này.")
+            print("    Lark nhận cả 2 kết nối, không báo lỗi, nhưng Hermes có thể")
+            print("    mất tin nhắn. V2 không cần --ws (polling là nguồn sự thật).")
+            print("!" * 60)
+            from . import ws_listener
+            ws_listener.start_in_thread()
+        orchestrator.run()
 
 
 def cmd_push_status(args) -> None:
@@ -453,7 +577,7 @@ def cmd_ask(args) -> None:
                   f"Xem: python -m v2 users", file=sys.stderr)
             sys.exit(1)
         print(f"[hỏi bằng danh tính] {who['name']}"
-              f"{' (là admin, thấy hết)' if who['admin'] else ''}\n")
+              f"{' (là admin — duyệt được từ điển, KHÔNG thấy cuộc của người khác)' if who['admin'] else ''}\n")
     else:
         who = askers.admin_view("(CLI, quyền admin)")
         print("[!] Không có --as: đang xem bằng QUYỀN ADMIN, thấy hết mọi cuộc "
@@ -481,7 +605,7 @@ def cmd_transcript(args) -> None:
                   f"Xem: python -m v2 users", file=sys.stderr)
             sys.exit(1)
         print(f"[xem bằng danh tính] {who['name']}"
-              f"{' (là admin, thấy hết)' if who['admin'] else ''}\n")
+              f"{' (là admin — duyệt được từ điển, KHÔNG thấy cuộc của người khác)' if who['admin'] else ''}\n")
     else:
         who = askers.admin_view("(CLI, quyền admin)")
         print("[!] Không có --as: đang xem bằng QUYỀN ADMIN, thấy hết mọi cuộc "
@@ -547,6 +671,10 @@ def main() -> None:
     c.add_argument("--state", required=True)
     c.set_defaults(fn=cmd_complete)
 
+    pf = sub.add_parser("profile",
+                        help="in hồ sơ bot (tên, việc làm được, luồng, giới hạn)")
+    pf.set_defaults(fn=cmd_profile)
+
     g = sub.add_parser("gate", help="cửa vào bot hỏi đáp (plugin Hermes gọi)")
     g.add_argument("--union-id", default="", help="SessionSource.user_id_alt")
     g.add_argument("--user-id", default="", help="chỉ để đọc log")
@@ -563,6 +691,18 @@ def main() -> None:
     ep = sub.add_parser("enroll-poll",
                         help="kéo code OAuth từ hộp thư Vercel rồi enroll")
     ep.set_defaults(fn=cmd_enroll_poll)
+
+    cf = sub.add_parser(
+        "cloudflare-config",
+        help="nhập ẩn + kiểm Queue API token; chưa kích hoạt/cutover callback")
+    cf.add_argument("--account-id", required=True, help="Cloudflare Account ID (32 hex)")
+    cf.add_argument("--queue-id", required=True, help="Cloudflare Queue ID (32 hex)")
+    cf_token = cf.add_mutually_exclusive_group()
+    cf_token.add_argument("--token-stdin", action="store_true",
+                          help="đọc token từ stdin")
+    cf_token.add_argument("--token-dialog", action="store_true",
+                          help="mở hộp thoại Windows có che ký tự để dán token")
+    cf.set_defaults(fn=cmd_cloudflare_config)
 
     sub.add_parser("invites", help="ai đã được mời cấp quyền mà chưa xong")\
        .set_defaults(fn=cmd_invites)
@@ -594,6 +734,16 @@ def main() -> None:
                     help="xác nhận — bắt buộc, không có thì chỉ in ra rồi thoát")
     rv.set_defaults(fn=cmd_revoke)
 
+    ua = sub.add_parser(
+        "unauth",
+        help="XOÁ quyền của một người để họ cấp lại từ đầu (giữ nguyên biên bản)")
+    uw = ua.add_mutually_exclusive_group(required=True)
+    uw.add_argument("--open-id", help="ou_...")
+    uw.add_argument("--union-id", help="on_... (gate in ra cái này)")
+    ua.add_argument("--yes", action="store_true",
+                    help="xác nhận — không có thì chỉ in ra rồi thoát")
+    ua.set_defaults(fn=cmd_unauth)
+
     al = sub.add_parser("alerts",
                         help="kiểm + gửi cảnh báo DM một lượt (vòng run tự gọi)")
     al.add_argument("--dry-run", action="store_true",
@@ -613,6 +763,26 @@ def main() -> None:
     eq.add_argument("--token", required=True, help="minute_token cần nạp")
     eq.add_argument("--reader", help="open_id người enroll để mượn token đọc")
     eq.set_defaults(fn=cmd_enqueue)
+
+    cv = sub.add_parser(
+        "coverage",
+        help="ai đang thấy được bao nhiêu cuộc họp của họ, và ai đang chặn")
+    cv.add_argument("--days", type=int, default=90,
+                    help="cửa sổ đối chiếu với Lark (mặc định 90)")
+    cv.set_defaults(fn=cmd_coverage)
+
+    bf = sub.add_parser(
+        "backfill",
+        help="nạp bù cuộc họp CŨ hơn LOOKBACK_DAYS (mặc định chỉ thử khô)")
+    bf.add_argument("--days", type=int, default=180,
+                    help="quét lùi bao nhiêu ngày (mặc định 180)")
+    bf.add_argument("--priority", type=int, default=0,
+                    help="0=backlog (mặc định). Đừng đặt 1: cuộc cũ không phải "
+                         "cuộc mới, và priority 1 làm chúng chen trước cuộc "
+                         "vừa họp xong")
+    bf.add_argument("--yes", action="store_true",
+                    help="nạp thật — không có thì chỉ liệt kê rồi thoát")
+    bf.set_defaults(fn=cmd_backfill)
 
     p = sub.add_parser("process")
     p.add_argument("--send", action="store_true", help="gửi thật")

@@ -30,11 +30,23 @@ except Exception:
 R = "\033[0m"; B = "\033[1m"; DIM = "\033[2m"
 GREEN = "\033[32m"; YELLOW = "\033[33m"; RED = "\033[31m"; CYAN = "\033[36m"
 LEVEL_COLOR = {"OK": GREEN, "WARN": YELLOW, "FAIL": RED}
-W = 44                                          # be rong khung
+W = 52                                          # be rong khung
 
 
 def c(val: str, color: str) -> str:
     return f"{color}{val}{R}"
+
+
+def num(val, unit: str = "", *, warn=None, higher_is_worse: bool = True,
+        zero_ok: bool = True) -> str:
+    """Mot so co mau. None -> '?' xam, khong to do: khong doc duoc != hong."""
+    if val is None:
+        return c("?", DIM)
+    text = f"{val}{unit}"
+    if warn is None:
+        return c(text, GREEN if (val or not zero_ok) else DIM)
+    bad = val > warn if higher_is_worse else val < warn
+    return c(text, YELLOW if bad else GREEN)
 
 
 def render(d: dict) -> str:
@@ -45,12 +57,26 @@ def render(d: dict) -> str:
     v2run = c(str(d["v2run"]), GREEN if d["v2run"] == 1 else RED)
     hermes = c("up", GREEN) if d["hermes"] else c("DOWN", RED)
     scan = "?" if d["scan"] is None else (
-        c(f"{d['scan']}m", GREEN if d["scan"] <= 20 else YELLOW))
+        c(f"{d['scan']}m", GREEN if d["scan"] <= heartbeat.SCAN_WARN_MIN
+          else YELLOW))
     gw = d["gwerr"]; v2e = d["v2err"]
     gwc = c(str(gw), GREEN if gw == 0 else RED)
     v2c = c(str(v2e), GREEN if v2e == 0 else RED)
     tok = "?" if d["tokens"] is None else (
-        c(f"{d['tokens']} ngay", GREEN if d["tokens"] >= 2 else RED))
+        c(f"{d['tokens']} ngay",
+          GREEN if d["tokens"] >= heartbeat.TOKEN_WARN_DAYS else RED))
+    wlat = "" if d["wlat"] is None else f"  {DIM}({d['wlat']}ms){R}"
+    # Hang doi: chi ke status DANG co job. Ke ca status bang 0 thi mat mot dong
+    # toan so 0 va mat luon cai nhin "hom nay he thong dang lam gi".
+    queue = d["queue"] or {}
+    qtext = ("  ".join(f"{k} {c(str(v), YELLOW if k == 'failed' else CYAN)}"
+                       for k, v in queue.items()) or c("trong", DIM))
+    # "Xong cach day" chi dang lo khi CON job cho. Het viec ma lau khong dich
+    # gi la binh thuong, khong to mau canh bao.
+    idle = ("" if d["idle"] is None else
+            f"   xong cach  : "
+            f"{num(d['idle'], 'm', warn=heartbeat.IDLE_WARN_MIN if d['backlog'] else None)}"
+            f"   {DIM}(lan cuoi phien am xong mot cuoc){R}")
 
     bar = "  " + "─" * W
     lines = [
@@ -59,10 +85,23 @@ def render(d: dict) -> str:
         f"{DIM}{d['now']:%H:%M:%S}{R}",
         bar,
         f"   TRANG THAI:  {lc}{B}● {lv}{R}",
-        f"   vong run   : {v2run}        whisper : {whisper}",
+        f"   vong run   : {v2run}        whisper : {whisper}{wlat}",
         f"   hermes 8642: {hermes}       scan    : {scan}",
         f"   loi 15p    : gw {gwc} / v2 {v2c}",
         f"   token con  : {tok}",
+        bar,
+        f"   hang doi   : {qtext}",
+        *([idle] if idle else []),
+        f"   hong can sua: {num(d['failed_act'], warn=0)}"
+        f"  {DIM}(da tru ban ghi khong co tieng noi){R}",
+        f"   phat 24h   : {num(d['deliv24'])}"
+        f"        dang hoi: {num(d['askers'])}",
+        f"   nguoi dung : {num(d['users'])}",
+        bar,
+        f"   dia con    : {num(d['disk'], 'GB', warn=heartbeat.DISK_WARN_GB, higher_is_worse=False)}"
+        f"     db: {num(d['dbmb'], 'MB')}",
+        f"   vong run   : RAM {num(d['v2mem'], 'MB')}  "
+        f"chay {num(d['v2up'], 'h')}",
         bar,
     ]
     if d["problems"]:

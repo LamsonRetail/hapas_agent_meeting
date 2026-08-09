@@ -48,14 +48,19 @@ from . import askers, bitable, config, lark_api
 
 # Câu trả lời khi không biết ai đang hỏi. Nói RÕ là vấn đề danh tính, không phải
 # "không có dữ liệu" — hai cái đó dẫn người dùng đi hai hướng khác nhau.
-NO_ASKER = (
+#
+# Tách làm hai: phần người dùng đọc, và phần dặn agent. Trước 04/08/2026 hai
+# phần này nằm chung một chuỗi và agent chép cả dòng `[Cho agent: ...]` ra chat.
+_NO_ASKER_USER = (
     "Mình chưa xác định được bạn là ai nên chưa dám trả lời về biên bản họp — "
     "biên bản chỉ hiện cho người có dự cuộc họp đó.\n"
     "Bạn nhắn lại một câu nữa là mình có lại thông tin phiên; còn nếu vẫn vậy "
-    "thì nhắn cho quản trị hệ thống (có thể phiên đã hết hạn).\n"
-    "[Cho agent: lời gọi tool thiếu hoặc sai `asker_token`. Vé nằm ở dòng "
+    "thì nhắn cho quản trị hệ thống (có thể phiên đã hết hạn)."
+)
+_NO_ASKER_AGENT = (
+    "Lời gọi tool thiếu hoặc sai `asker_token`. Vé nằm ở dòng "
     "`[V2-ASKER: ...]` trong tin nhắn của người dùng — đọc lại và gọi lại tool "
-    "kèm tham số đó. Đừng trả lời người dùng bằng dữ liệu cũ trong ngữ cảnh.]"
+    "kèm tham số đó. Đừng trả lời người dùng bằng dữ liệu cũ trong ngữ cảnh."
 )
 
 
@@ -63,15 +68,194 @@ class QAError(RuntimeError):
     """Không đọc được dữ liệu — caller quyết cách báo cho người dùng."""
 
 
+# ------------------------------------------------- HAI KÊNH trong một kết quả
+#
+# Vì sao có (user phản hồi 04/08/2026, ba lời chê cùng một gốc): trước đây tool
+# trả về MỘT khối text trộn lẫn hai thứ khác hẳn nhau — câu cho người dùng đọc,
+# và lời dặn cho agent ("PHẢI nói cho người dùng biết, đừng bỏ qua"). Hậu quả
+# đúng như người dùng kể lại:
+#
+#   1. "mấy cái item của Hermes hiện lên" — agent chép cả lời dặn nội bộ ra chat.
+#   2. "định dạng lộn xộn" — tool chỉ đưa MẢNH RỜI (đầu đề một chỗ, khối cảnh
+#      báo một chỗ), agent phải tự ghép nên mỗi lượt một kiểu.
+#   3. "sai / tự mâu thuẫn" — agent tự đếm lại: đo thật thấy nó nói "7 cuộc họp"
+#      rồi liệt kê thêm cuộc thứ 8 ở câu sau.
+#
+# Cách chữa: CODE dựng sẵn câu thành phẩm, agent chỉ việc chép. Đếm là phép tính
+# trong Python, không phải việc của LLM. Lời dặn nội bộ chuyển xuống kênh riêng
+# có nhãn rõ ràng, và prompt cấm hiện kênh đó.
+#
+# Nhãn phải NGẮN và KHÁC HẲN văn phong tiếng Việt xung quanh: agent cần nhận ra
+# ranh giới ngay cả khi ngữ cảnh đã dài.
+
+SEND_MARK = "===== GỬI NGUYÊN VĂN CHO NGƯỜI DÙNG (chép y hệt, không viết lại) ====="
+END_MARK = ("===== HẾT PHẦN GỬI — chép ĐÚNG khối trên vào tin nhắn. Không tóm "
+            "tắt, không đếm lại, không đổi thứ tự, không thêm câu nào. =====")
+INTERNAL_MARK = "===== NỘI BỘ — KHÔNG ĐƯỢC HIỆN CHO NGƯỜI DÙNG ====="
+
+# KÊNH THỨ BA (05/08/2026) — và là kênh mà PHẦN LỚN tool đọc phải dùng.
+#
+# Vì sao phải tách khỏi SEND_MARK (đo trên chat thật, user gửi 5 ảnh chụp):
+# `append_agent_note` cũ tự động bọc MỌI kết quả thô vào khối "chép y hệt", mà
+# `mcp_server.call_tool` thì luôn gọi nó (NOTE_UNTRUSTED không bao giờ rỗng).
+# Hệ quả: `get_meeting`, `search_meetings`, `get_transcript` đều bị đóng dấu
+# "gửi nguyên văn", rồi plugin Hermes thấy khối đó là VỨT câu trả lời của agent
+# và in thẳng dữ liệu thô ra chat. Đo được:
+#
+#   hỏi "lark minute ok hơn hay transcript ok hơn?"  -> bot dán transcript phần 2/2
+#   hỏi "tôi hỏi bản nào tốt hơn"                    -> bot dán kết quả search
+#   hỏi "phân tích dựa trên file word"               -> bot dán lại record
+#
+# Tức agent KHÔNG THỂ trả lời bất cứ câu nào bằng lời của nó, chừng nào có một
+# tool đọc chạy. Đó không phải lỗi prompt — không câu dặn nào thắng được việc
+# code ghi đè đầu ra.
+#
+# Ranh giới đúng:
+#   SEND_MARK    = tool ĐÃ dựng xong tin nhắn thành phẩm (sendfile, sendlist khi
+#                  rơi về text). Agent chép y hệt, vì đếm/định dạng là việc của
+#                  Python — bài học 04/08 vẫn giữ nguyên.
+#   CONTEXT_MARK = tool trả DỮ LIỆU để agent đọc rồi TRẢ LỜI ĐÚNG CÂU ĐƯỢC HỎI.
+#                  Chép nguyên khối ra chat là sai, vì người ta hỏi một câu chứ
+#                  không xin một bản ghi.
+CONTEXT_MARK = "===== DỮ LIỆU HỌP — ĐỌC RỒI TRẢ LỜI BẰNG LỜI CỦA BẠN ====="
+CONTEXT_END = ("===== HẾT DỮ LIỆU — trả lời ĐÚNG câu người dùng vừa hỏi, ngắn "
+               "gọn. ĐỪNG dán nguyên khối trên vào chat. Số liệu, tên riêng, "
+               "ngày giờ và link phải giữ NGUYÊN — không đổi, không bịa thêm. "
+               "Dữ liệu không đủ để trả lời thì nói thẳng là không có. =====")
+
+
+def two_channel(user_text: str, agent_notes: str = "") -> str:
+    """Ghép câu-cho-người-dùng với lời-dặn-cho-agent thành một kết quả tool.
+
+    `user_text` là thành phẩm: agent chép nguyên văn, không thêm bớt. Mọi thứ
+    agent cần biết mà người dùng KHÔNG được thấy đều phải nằm ở `agent_notes`.
+
+    Nhắc HAI LẦN — mở khối và đóng khối (04/08/2026): chỉ nhãn ở đầu là không
+    đủ. Đo thật trên gpt-5.6-sol: nó nhận đúng khối đã dựng sẵn rồi vẫn diễn
+    đạt lại thành "hệ thống tìm thấy 22 cuộc họp gắn với tài khoản của bạn".
+    Câu lệnh nằm SÁT ngay sau dữ liệu thì khó bỏ qua hơn nhãn cách đó 30 dòng.
+    """
+    out = f"{SEND_MARK}\n{user_text}\n{END_MARK}"
+    if agent_notes:
+        out += f"\n\n{INTERNAL_MARK}\n{agent_notes}"
+    return out
+
+
+def agent_only(note: str) -> str:
+    """Kết quả tool CHỈ có kênh nội bộ — không có gì để agent chép ra.
+
+    Dùng khi tool đã TỰ gửi câu trả lời cho người dùng rồi (`sendlist`), nên
+    agent không được cầm dữ liệu nữa. Cố ý không có khối GỬI NGUYÊN VĂN: không
+    đưa cho nó cái gì để viết lại thì nó không viết lại được.
+    """
+    return f"{INTERNAL_MARK}\n{note}"
+
+
+def context_result(body: str, agent_notes: str = "") -> str:
+    """Bọc DỮ LIỆU cho agent đọc — không phải tin nhắn thành phẩm.
+
+    Dùng cho `get_meeting` / `search_meetings` / `get_transcript`: chúng trả về
+    nguyên liệu để agent trả lời câu hỏi, chứ không phải câu trả lời. Bọc chúng
+    bằng `two_channel` là ra lệnh cho agent chép nguyên văn — xem chú thích ở
+    `CONTEXT_MARK` để biết nó đã làm bot hỏng thế nào.
+
+    Vẫn có mốc ĐÓNG (`CONTEXT_END`) như khối GỬI: ranh giới giữa dữ liệu và lời
+    dặn nội bộ phải rõ ràng bằng chuỗi, không để LLM suy đoán.
+    """
+    out = f"{CONTEXT_MARK}\n{body}\n{CONTEXT_END}"
+    if agent_notes:
+        out += f"\n\n{INTERNAL_MARK}\n{agent_notes}"
+    return out
+
+
+def append_agent_note(result: str, note: str) -> str:
+    """Gắn thêm lời dặn cho agent vào kênh NỘI BỘ của một kết quả tool.
+
+    Kết quả chưa có kênh nội bộ thì mở kênh mới; đã có thì nối vào cuối. Việc
+    này phải đi qua đây chứ không được `result + note`: nối thẳng chuỗi là đẩy
+    lời dặn vào phần agent đang được yêu cầu chép nguyên văn.
+
+    Text TRẦN rơi về kênh **DỮ LIỆU**, không phải kênh GỬI (sửa 05/08/2026).
+    Bản cũ rơi về `two_channel`, nghĩa là mọi tool đọc đều bị đóng dấu "chép y
+    hệt" chỉ vì đi qua `mcp_server.call_tool` — và plugin Hermes lấy đúng khối
+    đó thay cho câu trả lời của agent. Caller nào thật sự đã dựng xong tin nhắn
+    cho người dùng thì phải tự gọi `two_channel`, tường minh.
+    """
+    if not note:
+        return result
+    if INTERNAL_MARK in result:
+        return f"{result}\n{note}"
+    for head, tail in ((SEND_MARK, END_MARK), (CONTEXT_MARK, CONTEXT_END)):
+        if not result.startswith(head):
+            continue
+        if tail not in result:
+            # Fail-closed cho caller tự dựng khối dở dang: đóng phần trên trước
+            # khi mở kênh nội bộ, không để lời dặn bị chép ra chat.
+            result = f"{result}\n{tail}"
+        return f"{result}\n\n{INTERNAL_MARK}\n{note}"
+    return context_result(result, note)
+
+
+def _title(s: str) -> str:
+    """Gỡ escape HTML trong tên cuộc họp: '&amp;' -> '&', '&#39;' -> \"'\".
+
+    Lark Minutes trả tên đã escape HTML, và nó được ghi thẳng vào Base rồi chảy
+    ra chat: người dùng đọc được "Review HRIS &amp; feedback hệ thống Chấm công".
+    Gỡ ở đây (chỗ HIỂN THỊ) nên vá được cả những record đã nằm sẵn trên Base,
+    không cần chạy lại gì. `meetings.build_meta` gỡ luôn lúc nạp để record MỚI
+    sạch từ đầu — hai chỗ, vì dữ liệu cũ không tự sửa.
+    """
+    import html
+    return html.unescape(s or "")
+
+
+def _dmy(when: str) -> str:
+    """'2026-08-04 15:34:00' -> '04/08/2026 15:34'. Không parse được thì trả nguyên.
+
+    Một định dạng ngày DUY NHẤT cho mọi dòng: đo thật 04/08/2026 thấy cùng một
+    câu hỏi, hai lượt trả lời — lượt này có giờ, lượt kia chỉ có ngày. Đó là hệ
+    quả trực tiếp của việc để LLM tự trình bày ngày tháng.
+    """
+    s = (when or "").strip()
+    if len(s) < 10:
+        return s
+    d = s[:10].split("-")
+    if len(d) != 3:
+        return s
+    out = f"{d[2]}/{d[1]}/{d[0]}"
+    return f"{out} {s[11:16]}" if len(s) >= 16 else out
+
+
+# Dựng sau `two_channel` vì nó dùng hàm đó. Tên `NO_ASKER` giữ nguyên: mọi caller
+# (`mcp_server`, `sendfile`, `tasks`) và selftest đều so bằng hằng này.
+NO_ASKER = two_channel(_NO_ASKER_USER, _NO_ASKER_AGENT)
+
+
 # --------------------------------------------------------------- đọc Base
 
 
-def records(limit: int = 200) -> list[dict[str, Any]]:
+# Trần 200 cũ là trần MỘT TRANG của Lark, không phải một lựa chọn về sản phẩm —
+# `base_records_all` nay tự phân trang (05/08/2026), nên số này chỉ còn là chốt
+# chặn cho câu hỏi "đừng kéo cả kho vào một câu trả lời". Đặt 1000: hệ thống mới
+# chạy 6 ngày đã có 26 record và sắp nạp bù 48 cuộc nữa, nên 200 là ngưỡng sẽ
+# chạm trong vài tháng — và lúc chạm thì cuộc họp biến mất khỏi bot mà không có
+# lỗi nào.
+def records(limit: int = 1000) -> list[dict[str, Any]]:
     if not bitable.enabled():
         raise QAError("Chưa cấu hình Base (BITABLE_APP_TOKEN/BITABLE_TABLE_ID).")
     try:
-        return lark_api.base_records_all(
+        rows = lark_api.base_records_all(
             config.BITABLE_APP_TOKEN, config.BITABLE_TABLE_ID, limit=limit)
+        # Base là GƯƠNG của mọi job, kể cả queued/waiting_auth/failed. Những
+        # record đó CHƯA phải biên bản hoàn tất; nếu để lọt, list_text sẽ xếp vào
+        # khối "ĐÃ CÓ BIÊN BẢN" dù tóm tắt/transcript còn rỗng. Nguồn trạng thái
+        # thật là DB local; record không còn job vẫn đi tiếp rồi bị ACL fail-close.
+        from . import jobstore
+        states = {r["minute_token"]: r.get("status") for r in jobstore.all_jobs()}
+        return [r for r in rows
+                if not states.get(str(r.get(bitable.F_TOKEN) or ""))
+                or states.get(str(r.get(bitable.F_TOKEN) or ""))
+                in {"held", "delivered"}]
     except lark_api.LarkError as exc:
         raise QAError(f"không đọc được Base: {exc}") from exc
 
@@ -96,32 +280,26 @@ def viewers_index() -> dict[str, set[str]]:
     Cộng `owner_open_id`: chủ cuộc họp luôn thấy cuộc họp của mình, kể cả khi
     tra người dự ra rỗng (`no_calendar_event`, `no_match`).
 
-    Cộng `db.viewers_of()` (02/08/2026): người đã enroll mà minute này xuất hiện
-    trong `minutes/search` của CHÍNH HỌ — tức Lark khẳng định họ có dự. Đây là
-    bằng chứng mạnh hơn cả danh sách lịch, và nó vá đúng khiếu nại "tôi có dự mà
-    bot không cho tôi xem": chuỗi tra người dự sót thật (`no_match`,
-    `fallback:owner`, họp mời bằng group chat, sự kiện lịch đã bị xoá).
-
-    Đây là quyền ĐỌC, rộng hơn quyền NHẬN có chủ ý: người chưa enroll không lọt
-    vào đây được (bảng chỉ ghi người đã enroll) và cũng không dùng bot được
-    (`gate` chặn), nên nới ở đây không mở thêm cửa nào ra ngoài.
+    KHÔNG cộng `minute_viewers`: `minutes/search(participant_ids=...)` thực tế
+    vẫn có thể trả bản ghi được chia sẻ của người khác. Tập đó chỉ hữu ích để thử
+    token tải recording; dùng nó làm ACL đã gây lộ cuộc họp thật ngày 05/08/2026.
     """
-    from . import db, jobstore
-    # MỘT lời gọi cho cả bảng, không phải mỗi job một lời gọi: hàm này chạy hai
-    # lần cho mỗi câu hỏi của bot (`_only_visible` + `pending_split`).
-    seen = db.viewers_all()
+    from . import jobstore
     out: dict[str, set[str]] = {}
     for r in jobstore.all_jobs():
         try:
             meta = jobstore.meta_from_json(r["meta_json"])
         except Exception:                      # noqa: BLE001 — job cũ méo dữ liệu
             continue
-        ids = {a.union_id for a in meta.attendees if a.union_id}
-        ids |= {a.open_id for a in meta.attendees if a.open_id}
+        # `calendar[near…]` là metadata cũ ghép chỉ vì gần giờ; đã có ca ghép
+        # nhầm sự kiện khác và kéo 22 người lạ vào. Owner độc lập vẫn tin được,
+        # attendee của nguồn near thì fail-closed.
+        atts = ([] if "calendar[near" in (meta.participants_source or "")
+                else meta.attendees)
+        ids = {a.union_id for a in atts if a.union_id}
+        ids |= {a.open_id for a in atts if a.open_id}
         if meta.owner_open_id:
             ids.add(meta.owner_open_id)
-        for v in seen.get(r["minute_token"], ()):
-            ids |= {x for x in (v.get("union_id"), v.get("open_id")) if x}
         out[r["minute_token"]] = ids
     return out
 
@@ -132,34 +310,62 @@ def _may_see(minute_token: str, who: dict[str, Any] | None,
 
     Không có job tương ứng (record trên Base mà `jobs` không còn) => KHÔNG cho
     xem, dù đó là dữ liệu thật. Lý do: không tra được người dự thì không chứng
-    minh được người hỏi có dự, và đoán sai ở đây là rò biên bản. Admin vẫn thấy,
-    nên dữ liệu không biến mất khỏi hệ thống — chỉ không tự chảy ra ngoài.
+    minh được người hỏi có dự, và đoán sai ở đây là rò biên bản.
+
+    Cửa duy nhất đi vòng là `see_all`, và CHỈ `askers.admin_view()` đặt cờ đó —
+    tức đường terminal, người ngồi trước máy. `admin` (quyền duyệt từ điển,
+    suy từ union_id trong .env) KHÔNG còn mở cửa này nữa: user chốt 04/08/2026
+    sau khi thấy bot trả lời admin "22 cuộc họp gắn với tài khoản của bạn"
+    trong khi 22 là toàn bộ cuộc họp của cả công ty.
     """
     if not who:
         return False
-    if who.get("admin"):
+    if who.get("see_all"):
         return True
     return bool(_ids_of(who) & index.get(minute_token, set()))
 
 
-def _hidden_note(n: int) -> str:
-    """Nói SỐ cuộc họp bị ẩn, không nói cái gì bị ẩn.
+def remember(who: dict[str, Any] | None, minute_token: str,
+             title: str = "") -> None:
+    """Ghi 'người này vừa nhắc tới cuộc họp đó' vào ký ức hội thoại.
 
-    Vì sao phải nói (bài học commit 2721d2d, áp cho tình huống mới): im lặng bỏ
-    sót khiến người ta tưởng đã xem hết cuộc họp của mình rồi thôi đi tìm. Lọc
-    theo người dự là ĐÚNG, nhưng nó chỉ tốt bằng dữ liệu `attendees` — mà đo
-    31/07/2026 thấy 3/5 job thật chỉ có 1 người dự (khớp theo giờ, hoặc rơi về
-    fallback:owner). Nên chuyện "tôi có dự mà bot không cho thấy" là có thật, và
-    người dùng phải biết còn thứ họ không thấy để đi hỏi, thay vì tin là hết.
+    Gọi ở đúng những chỗ đã QUA `_may_see`, không bao giờ trước đó: bảng
+    `chat_memory` được phép tồn tại chính vì nó không chứa gì mà người đó chưa
+    được xem (xem chú thích bảng trong `db._SCHEMA`).
 
-    Chỉ con số: không tên, không tóm tắt, không link — đủ để đi hỏi, không đủ để
-    biết nội dung.
+    Nuốt mọi lỗi: mất một dòng ký ức chỉ làm câu tiếp nối kém tiện, còn ném ra
+    đây thì hỏng chính câu trả lời người ta đang chờ. Cùng lý lẽ với
+    `_tokens_with_transcript`.
+
+    Bỏ qua đường terminal: `askers.admin_view()` có `union_id` rỗng, nên
+    `db.remember_meeting` tự bỏ — người ngồi trước máy không cần bot nhớ hộ, và
+    ký ức của một danh tính giả thì không thuộc về ai.
     """
-    if n <= 0:
-        return ""
-    return (f"\n\n(Còn {n} cuộc họp khác trong hệ thống mà bạn không có trong "
-            f"danh sách người dự nên không hiện ra. Nếu bạn CÓ dự một trong số "
-            f"đó thì nhắn quản trị hệ thống — có thể việc tra người dự bị sót.)")
+    if not who or not (who.get("union_id") or "").strip():
+        return
+    try:
+        from . import db
+        db.remember_meeting(who["union_id"], minute_token, title)
+    except Exception as exc:                   # noqa: BLE001 — xem docstring
+        print(f"[qa] không ghi được ký ức hội thoại: {exc}")
+
+
+# ĐÃ BỎ HẲN: `_hidden_note()` — câu "Còn N cuộc họp khác..." gắn cuối mỗi câu
+# trả lời (user chốt 04/08/2026, sau khi đọc thật trong chat).
+#
+# Nó ra đời từ bài học commit 2721d2d: im lặng bỏ sót khiến người ta tưởng đã
+# xem hết cuộc họp của mình rồi thôi đi tìm. Lý lẽ đó không sai, và con số cũng
+# không sai — đo lại đúng 8 (11 cuộc trong cửa sổ 7 ngày, người hỏi dự 3).
+#
+# Nhưng nó phải trả giá ở MỌI câu trả lời, cho một tình huống hiếm:
+#   - lặp lại mỗi lần, thành tiếng ồn che mất phần người ta thật sự cần đọc;
+#   - đọc như lời buộc tội — "có 8 cuộc bạn không được vào";
+#   - ĐO LƯỜNG hoạt động của công ty cho bất kỳ ai hỏi bot;
+#   - và từ 02/08/2026 `minute_viewers` đã vá đúng cái lỗ mà nó canh: Lark tự
+#     khẳng định ai có dự, nên "có dự mà không thấy" hiếm hơn hẳn lúc viết nó.
+#
+# Ai thấy thiếu cuộc của mình thì vẫn nhắn quản trị được — chỉ là bot không tự
+# nhắc nữa. Muốn khôi phục thì dựng lại hàm này và gọi ở `list_meetings`.
 
 
 def _only_visible(rows: list[dict[str, Any]],
@@ -189,32 +395,104 @@ def _when(r: dict[str, Any]) -> str:
     return _s(r, bitable.F_WHEN)
 
 
+def _field_lines(label: str, value: str) -> list[str]:
+    """Một ô của record -> các dòng đã canh đúng. Nhiều dòng thì XUỐNG DÒNG.
+
+    Vì sao phải có (user báo 05/08/2026, kèm ảnh chụp chat): `Quyết định` và
+    `Việc cần làm` trên Base là chuỗi NHIỀU DÒNG (`bitable._bullets`). Bản cũ
+    ghép thẳng `f"- **{label}:** {value}"`, nên item ĐẦU dính vào dòng nhãn còn
+    các item sau rơi xuống cột 0 thành danh sách rời:
+
+        - **Việc cần làm:** • Cài tiện ích Web Scraper — Team research
+        • Chuẩn bị file JSON sitemap — Team research
+
+    Người đọc thấy một mục lồi ra rồi một danh sách mồ côi không có tiêu đề.
+    Đúng cái người dùng gọi là "chả thấy markdown gì cả".
+
+    Nay: nhãn đứng riêng một dòng, các item thụt vào ba khoảng trắng. Khoảng
+    trắng là thứ DUY NHẤT canh lề được trong `lark_md` (không có danh sách lồng,
+    không có bảng).
+    """
+    value = (value or "").strip()
+    if not value:
+        return []
+    body = [ln.strip() for ln in value.splitlines() if ln.strip()]
+    if len(body) == 1:
+        return [f"• **{label}:** {body[0]}"]
+    out = [f"• **{label}:**"]
+    for ln in body:
+        # Đã có `•` sẵn (chuỗi từ Base) thì giữ nguyên, đừng nhân đôi ký tự.
+        out.append(f"   {ln}" if ln.startswith("•") else f"   • {ln}")
+    return out
+
+
 def fmt_record(r: dict[str, Any], *, full: bool = True) -> str:
     """Một record -> text. full=False cho bản một dòng khi liệt kê."""
-    title = _s(r, bitable.F_TITLE) or "(không tiêu đề)"
+    title = _title(_s(r, bitable.F_TITLE)) or "(không tiêu đề)"
     status = _s(r, bitable.F_STATUS) or "?"
     if not full:
-        return f"- {_when(r)} · [{status}] {title}"
+        return f"• {_dmy(_when(r))} · [{status}] {title}"
 
-    lines = [f"### {title}"]
-    # `Người chốt` / `Chốt lúc` đã bỏ khỏi đây: cửa duyệt không còn, không ai
-    # ghi hai ô đó nữa (bitable.py). `_s()` bỏ ô trống nên để lại cũng vô hại,
-    # nhưng bỏ hẳn thì prompt của agent bớt một khái niệm không tồn tại.
-    for label, key in (("Thời gian", bitable.F_WHEN),
-                       ("Trạng thái", bitable.F_STATUS),
-                       ("Số người nhận", bitable.F_RECIPIENTS),
-                       ("Nguồn người nhận", bitable.F_SOURCE)):
-        if _s(r, key):
-            lines.append(f"- {label}: {_s(r, key)}")
+    # CHỈ những gì người dùng thật sự cần đọc (user chốt 05/08/2026).
+    #
+    # Đã BỎ khỏi khối này: `Trạng thái` ("chờ hỏi transcript"), `Số người nhận`,
+    # `Nguồn người nhận`, `minute_token`, và câu dặn agent về bản nguyên văn.
+    # Đó là sổ sách vận hành, không phải câu trả lời — người hỏi "cuộc họp hôm
+    # qua nói gì" không quan tâm nguồn người nhận là gì. Riêng câu dặn agent thì
+    # lọt thẳng ra chat và người dùng đọc được cả lời dặn ("Nói với người dùng
+    # là..."), đó là lỗi rò kênh nội bộ chứ không chỉ là dài dòng.
+    #
+    # Những thứ đó KHÔNG mất — chúng chuyển sang kênh nội bộ ở `_record_notes()`,
+    # nơi agent vẫn đọc được `minute_token` để gọi tool tiếp theo.
+    lines = [f"**{title}**"]
+    # Ghi chú định dạng, đọc trước khi sửa mấy dòng dưới (05/08/2026):
+    #
+    # Chuỗi này chảy vào `lark_md` (thẻ Lark) và vào câu trả lời của agent. Cả
+    # hai đều KHÔNG render `- ` thành gạch đầu dòng — `lark_md` chỉ có **đậm**
+    # và [nhãn](url). Nên mọi đầu dòng ở đây dùng `•`, đúng ký tự mà
+    # `bitable._bullets` và `Recap.BULLET` đang dùng.
+    # Giờ theo ĐÚNG định dạng của danh sách (`_dmy`), không phải chuỗi thô
+    # `2026-08-04 15:34:00` như trước: cùng một cuộc họp mà hai chỗ hiện hai
+    # kiểu ngày thì người đọc phải tự dịch, và đó là loại lệch nhỏ làm giao diện
+    # trông cẩu thả.
+    if _s(r, bitable.F_WHEN):
+        lines.append(f"• **Thời gian:** {_dmy(_when(r))}")
     for label, key in (("Tóm tắt", bitable.F_SUMMARY),
                        ("Quyết định", bitable.F_DECISIONS),
                        ("Việc cần làm", bitable.F_ACTIONS)):
         if _s(r, key):
-            lines.append(f"- {label}: {_s(r, key)}")
+            lines.extend(_field_lines(label, _s(r, key)))
+    # Gọi đúng tên: đây là bản TÓM TẮT của Lark, không phải nguyên văn. Nhãn cũ
+    # ghi "Nguyên văn:" cho chính link này, trong khi "bản nguyên văn" giờ là
+    # bản chép từng câu do hệ thống giữ — hai thứ khác hẳn mà trùng tên.
     if _s(r, bitable.F_LINK):
-        lines.append(f"- Nguyên văn: {_s(r, bitable.F_LINK)}")
-    lines.append(f"- minute_token: {_s(r, bitable.F_TOKEN)}")
+        lines.append(f"• **Bản tóm tắt của Lark:** {_s(r, bitable.F_LINK)}")
+    if _s(r, bitable.F_TOKEN) in _tokens_with_transcript():
+        # `**đậm**` chứ KHÔNG `*nghiêng*`: lark_md không có nghiêng, nên một dấu
+        # sao hiện ra đúng là một dấu sao. Và phải khớp `_FOOT_ASK` — hai câu
+        # mời cùng một việc mà một câu đậm một câu trơ là thứ nhìn thấy ngay.
+        lines.append("• **Bản nguyên văn:** có sẵn — chép lại đúng từng câu mọi "
+                     "người đã nói. Nhắn **gửi nguyên văn** để nhận file Word.")
     return "\n".join(lines)
+
+
+def _record_notes(r: dict[str, Any]) -> str:
+    """Phần sổ sách của một record — dành cho AGENT, không cho người dùng đọc.
+
+    `minute_token` bắt buộc phải ở đây: agent cần nó cho `create_task` và
+    `send_transcript_file`. Bỏ hẳn thì mọi lời gọi tool tiếp theo phải đoán tên
+    cuộc họp, và đoán sai là gửi file của cuộc khác.
+    """
+    notes = [f"minute_token: {_s(r, bitable.F_TOKEN)}"]
+    for label, key in (("trạng thái phát", bitable.F_STATUS),
+                       ("số người nhận", bitable.F_RECIPIENTS),
+                       ("nguồn người nhận", bitable.F_SOURCE)):
+        if _s(r, key):
+            notes.append(f"{label}: {_s(r, key)}")
+    if _s(r, bitable.F_TOKEN) in _tokens_with_transcript():
+        notes.append("Cuộc này CÓ bản nguyên văn. Người dùng muốn cả bản ghi "
+                     "thì gọi send_transcript_file, đừng dán transcript vào chat.")
+    return "\n".join(notes)
 
 
 # ------------------------------------------------------------- ba tool
@@ -236,6 +514,8 @@ _TINH_TRANG = {
     "queued": "đang chờ xử lý",
     "transcribing": "đang phiên âm",
     "recapping": "đang tóm tắt",
+    "waiting_auth": "đang chờ người có quyền tự xác thực; khi họ hoàn tất, "
+                    "hệ thống sẽ tự phiên âm",
     # `delivered` mà vẫn lọt vào danh sách này = đã phát cho người dự nhưng lần
     # ghi record hỏng. PHẢI có dòng này: thiếu nó thì `_TINH_TRANG.get(st, st)`
     # rơi về chuỗi thô và bot nói câu tự mâu thuẫn "CHƯA CÓ BIÊN BẢN — delivered".
@@ -256,6 +536,34 @@ _TINH_TRANG = {
     "owner_only": "di sản: chỉ gửi cho chủ cuộc họp",
     "expired": "di sản: quá hạn duyệt",
 }
+
+
+# Lý do hỏng, viết cho NGƯỜI DÙNG đọc. Chuỗi trong `jobs.error` là thư cho
+# người vận hành: nó có tên engine, tên file bằng chứng và cả lệnh sqlite3 để
+# trả job về hàng đợi. Cắt 120 ký tự rồi ném vào chat thì người dùng nhận một
+# câu cụt giữa chừng đầy chữ lạ (đã gặp: "…engine faster-whisper/medium). Bản
+# ghi im lặng thật, hoặc whisper đ").
+#
+# Chỉ dịch những mã ta BIẾT. Mã lạ thì vẫn đưa câu gốc đã cắt — thà thô còn hơn
+# im lặng, vì "không có biên bản mà không nói vì sao" là thứ user đã than.
+_LY_DO_HONG = {
+    # Cố ý KHÔNG khẳng định "bản ghi im lặng": một cuộc 25 phút ra 0 chữ nhiều
+    # khả năng là whisper nuốt, không phải không ai nói. Nói đúng thứ quan sát
+    # được, và chỉ đường hỏi tiếp.
+    "empty_transcript": "hệ thống không nghe được câu nào trong bản ghi này "
+                        "nên không tạo được biên bản — nếu bạn chắc cuộc họp "
+                        "có tiếng nói thì nhắn quản trị hệ thống",
+}
+
+
+def _fail_reason(row: dict[str, Any]) -> str:
+    """Lý do hỏng đã dịch sang tiếng người. "" nếu job không ghi lỗi nào."""
+    from . import jobstore
+    raw = row.get("error") or ""
+    if not raw.strip():
+        return ""
+    return _LY_DO_HONG.get(jobstore.error_code(raw),
+                           jobstore.error_text(raw)[:120])
 
 
 def _ts_to_str(ms: int | None) -> str:
@@ -287,7 +595,9 @@ def pending_split(who: dict[str, Any] | None) -> tuple[list[dict[str, Any]], int
     out: list[dict[str, Any]] = []
     hidden = 0
     for r in jobstore.all_jobs():
-        if r.get("bitable_record_id"):
+        # Có record Base chưa đồng nghĩa đã có biên bản: Base soi cả job đang
+        # chờ. Chỉ held/delivered mới ra khỏi khối pending.
+        if r.get("bitable_record_id") and r.get("status") in {"held", "delivered"}:
             continue
         try:
             meta = jobstore.meta_from_json(r["meta_json"])
@@ -304,7 +614,7 @@ def pending_split(who: dict[str, Any] | None) -> tuple[list[dict[str, Any]], int
             "tinh_trang": _TINH_TRANG.get(st, st),
             "minute_token": r["minute_token"],
             "link": meta.app_link or "",
-            "error": (r.get("error") or "")[:120],
+            "error": _fail_reason(r),
             "attempts": r.get("attempts") or 0,
         })
     out.sort(key=lambda x: x["when"], reverse=True)
@@ -316,8 +626,116 @@ def pending_meetings(who: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     return pending_split(who)[0]
 
 
+def row_done(i: int, r: dict[str, Any], mark: str = "") -> str:
+    """Một dòng cho cuộc họp ĐÃ có biên bản, trong danh sách đánh số liên tục.
+
+    Có link Minutes ngay tại đây là CỐ Ý (04/08/2026): bản cũ chỉ trả tên + giờ,
+    nên agent muốn đưa link phải tự gọi `get_meeting` từng cuộc — hoặc tự ghép
+    URL từ minute_token, tức là bịa. Đo thật thấy một câu trả lời có đủ 7 link mà
+    tool liệt kê không hề trả link nào.
+
+    `mark` chỉ được đặt khi danh sách LẪN cuộc có và cuộc chưa có bản gỡ băng
+    (xem `_render_list`). Cả danh sách đều có thì móc không phân biệt được gì,
+    chỉ làm dòng dài thêm — lúc đó chân trang nói bằng lời.
+    """
+    prefix = f"{mark} " if mark else ""
+    title = _title(_s(r, bitable.F_TITLE)) or "(không tiêu đề)"
+    # In đậm TÊN cuộc họp, để ngày giờ thường (user chốt 05/08/2026): mắt tìm
+    # cuộc họp theo tên, không theo ngày. `lark_md` chỉ có **đậm** và [nhãn](url)
+    # — không có heading, nên nhấn mạnh chỉ còn cách này.
+    line = f"{i}. {prefix}**{title}** · {_dmy(_when(r))}"
+    if _s(r, bitable.F_LINK):
+        line += f"\n   {_s(r, bitable.F_LINK)}"
+    return line
+
+
+_TRANSCRIPT_CACHE_S = 30
+_transcript_cache: tuple[float, set[str]] = (0.0, set())
+
+
+def _tokens_with_transcript() -> set[str]:
+    """minute_token của mọi job đã có bản gỡ băng whisper trên đĩa.
+
+    Một truy vấn cho cả danh sách thay vì `jobstore.get` từng dòng: danh sách
+    có thể tới 50 cuộc, và hàm này chạy trong đường gửi tin cho người dùng.
+    Lỗi đọc DB KHÔNG được làm hỏng danh sách — mất móc còn hơn mất câu trả lời.
+
+    Có cache 30 giây vì `fmt_record` gọi hàm này cho TỪNG record, mà
+    `search_meetings`/`records_text` render tới hàng chục record một lượt —
+    không cache thì mỗi câu hỏi quét bảng `jobs` vài chục lần. Cửa sổ 30 giây là
+    an toàn: hậu quả xấu nhất là một cuộc vừa phiên âm xong chưa được quảng cáo
+    ngay, chứ không bao giờ hứa một bản gỡ băng không tồn tại — trừ khi file bị
+    xoá trong đúng 30 giây đó, và `sendfile` vẫn kiểm lại trước khi gửi.
+    """
+    global _transcript_cache
+    import time as _time
+    now = _time.monotonic()
+    stamp, cached = _transcript_cache
+    if stamp and now - stamp < _TRANSCRIPT_CACHE_S:
+        return cached
+    from . import jobstore
+    try:
+        fresh = {r["minute_token"] for r in jobstore.all_jobs()
+                 if r["transcript_path"]}
+    except Exception as exc:                   # noqa: BLE001 — danh sách quan trọng hơn móc
+        print(f"[qa] không đọc được trạng thái transcript: {exc}")
+        return set()
+    _transcript_cache = (now, fresh)
+    return fresh
+
+
+# Chân trang danh sách (chốt 05/08/2026). Vì sao phải có: người dùng thấy link
+# Minutes của Lark rồi tưởng đó là tất cả những gì hệ thống có, trong khi bản gỡ
+# băng whisper chi tiết hơn hẳn và đang nằm sẵn trên đĩa. Không ai xin thứ mình
+# không biết là tồn tại.
+# Gọi là "NGUYÊN VĂN", không phải "bản gỡ băng" (user chốt 05/08/2026): gỡ băng
+# là tiếng lóng nghề báo, nhân viên văn phòng đọc không ra. "Nguyên văn" ai cũng
+# hiểu là đúng từng chữ người ta nói, và nó khớp luôn với lệnh `gửi nguyên văn`
+# mà cổng write-tool đã nhận.
+#
+# KHÔNG dùng "biên bản chi tiết": "biên bản" đang mang nghĩa khác ngay trong
+# cùng danh sách (`ĐÃ CÓ BIÊN BẢN` = đã có bản tóm tắt trên Base). Hai nghĩa cho
+# một từ trong cùng một tin nhắn là cách chắc chắn làm người đọc hiểu sai.
+_FOOT_ALL = ("Cả {n} cuộc đều có **BẢN NGUYÊN VĂN** — chép lại đúng từng câu "
+             "mọi người đã nói, đầy đủ hơn bản tóm tắt của Lark.")
+_FOOT_MIXED = ("📄 = có **bản nguyên văn** ({k}/{n} cuộc) — chép lại đúng từng "
+               "câu mọi người đã nói, đầy đủ hơn bản tóm tắt của Lark.")
+_FOOT_ASK = 'Nhắn **gửi nguyên văn <tên cuộc họp>** để nhận file Word.'
+
+
+def _lark_ready(minute_token: str) -> bool:
+    """Đã có bản chép của Lark trên đĩa chưa. Không chạm mạng, không bao giờ ném."""
+    try:
+        from . import larktext
+        return larktext.have(minute_token)
+    except Exception as exc:                       # noqa: BLE001 — chỉ là một nhãn
+        print(f"[qa] không kiểm được bản Lark {minute_token}: {exc}")
+        return False
+
+
+def row_pending(i: int, p: dict[str, Any]) -> str:
+    """Một dòng cho cuộc họp CHƯA có biên bản. Cùng kiểu đánh số với `row_done`."""
+    line = f"{i}. {_dmy(p['when']) or '(không rõ giờ)'} · {_title(p['title'])}"
+    line += f"\n   {p['tinh_trang']}"
+    if p["status"] == "failed" and p["error"]:
+        # Xuống dòng chứ không nhét vào ngoặc: lý do giờ là một CÂU, nhét trong
+        # ngoặc đơn giữa dòng thì đọc rối.
+        line += f"\n   Lý do: {p['error']}"
+    if p["link"]:
+        line += f"\n   {p['link']}"
+    return line
+
+
 def fmt_pending(p: dict[str, Any]) -> str:
-    line = f"- {p['when'] or '(không rõ giờ)'} · {p['title']}"
+    """Một cuộc chưa có biên bản, viết cho NGƯỜI đọc.
+
+    Chữ in hoa ở đây là thứ agent nhại lại nguyên xi ra chat (ca thật
+    06/08/2026: bot trả lời "hệ thống hiện vẫn báo **CHƯA CÓ BIÊN BẢN** — đang
+    phiên âm"). Nhãn viết hoa vẫn giữ vì nó là NHÃN trạng thái trong một danh
+    sách gạch đầu dòng — mắt cần mốc để quét. Cái phải chặn là agent bê nhãn đó
+    vào câu văn xuôi, và chỗ chặn đúng là prompt, không phải ở đây.
+    """
+    line = f"• **{_title(p['title'])}** · {_dmy(p['when']) or '(không rõ giờ)'}"
     # Ba ca KHÁC nhau, đừng gộp. KHÔNG lộ "Base" cho người dùng (user chốt
     # 03/08/2026 — Base là chỗ nội bộ, hạn chế người vào):
     #  - delivered: biên bản CÓ THẬT và đã tới tay người dự, chỉ chưa đồng bộ
@@ -330,13 +748,23 @@ def fmt_pending(p: dict[str, Any]) -> str:
         dau = "CHƯA TẠO XONG BIÊN BẢN"
     else:
         dau = "CHƯA CÓ BIÊN BẢN"
-    line += f"\n    tình trạng: {dau} — {p['tinh_trang']}"
+    # Thụt ba khoảng trắng cho khớp `_field_lines` và `row_pending` — ba chỗ này
+    # đứng cạnh nhau trong cùng một tin nhắn, lệch lề là nhìn thấy ngay.
+    line += f"\n   tình trạng: {dau} — {p['tinh_trang']}"
     if p["status"] == "failed" and p["error"]:
-        line += f" (lỗi: {p['error']})"
+        line += f"\n   Lý do: {p['error']}"
+    # Đã tải được bản chép của Lark thì NÓI RA: người dùng hỏi tiếp về cuộc này
+    # là trả lời được ngay, và im lặng ở đây làm agent tưởng không có gì để đọc.
+    # `have()` đọc đĩa, KHÔNG chạm mạng — dòng này chạy cho từng cuộc trong một
+    # danh sách có thể dài mấy chục dòng.
+    if _lark_ready(p["minute_token"]):
+        line += ("\n   nội dung ĐỌC ĐƯỢC rồi (bản chép sẵn của Lark) — hỏi mình "
+                 "về cuộc này là mình trả lời được")
     if p["link"]:
-        line += f"\n    xem nguyên văn trong Lark Minutes: {p['link']}"
-    else:
-        line += f"\n    minute_token: {p['minute_token']}"
+        line += f"\n   xem nguyên văn trong Lark Minutes: {p['link']}"
+    # KHÔNG in `minute_token` cho người dùng: đó là sổ sách của agent, và nó đã
+    # đi kênh nội bộ qua `_record_notes`. Bản cũ in ra khi thiếu link, nên đúng
+    # những cuộc chưa có link Minutes lại là những cuộc lộ mã máy ra chat.
     return line
 
 
@@ -357,14 +785,35 @@ def _pending_block(who: dict[str, Any] | None,
         ps = [p for p in ps if p["when"] <= f"{until} 23:59:59"]
     if not ps:
         return "", hidden
-    return ("\n\n⚠️ NGOÀI RA có {n} cuộc họp đã phát hiện nhưng CHƯA có biên bản. "
-            "PHẢI nói cho người dùng biết, đừng bỏ qua:\n{body}").format(
+    # Không còn câu "PHẢI nói cho người dùng biết, đừng bỏ qua" (bỏ 04/08/2026):
+    # đó là lời dặn cho agent nằm lẫn trong text người dùng đọc, và agent đã chép
+    # nguyên văn ra chat. Việc bắt buộc nói lại nay nằm ở prompt, không nằm ở đây.
+    return ("\n\nCHƯA CÓ BIÊN BẢN ({n}):\n{body}").format(
         n=len(ps), body="\n".join(fmt_pending(p) for p in ps)), hidden
 
 
 def list_meetings(who: dict[str, Any] | None, *, status: str = "all",
                   since: str = "", until: str = "", limit: int = 50) -> str:
-    """Liệt kê cuộc họp, mới nhất trước.
+    """Danh sách đã bọc nhãn hai kênh — đường CLI (`v2 ask`) và bản dự phòng.
+
+    Đường sản phẩm (bot Lark) nay đi qua `sendlist.send_list`: nó gửi thẳng
+    `list_text()` vào khung chat rồi chỉ trả lời dặn cho agent. Giữ hàm này vì
+    terminal không có khung chat nào để gửi, và vì khi Lark hỏng thì `sendlist`
+    rơi về đúng đây.
+    """
+    if not who:
+        return NO_ASKER
+    return two_channel(list_text(who, status=status, since=since,
+                                 until=until, limit=limit))
+
+
+def list_text(who: dict[str, Any], *, status: str = "all", since: str = "",
+              until: str = "", limit: int = 50) -> str:
+    """Danh sách cuộc họp dạng THÔ — chưa bọc nhãn, gửi thẳng cho người dùng được.
+
+    Tách khỏi `list_meetings` (04/08/2026) để `sendlist` gửi được đúng chuỗi này
+    vào khung chat mà không phải bóc nhãn ra. Ai gọi hàm này thì tự chịu trách
+    nhiệm bọc nhãn hoặc gửi đi.
 
     status: `all`, hoặc một giá trị của cột Trạng thái — nay là về VIỆC PHÁT
     (`đã phát` / `phát hỏng` / `không có recap`), KHÔNG còn `draft`/`final`
@@ -373,8 +822,6 @@ def list_meetings(who: dict[str, Any] | None, *, status: str = "all",
     since/until dạng YYYY-MM-DD, so sánh trên chuỗi `Thời gian họp` (đã lưu
     dạng 'YYYY-MM-DD HH:MM:SS' nên so chuỗi là đúng thứ tự thời gian).
     """
-    if not who:
-        return NO_ASKER
     rows = records()
     status = (status or "all").lower()
     if status != "all":
@@ -396,17 +843,113 @@ def list_meetings(who: dict[str, Any] | None, *, status: str = "all",
     # người ta lọc theo một trạng thái Base cụ thể (lúc đó họ hỏi về Base,
     # không hỏi "tôi có những cuộc họp nào").
     if status != "all":
-        tail, hidden_pending = "", 0
+        pend = []
     else:
-        tail, hidden_pending = _pending_block(who, since, until)
-    tail += _hidden_note(hidden + hidden_pending)
+        pend, _ = _pending_filtered(who, since, until)
 
-    if not rows:
-        return ("Không có cuộc họp nào ĐÃ CÓ BIÊN BẢN khớp yêu cầu."
-                + (tail or " Và cũng không có cuộc họp nào đang chờ xử lý."))
-    head = f"{len(rows)} cuộc họp đã có biên bản:"
-    return (head + "\n"
-            + "\n".join(fmt_record(r, full=False) for r in rows) + tail)
+    if not rows and not pend:
+        return "Bạn không có cuộc họp nào khớp yêu cầu."
+
+    # XEM HẾT (chỉ đường terminal): tách hai khối, cuộc của mình và cuộc của
+    # người khác. Trộn chung một danh sách thì không phân biệt nổi, và tưởng hệ
+    # thống gán bừa người dự (đã gặp thật 04/08/2026: danh sách 11 cuộc lẫn
+    # CDP/BI/HRIS mà người hỏi không dự cuộc nào trong đó).
+    #
+    # Bot KHÔNG bao giờ vào nhánh này nữa — `see_all` chỉ do `admin_view()` đặt,
+    # mà `admin_view` không dựng được từ dữ liệu đến từ Lark.
+    if (who or {}).get("see_all"):
+        idx = viewers_index()
+        ids = _ids_of(who)
+        mine = [r for r in rows if ids & idx.get(_s(r, bitable.F_TOKEN), set())]
+        others = [r for r in rows if r not in mine]
+        if others:
+            return _render_admin(mine, others, pend)
+
+    return _render_list(rows, pend)
+
+
+def _pending_filtered(who: dict[str, Any] | None, since: str, until: str
+                      ) -> tuple[list[dict[str, Any]], int]:
+    """(cuộc chưa có biên bản sau bộ lọc thời gian, số bị ẩn). Không dựng text."""
+    try:
+        ps, hidden = pending_split(who)
+    except Exception as exc:                   # noqa: BLE001 — không được làm hỏng câu trả lời chính
+        print(f"[qa] không đọc được hàng đợi: {exc}")
+        return [], 0
+    if since:
+        ps = [p for p in ps if p["when"] >= since]
+    if until:
+        ps = [p for p in ps if p["when"] <= f"{until} 23:59:59"]
+    return ps, hidden
+
+
+def _render_list(rows: list[dict[str, Any]], pend: list[dict[str, Any]]) -> str:
+    """Danh sách THÀNH PHẨM: một tổng số duy nhất, đánh số liên tục hai khối.
+
+    Vì sao tổng số phải tính ở đây chứ không để agent tự nói (đo 04/08/2026):
+    bản cũ trả "7 cuộc họp đã có biên bản:" rồi gắn khối "NGOÀI RA có 1 cuộc..."
+    ở cuối. Agent đọc xong nói "Bạn có thể xem 7 cuộc họp", liệt kê 7, rồi thêm
+    cuộc thứ 8 vào câu sau — người đọc đếm được 8 mà đầu câu ghi 7.
+
+    Hai khối vẫn tách vì chúng khác nhau THẬT (có biên bản để đọc / chưa có),
+    nhưng số thứ tự chạy liên tục 1..N nên tổng luôn tự kiểm được bằng mắt.
+    """
+    total = len(rows) + len(pend)
+    parts = [f"Bạn có **{total} cuộc họp**:"]
+    i = 0
+    full = _tokens_with_transcript() if rows else set()
+    n_full = sum(1 for r in rows if _s(r, bitable.F_TOKEN) in full)
+    mixed = 0 < n_full < len(rows)
+    if rows:
+        parts.append(f"\n**ĐÃ CÓ BIÊN BẢN ({len(rows)})**")
+        for r in rows:
+            i += 1
+            mark = ""
+            if mixed:
+                mark = "📄" if _s(r, bitable.F_TOKEN) in full else "  "
+            parts.append(row_done(i, r, mark))
+    if pend:
+        parts.append(f"\n**CHƯA CÓ BIÊN BẢN ({len(pend)})**")
+        for p in pend:
+            i += 1
+            parts.append(row_pending(i, p))
+    # Không có cuộc nào gỡ băng xong thì im lặng: quảng cáo một thứ chưa tồn tại
+    # rồi để người dùng xin và nhận về "chưa có" là làm hỏng lòng tin.
+    if n_full:
+        parts.append("\n───")
+        parts.append(_FOOT_MIXED.format(k=n_full, n=len(rows)) if mixed
+                     else _FOOT_ALL.format(n=n_full))
+        parts.append(_FOOT_ASK)
+    return "\n".join(parts)
+
+
+def _render_admin(mine: list[dict[str, Any]], others: list[dict[str, Any]],
+                  pend: list[dict[str, Any]]) -> str:
+    """Bản cho ADMIN — cuộc của người khác nằm khối riêng, nói rõ vì sao thấy.
+
+    Lời dặn "đừng liệt kê chung" trước đây nằm trong text người dùng đọc. Giờ nó
+    không cần nữa: chính câu tiêu đề khối đã nói rõ, và agent chép nguyên văn.
+    """
+    total = len(mine) + len(pend)
+    parts = [f"Bạn có {total} cuộc họp:"]
+    i = 0
+    if mine:
+        parts.append(f"\nĐÃ CÓ BIÊN BẢN ({len(mine)})")
+        for r in mine:
+            i += 1
+            parts.append(row_done(i, r))
+    if pend:
+        parts.append(f"\nCHƯA CÓ BIÊN BẢN ({len(pend)})")
+        for p in pend:
+            i += 1
+            parts.append(row_pending(i, p))
+    if not mine and not pend:
+        parts = ["Bạn không dự cuộc họp nào trong hệ thống."]
+    parts.append(f"\n{len(others)} cuộc họp DƯỚI ĐÂY KHÔNG PHẢI của bạn — bạn "
+                 f"thấy vì đang là quản trị hệ thống:")
+    for j, r in enumerate(others, 1):
+        parts.append(row_done(j, r))
+    return "\n".join(parts)
 
 
 def get_meeting(who: dict[str, Any] | None, query: str) -> str:
@@ -429,7 +972,10 @@ def get_meeting(who: dict[str, Any] | None, query: str) -> str:
 
     exact = [r for r in rows if _s(r, bitable.F_TOKEN) == query]
     if exact:
-        return fmt_record(exact[0])
+        remember(who, _s(exact[0], bitable.F_TOKEN),
+                 _title(_s(exact[0], bitable.F_TITLE)))
+        return append_agent_note(fmt_record(exact[0]),
+                                 _record_notes(exact[0]))
     hits = [r for r in rows if q in _s(r, bitable.F_TITLE).lower()]
     if not hits:
         if _blocked(all_rows):
@@ -442,10 +988,21 @@ def get_meeting(who: dict[str, Any] | None, query: str) -> str:
         # cuộc họp không tồn tại và thôi đi tìm.
         pend = [p for p in pending_meetings(who)
                 if p["minute_token"] == query or q in p["title"].lower()]
+        if len(pend) == 1:
+            # Chưa lên Base KHÔNG có nghĩa là không đọc được nội dung: bản chép
+            # của Lark thường đã sẵn từ lúc cuộc họp vừa tan. Thử cửa đó trước
+            # khi trả lời "chưa có gì để nói" — xem chú thích ở `from_lark`.
+            from . import jobstore as _js
+            job = _js.get(pend[0]["minute_token"])
+            if job and (served := from_lark(job, pend[0]["title"])):
+                remember(who, pend[0]["minute_token"], pend[0]["title"])
+                return served
         if pend:
-            return ("Cuộc họp này CHƯA có biên bản nên chưa có tóm tắt/quyết "
-                    "định để trả lời. Nói rõ điều đó cho người dùng và đưa link "
-                    "Minutes để họ tự xem:\n"
+            return ("Cuộc họp này chưa có bản tóm tắt/quyết định do hệ thống "
+                    "dựng, và cũng chưa đọc được bản chép nào của Lark. Nói với "
+                    "người dùng bằng lời bình thường rằng nội dung chưa sẵn "
+                    "sàng, đưa link Minutes để họ tự xem, và đừng nhại lại chữ "
+                    "in hoa của hệ thống:\n"
                     + "\n".join(fmt_pending(p) for p in pend))
         return (f"Không tìm thấy cuộc họp nào khớp '{query}' — cả trong biên bản "
                 f"đã chốt lẫn hàng đợi đang xử lý.")
@@ -454,7 +1011,9 @@ def get_meeting(who: dict[str, Any] | None, query: str) -> str:
         return (f"Có {len(hits)} cuộc họp khớp '{query}', nói rõ hơn hoặc dùng "
                 f"minute_token:\n"
                 + "\n".join(fmt_record(r, full=False) for r in hits))
-    return fmt_record(hits[0])
+    remember(who, _s(hits[0], bitable.F_TOKEN),
+             _title(_s(hits[0], bitable.F_TITLE)))
+    return append_agent_note(fmt_record(hits[0]), _record_notes(hits[0]))
 
 
 def search_meetings(who: dict[str, Any] | None, keyword: str,
@@ -480,15 +1039,20 @@ def search_meetings(who: dict[str, Any] | None, keyword: str,
     if not hits and not pend:
         return f"Không có cuộc họp nào nhắc tới '{keyword}'."
     out = []
+    notes: list[str] = []
     if hits:
         hits.sort(key=_when, reverse=True)
         out.append(f"{len(hits)} cuộc họp (đã có biên bản) nhắc tới '{keyword}':")
-        out += [fmt_record(r) for r in hits[:max(1, limit)]]
+        shown = hits[:max(1, limit)]
+        out += [fmt_record(r) for r in shown]
+        # Sổ sách của TỪNG cuộc đi kênh nội bộ: agent cần `minute_token` để gọi
+        # tool tiếp theo, còn người dùng thì không.
+        notes += [_record_notes(r) for r in shown]
     if pend:
         out.append(f"⚠️ {len(pend)} cuộc họp có TÊN khớp '{keyword}' nhưng CHƯA "
                    f"có biên bản, nên không tìm được trong nội dung. PHẢI nêu ra:")
         out += [fmt_pending(p) for p in pend]
-    return "\n\n".join(out)
+    return append_agent_note("\n\n".join(out), "\n\n".join(notes))
 
 
 # --------------------------------------------- nguyên văn whisper (03/08/2026)
@@ -548,6 +1112,89 @@ def _job_title(row: dict[str, Any]) -> str:
     return str(row.get("title") or "") or "(không tiêu đề)"
 
 
+# --------------------------------------- bản chép sẵn của Lark (07/08/2026)
+#
+# Vì sao thêm (user báo 07/08/2026, kèm ảnh chụp chat): người dùng bấm link Lark
+# Minutes thì thấy ĐỦ CHỮ, nhưng hỏi bot thì bot đáp "chưa có biên bản — đang
+# phiên âm" rồi từ chối phân tích. Nhìn từ phía họ, đó là bot mù.
+#
+# Bot không mù, bot chưa từng đi lấy: `lark_api.minutes_transcript` chỉ được gọi
+# đúng một lần lúc phát hiện cuộc họp, bằng đúng một token, và token đó thường
+# không phải chủ bản ghi nên hỏng. Xem `v2/larktext.py` cho toàn bộ số đo.
+#
+# Ranh giới KHÔNG được xoá: bản Lark là bản ĐỌC TẠM, bản chuẩn vẫn là whisper
+# (có tên người dự + glossary đã duyệt nhồi vào prompt). Mọi câu trả lời dựng
+# từ bản Lark phải nói rõ nguồn và mời người dùng lấy bản chuẩn — đó chính là
+# luồng người dùng đặt hàng: đọc được ngay → hỏi có cần bản chuẩn không → nói
+# ước tính → tự gửi khi xong.
+
+# Dấu MỜI. Plugin Hermes đọc dấu này trong kênh NỘI BỘ để biết bot vừa mời lấy
+# bản nguyên văn, nhờ vậy câu trả lời "có" ở lượt sau mở được cổng write-tool
+# (xem `hermes/v2-enroll-gate/_on_post_tool_call`). Không có dấu này thì người
+# dùng đáp "có" và bot bảo họ gõ lại cả câu dài — đúng cái đã sửa ở `_asked_recently`.
+OFFER_MARK = "[V2-OFFER: transcript]"
+
+
+def _lark_note(minute_token: str, title: str) -> str:
+    """Lời dặn cho agent khi vừa phục vụ bằng bản chép của Lark."""
+    from . import eta
+    when = eta.human(minute_token)
+    khi_nao = f"mất {when}" if when else "chưa ước tính được thời gian"
+    return "\n".join([
+        OFFER_MARK,
+        f"Nội dung trên là bản chép SẴN CỦA LARK cho '{title}' — đọc được ngay, "
+        f"nhưng là bản máy nghe thô: không có tên người dự làm gợi ý và không "
+        f"có bộ thuật ngữ công ty, nên tên riêng dễ sai.",
+        "Trả lời ĐÚNG câu người dùng vừa hỏi bằng nội dung đó trước đã.",
+        f"Rồi HỎI THÊM MỘT CÂU ở cuối: họ có muốn bản nguyên văn chuẩn (hệ "
+        f"thống tự phiên âm lại, đúng tên riêng hơn) không — nói luôn là {khi_nao}. "
+        f"Hỏi gọn một câu, đừng giải thích dài.",
+        f"Họ trả lời có thì gọi send_transcript_file với "
+        f"minute_token={minute_token}.",
+        "Đừng nói với người dùng là 'chưa có biên bản': họ đang cầm nội dung "
+        "cuộc họp trong tay rồi.",
+    ])
+
+
+def _lark_body(row: dict[str, Any], title: str, part: int) -> str:
+    """Bản Lark của một job -> khối DỮ LIỆU đã cắt phần. "" nếu không có.
+
+    Cắt phần y hệt nguyên văn whisper (`_split_parts`): đo thật có cuộc cho ra
+    124.915 ký tự, đổ thẳng vào prompt agent là vừa tốn vừa làm nó lạc câu hỏi.
+    """
+    from . import larktext
+    text = larktext.get(row)
+    if not text.strip():
+        return ""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    body = _split_parts(lines, TRANSCRIPT_PART_CHARS)
+    total = len(body)
+    part = max(1, min(int(part or 1), total))
+    head = [f"**Nội dung cuộc họp — {title}**",
+            "- Nguồn: bản chép sẵn của Lark (máy nghe, chưa qua bộ thuật ngữ "
+            "công ty — tên riêng có thể sai)",
+            f"- Phần {part}/{total}"
+            + ("" if part >= total else "  ← chưa hết"),
+            f"- minute_token: {row['minute_token']}",
+            ""]
+    tail = ("" if part >= total else
+            f"\n\n… còn phần {part + 1}/{total}. Cần đọc tiếp thì gọi lại "
+            f"get_transcript với cùng minute_token và part={part + 1}.")
+    return "\n".join(head) + body[part - 1] + tail
+
+
+def from_lark(row: dict[str, Any], title: str, *, part: int = 1) -> str:
+    """Phục vụ câu hỏi bằng bản Lark. "" nếu cuộc này không đọc được bản nào.
+
+    KHÔNG kiểm quyền ở đây — caller phải qua `_may_see` trước. Cùng lý lẽ với
+    `larktext`: một luật quyền thứ hai song song thì sớm muộn cũng lệch.
+    """
+    body = _lark_body(row, title, part)
+    if not body:
+        return ""
+    return context_result(body, _lark_note(row["minute_token"], title))
+
+
 def get_transcript(who: dict[str, Any] | None, query: str,
                    *, part: int = 1) -> str:
     """Nguyên văn whisper của một cuộc họp, cắt thành phần cho vừa prompt.
@@ -583,21 +1230,35 @@ def get_transcript(who: dict[str, Any] | None, query: str,
                 "sách người dự, nên mình không đưa nguyên văn được. Nếu bạn có "
                 "dự thì nhắn quản trị hệ thống — có thể việc tra người dự bị sót.")
     if len(allowed) > 1:
+        # `start_ts` rỗng là chuyện có thật (job dựng từ search hit chưa tra được
+        # giờ). Bản cũ in chuỗi RỖNG, nên hai cuộc trùng tên ra hai dòng giống
+        # hệt nhau — câu hỏi lại thành vô nghĩa, người dùng không chọn nổi. Cùng
+        # ca đã phải vá ở `sendfile._when_of`.
         allowed.sort(key=lambda r: r.get("start_ts") or 0, reverse=True)
-        return (f"Có {len(allowed)} cuộc họp khớp '{query}', gọi lại kèm "
-                f"minute_token cụ thể:\n"
-                + "\n".join(f"- {_ts_to_str(r.get('start_ts'))} · {_job_title(r)}"
-                            f" · {r['minute_token']}" for r in allowed))
+        return (f"Có {len(allowed)} cuộc họp khớp '{query}'. Hỏi người dùng "
+                f"muốn cuộc nào (nêu ngày giờ), rồi gọi lại kèm đúng "
+                f"minute_token:\n"
+                + "\n".join(f"• {_ts_to_str(r.get('start_ts')) or '(chưa rõ giờ)'}"
+                            f" · {_job_title(r)} · {r['minute_token']}"
+                            for r in allowed))
 
     row = allowed[0]
     title = _job_title(row)
+    remember(who, row["minute_token"], title)
     tpath = row.get("transcript_path")
     if not tpath:
+        # CHƯA phiên âm xong — nhưng Lark thường đã có bản chép của nó rồi.
+        # Thử cửa đó TRƯỚC khi nói "chưa có": nói "chưa có" trong khi người dùng
+        # đang mở đúng nội dung đó trên Lark Minutes là cách nhanh nhất làm họ
+        # mất tin vào bot (ca thật 06/08/2026 18:11).
+        if (served := from_lark(row, title, part=part)):
+            return served
         st = row.get("status") or "?"
-        return (f"Cuộc họp '{title}' CHƯA có nguyên văn: {_TINH_TRANG.get(st, st)}"
+        return (f"Cuộc họp '{title}' chưa có nguyên văn: {_TINH_TRANG.get(st, st)}"
                 + (f" (lỗi: {(row.get('error') or '')[:160]})"
                    if row.get("error") else "")
-                + ". Nói rõ điều đó cho người dùng, đừng bịa nội dung.")
+                + ". Nói rõ điều đó cho người dùng bằng lời bình thường, "
+                  "đừng bịa nội dung và đừng nhại lại chữ in hoa của hệ thống.")
 
     import json as _json
     from .models import Transcript
@@ -625,7 +1286,10 @@ def get_transcript(who: dict[str, Any] | None, query: str,
         return (f"Nguyên văn cuộc họp '{title}' chỉ có {total} phần, không có "
                 f"phần {part}.")
 
-    head = [f"### Nguyên văn (whisper) — {title}",
+    # Bỏ chữ "whisper" khỏi dòng tiêu đề (05/08/2026): tên engine là chuyện nội
+    # bộ, người đọc chỉ cần biết đây là bản chép đúng từng câu. Chi tiết kỹ thuật
+    # vẫn giữ ở dòng "Nguồn" cho ai cần chẩn lỗi.
+    head = [f"**Nguyên văn — {title}**",
             f"- Phần {part}/{total}"
             + ("" if part >= total else "  ← CHƯA hết, xem dòng cuối"),
             f"- Nguồn: {t.engine}, {t.duration:.0f}s audio, {len(segs)} đoạn",
@@ -669,10 +1333,9 @@ def context(who: dict[str, Any] | None, limit: int = 50) -> str:
     """
     if not who:
         return ""
-    rows, hidden = _only_visible(records(limit=limit), who)
-    tail, hidden_pending = _pending_block(who)
-    return ("\n\n".join(fmt_record(r) for r in rows)
-            + tail + _hidden_note(hidden + hidden_pending))
+    rows, _ = _only_visible(records(limit=limit), who)
+    tail, _ = _pending_block(who)
+    return "\n\n".join(fmt_record(r) for r in rows) + tail
 
 
 def answer(who: dict[str, Any] | None, question: str, *, limit: int = 50) -> str:

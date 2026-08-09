@@ -182,13 +182,42 @@ def transcribe(audio_path: Path, minute_token: str,
         raise TranscribeError(f"server không trả job_id: {r.text[:200]}")
 
     deadline = time.time() + timeout_sec
+    unknown = 0                          # số lần liên tiếp không đọc ra trạng thái
     while time.time() < deadline:
         time.sleep(poll_interval)
         try:
-            res = httpx.get(f"{base}/status/{job_id}", timeout=30.0).json()
+            r = httpx.get(f"{base}/status/{job_id}", timeout=30.0)
         except httpx.HTTPError:
             continue                     # server bận/chưa sẵn -> thử lại
+        # 404 = whisper KHỞI ĐỘNG LẠI giữa chừng (job_id nằm trong RAM của tiến
+        # trình cũ, không có sổ trên đĩa). Trước 04/08/2026 nhánh này không tồn
+        # tại: `.json()` của một 404 trả `{"detail": ...}`, `status` ra rỗng, và
+        # vòng lặp quay tiếp cho tới `timeout_sec` = SÁU GIỜ — trong lúc đó
+        # whisper log 404 mỗi 5 giây và cả hàng đợi đứng sau một job đã chết.
+        # Đã trả giá thật với bản ghi 3,8 giờ: 4 lần thử, chặn 4 cuộc phía sau.
+        #
+        # Ném `TranscribeUnavailable` (không phải lỗi thường): orchestrator trả
+        # lại lượt thử và đưa job về `queued` — whisper restart là sự cố HẠ
+        # TẦNG, không phải lỗi của cuộc họp, nên đừng đốt quota thử lại của nó.
+        if r.status_code == 404:
+            raise TranscribeUnavailable(
+                f"job {job_id} không còn trên whisper (server đã khởi động lại "
+                f"giữa chừng) — nộp lại ở vòng sau")
+        try:
+            res = r.json()
+        except ValueError:
+            continue
         status = str(res.get("status") or "").lower()
+        if not status:
+            # Trả lời không có `status`: cùng họ với 404 (đổi API, proxy chen
+            # vào, body rác). Chịu ~1 phút rồi bỏ, đừng quay 6 giờ.
+            unknown += 1
+            if unknown >= max(3, int(60 / max(poll_interval, 1))):
+                raise TranscribeUnavailable(
+                    f"whisper trả lời không đọc được trạng thái "
+                    f"({str(res)[:120]}) — nộp lại ở vòng sau")
+            continue
+        unknown = 0
         if status in ("done", "completed", "finished", "success"):
             duration = float(res.get("duration") or res.get("duration_seconds")
                              or 0.0)

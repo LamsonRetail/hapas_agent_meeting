@@ -48,6 +48,7 @@ nul
 enroll-links.html
 # Hai dòng dưới do `vercel link` tự thêm (02/08/2026).
 .vercel
+.wrangler/
 .env*
 # ...nhưng `.env*` khớp CẢ `v2/.env.example` — file mẫu mà repo cần có.
 # Hôm nay nó vẫn còn vì đã được tracked từ trước (gitignore không đuổi file đã

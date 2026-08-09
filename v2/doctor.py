@@ -17,6 +17,24 @@ from pathlib import Path
 from . import config, jobstore, tokenstore
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
+
+# Mức nghiêm trọng của từng status khi đếm hàng đợi. Khoá PHẢI phủ đúng
+# `jobstore.ALL_STATUSES` — selftest cưỡng chế điều đó, vì bản cũ gõ tay danh
+# sách này và quên `held`, tức doctor báo "hàng đợi" mà giấu mất trạng thái mà
+# gần như mọi cuộc họp kết thúc ở đó (mô hình kéo, 03/08/2026).
+#
+# `held` là OK chứ không phải WARN: nó là điểm dừng BÌNH THƯỜNG — đã phiên âm
+# xong, cố ý giữ lại chờ người dự hỏi. Không có gì để người vận hành phải làm.
+QUEUE_LEVELS = {
+    # WARN: `create()` luôn đặt 'queued', nên một job còn ở 'detected' nghĩa là
+    # có đường ghi nào đó bỏ sót — đáng để người vận hành nhìn thấy.
+    "detected": WARN,
+    "queued": OK, "transcribing": OK, "recapping": OK,
+    "waiting_auth": OK,
+    "held": OK, "delivered": OK, "failed": FAIL,
+    "awaiting_approval": WARN, "owner_only": OK, "expired": WARN,
+    "discarded": OK,
+}
 _MARK = {OK: "[+]", WARN: "[!]", FAIL: "[x]"}
 
 
@@ -62,6 +80,64 @@ def _check_config(r: Report) -> None:
               "token v2 sẽ không trả refresh_token")
 
 
+def relay_log_health(text: str) -> tuple[str, str]:
+    """Đọc kết quả đẩy Vercel gần nhất mà không chạm mạng hay xoá OAuth code.
+
+    Dashboard status, link rút gọn và hộp thư callback của deployment hiện tại
+    cùng dùng một Blob store. Vì endpoint ``oauth-pending`` là kiểu đọc-rồi-xoá,
+    doctor tuyệt đối không được gọi nó để health-check: chạy doctor đúng lúc ai
+    đó auth sẽ nuốt mất code một-lần. Log của lần POST status gần nhất là phép
+    thử an toàn đã có sẵn; nếu Blob bị suspend thì chính ``put()`` này báo lỗi.
+    """
+    ok_at = text.rfind("[status] đã đẩy snapshot")
+    fail_at = max(text.rfind("[status] đẩy hỏng"),
+                  text.rfind("[status] heartbeat hỏng"))
+    if fail_at > ok_at:
+        tail = text[fail_at:fail_at + 500].lower()
+        if "store has been suspended" in tail or "blob" in tail and "suspend" in tail:
+            return FAIL, ("Vercel Blob bị suspend; callback OAuth không tự chuyển "
+                          "code về máy")
+        return FAIL, "lần đẩy Vercel gần nhất bị hỏng; xem log v2"
+    if ok_at >= 0:
+        return OK, "lần đẩy Vercel gần nhất thành công"
+    return WARN, "chưa thấy kết quả đẩy Vercel trong log"
+
+
+def _check_oauth_relay(r: Report) -> None:
+    if config.CF_RELAY_URL:
+        from . import cloudflare_relay
+        if not cloudflare_relay.queue_enabled():
+            r.add(FAIL, "Cloudflare OAuth relay",
+                  "đã bật CF_RELAY_URL nhưng thiếu account/queue/token/khóa ký")
+            return
+        try:
+            detail = cloudflare_relay.live_health()
+        except Exception as exc:  # noqa: BLE001 - doctor must report, not crash
+            r.add(FAIL, "Cloudflare OAuth relay", str(exc))
+        else:
+            r.add(OK, "Cloudflare OAuth relay", detail)
+        return
+    if not config.OAUTH_PULL_URL:
+        r.add(FAIL, "hộp thư OAuth tự phục vụ chưa cấu hình",
+              "auth xong sẽ không tự trả code về máy")
+        return
+    log_dir = config.DATA_DIR / "logs"
+    files = sorted(log_dir.glob("v2-*.log"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "[status]" not in text:
+            continue
+        level, detail = relay_log_health(text)
+        r.add(level, "Vercel Blob / callback OAuth", detail)
+        return
+    r.add(WARN, "Vercel Blob / callback OAuth",
+          "chưa có log để xác nhận relay đang sống")
+
+
 def _check_fernet(r: Report) -> None:
     if not config.FERNET_KEY:
         r.add(FAIL, "V2_FERNET_KEY trống", "sinh bằng: python -m v2 genkey")
@@ -98,6 +174,19 @@ def _check_enrolled(r: Report) -> None:
 
 def _check_whisper(r: Report) -> None:
     url = config.TRANSCRIBE_URL.rstrip("/") + "/health"
+    from . import whisper_supervisor
+    if config.WHISPER_AUTOSTART and whisper_supervisor.is_local_url():
+        script = config.WHISPER_START_SCRIPT.expanduser().resolve()
+        if script.is_file():
+            r.add(OK, "whisper tự phục hồi đã cấu hình", str(script))
+        else:
+            r.add(FAIL, "whisper tự phục hồi thiếu script", str(script))
+    elif config.WHISPER_AUTOSTART:
+        r.add(WARN, "whisper là endpoint từ xa — không tự khởi động",
+              config.TRANSCRIBE_URL)
+    else:
+        r.add(WARN, "whisper tự phục hồi đang TẮT",
+              "WHISPER_AUTOSTART=0; tiến trình chết phải bật lại bằng tay")
     try:
         import httpx
         resp = httpx.get(url, timeout=5.0)
@@ -113,7 +202,8 @@ def _check_whisper(r: Report) -> None:
             r.add(WARN, "whisper /health trả bất thường", str(data)[:80])
     except Exception as exc:  # noqa: BLE001 - kết nối hỏng đủ kiểu
         r.add(FAIL, f"whisper KHÔNG kết nối được @ {config.TRANSCRIBE_URL}",
-              "bật E:\\whisper\\run-server.bat + đúng cổng trong TRANSCRIBE_URL")
+              f"v2 run sẽ thử bật {config.WHISPER_START_SCRIPT}; kiểm tra log "
+              "v2/data/logs/whisper-YYYY-MM-DD.log")
 
 
 def _check_llm(r: Report) -> None:
@@ -188,9 +278,11 @@ def _check_base(r: Report) -> None:
 # Giá trị `link_share_entity` -> (mức, câu giải thích). Xếp từ hẹp tới rộng.
 LINK_SHARE: dict[str, tuple[str, str]] = {
     "closed": (OK, "chỉ người được thêm vào mới xem được"),
-    "tenant_readable": (WARN, "MỌI người trong công ty có link đều ĐỌC được"),
-    "tenant_editable": (WARN, "MỌI người trong công ty có link đều SỬA được"),
-    "partner_tenant_readable": (WARN,
+    # Với V2, Base chứa nguyên văn transcript và đường bot có ACL theo người dự.
+    # Bất kỳ link-share vượt ACL đó đều là lỗi chặn go-live, không chỉ cảnh báo.
+    "tenant_readable": (FAIL, "MỌI người trong công ty có link đều ĐỌC được"),
+    "tenant_editable": (FAIL, "MỌI người trong công ty có link đều SỬA được"),
+    "partner_tenant_readable": (FAIL,
                                 "công ty mình VÀ tổ chức đối tác đều đọc được"),
     "anyone_readable": (FAIL, "BẤT KỲ AI có link, kể cả ngoài công ty, ĐỌC được"),
     "anyone_editable": (FAIL, "BẤT KỲ AI có link, kể cả ngoài công ty, SỬA được"),
@@ -275,16 +367,9 @@ def _check_alerts(r: Report) -> None:
 
 
 def _check_queue(r: Report) -> None:
-    # 4 status cuối là di sản của cửa duyệt đã bỏ (xem jobstore docstring).
-    buckets = {
-        "queued": OK, "transcribing": OK, "recapping": OK,
-        "delivered": OK, "failed": FAIL,
-        "awaiting_approval": WARN, "owner_only": OK, "expired": WARN,
-        "discarded": OK,
-    }
     parts = []
     worst_seen = OK
-    for st, lvl in buckets.items():
+    for st, lvl in QUEUE_LEVELS.items():
         n = len(jobstore.by_status(st))
         if n:
             parts.append(f"{st}={n}")
@@ -365,7 +450,7 @@ def _check_backup(r: Report) -> None:
               "V2_BACKUP_DIR ra ngoài máy nếu cần")
 
 
-def collect() -> Report:
+def collect(*, check_relay: bool = True) -> Report:
     """Chạy toàn bộ kiểm tra, trả Report (không in gì).
 
     Tách khỏi run() để status_push.py đẩy cùng bộ kiểm tra lên dashboard —
@@ -377,6 +462,8 @@ def collect() -> Report:
 
     r = Report()
     _check_config(r)
+    if check_relay:
+        _check_oauth_relay(r)
     _check_fernet(r)
     _check_enrolled(r)
     _check_whisper(r)
@@ -391,7 +478,7 @@ def collect() -> Report:
 
 
 def run() -> int:
-    r = collect()
+    r = collect(check_relay=True)
 
     print("=== V2 doctor ===")
     print(r.render())

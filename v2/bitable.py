@@ -104,6 +104,7 @@ JOB_STATUS_LABEL = {
     "queued": "đang chờ dịch",
     "transcribing": "đang phiên âm",
     "recapping": "đang tóm tắt",
+    "waiting_auth": "chờ người có quyền tự xác thực",
     "held": "đã dịch xong — chờ người hỏi",
     "delivered": "đã gửi",
     "failed": "HỎNG — không tự chạy lại",
@@ -442,6 +443,41 @@ def _job_fields(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _meta_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Ô HIỂN THỊ soi từ `meta_json`. Rẻ như `_job_fields` — chỉ parse JSON.
+
+    Vì sao phải có (đo 05/08/2026): `sync_jobs` trước đây chỉ đổ `_job_fields`,
+    nên bốn ô dưới đây được ghi ĐÚNG MỘT LẦN lúc `write_draft` tạo record rồi
+    đóng băng vĩnh viễn. Ba hậu quả đã đo được trên Base thật:
+
+      - Bản vá ACL đổi `participants_source` của Workforce Buổi 4 từ
+        `calendar[near5m]` sang `calendar[verified]…+vc29` trong SQLite, còn Base
+        vẫn hiện "khớp theo GIỜ (lệch 5m)". Đó chính là ô người vận hành nhìn để
+        trả lời "vì sao người này nhận được biên bản" — nó đang nói dối.
+      - Tên cuộc họp còn nguyên escape HTML (`Review HRIS &amp; feedback`) dù
+        `meetings.build_meta` đã gỡ từ 04/08. `qa._title()` chỉ gỡ lúc HIỂN THỊ
+        trong bot, nên người mở thẳng Base vẫn đọc chuỗi hỏng.
+      - Cuộc họp được tra lại người dự (`_maybe_reresolve`) đổi cả tên sự kiện
+        lẫn link Minutes mà Base không hay biết.
+
+    KHÔNG đưa `F_WHEN` vào `_DIFF_FIELDS` (xem chú thích ở đó): Base trả datetime
+    về dạng chuỗi còn ta gửi epoch ms, so thẳng thì lần nào cũng "lệch". Nó vẫn
+    được ghi — đi ké mỗi khi một ô khác kích hoạt lượt đẩy.
+    """
+    out: dict[str, Any] = {}
+    try:
+        meta = jobstore.meta_from_json(row["meta_json"])
+    except (ValueError, KeyError, TypeError):
+        return out                        # job cũ méo: để `_job_fields` lo phần còn lại
+    from . import meetings
+    out[F_TITLE] = meta.title or "(không tiêu đề)"
+    out[F_SOURCE] = meetings.explain_source(meta.participants_source)
+    out[F_LINK] = meta.app_link or ""
+    if meta.start:
+        out[F_WHEN] = int(meta.start * 1000)
+    return out
+
+
 def _tracking_fields(meta: MeetingMeta, *,
                      skip_file: bool = False) -> dict[str, Any]:
     """Các ô theo dõi: chủ họp, người dự, thời gian whisper, file transcript.
@@ -719,8 +755,22 @@ def update_recap(minute_token: str, recap: Recap) -> bool:
 # datetime: Base trả chúng về dạng chuỗi '2026-07-29 09:41:23' còn ta gửi đi là
 # epoch ms, so thẳng thì lần nào cũng "lệch" -> ghi lại cả bảng mỗi 5 phút. Ba
 # mốc thời gian chỉ được đặt đúng lúc `status` đổi, mà `status` thì có trong
-# danh sách này — nên chúng vẫn lên Base, chỉ là đi ké.
-_DIFF_FIELDS = (F_JOB_STATUS, F_ERROR, F_ATTEMPTS, F_INVITEES)
+# danh sách này — nên chúng vẫn lên Base, chỉ là đi ké. `Thời gian họp`
+# (`F_WHEN`) cũng vậy: `_meta_fields` luôn gửi nó, chỉ không đem ra so.
+#
+# Thêm HAI ô hiển thị 05/08/2026 (xem `_meta_fields`): thiếu chúng thì tên cuộc
+# họp và nguồn người nhận chỉ đúng vào ĐÚNG LÚC record được tạo. Đo thật lúc
+# thêm: 6/24 record đang lệch, trong đó Workforce Buổi 4 vẫn khoe "khớp theo GIỜ
+# (lệch 5m)" hai ngày sau khi ACL của nó được vá thành verified.
+#
+# `F_LINK` CỐ Ý KHÔNG có mặt, dù `_meta_fields` vẫn gửi nó. Lý do đo được: Base
+# tự chuẩn hoá ô url, và 1/24 record đang lưu dạng markdown
+# `[https://…](https://…)` trong khi ta gửi URL trần. Đưa nó vào đây thì record
+# đó lệch VĨNH VIỄN -> ghi lại mỗi 5 phút, mãi mãi — đúng cái bẫy mà chú thích
+# datetime ngay trên vừa cảnh báo. Nó vẫn được sửa, chỉ là đi ké lượt đẩy do ô
+# khác kích hoạt.
+_DIFF_FIELDS = (F_JOB_STATUS, F_ERROR, F_ATTEMPTS, F_INVITEES,
+                F_TITLE, F_SOURCE)
 
 
 def _needs_push(rec: dict[str, Any], want: dict[str, Any]) -> bool:
@@ -768,6 +818,7 @@ def sync_jobs() -> int:
         if not rid:
             continue                      # chưa có record -> retry_missing_records lo
         want = _job_fields(row)
+        want.update(_meta_fields(row))
         # Ô ĐẮT (file transcript, số giây whisper, người dự) chỉ được điền lúc
         # TẠO record. Từ 03/08/2026 record được tạo ngay khi job còn `queued` —
         # lúc đó chưa có transcript, mà `write_draft` ở bước `held` thì thoát
@@ -779,15 +830,32 @@ def sync_jobs() -> int:
         has_metrics = bool(cur.get(F_WHISPER_SEC))
         lacks = ((row.get("transcript_path") and not has_file)
                  or (row.get("whisper_seconds") and not has_metrics))
-        if rec is not None and not lacks and not _needs_push(rec, want):
+        # Danh sách người dự đã đổi so với Base (thêm 05/08/2026). Tra lại người
+        # dự và các bản vá ACL đều ghi đè `meta.attendees`, mà ô `Người dự` /
+        # `Chủ cuộc họp` nằm trong `_tracking_fields` — phần ĐẮT, trước đây chỉ
+        # được chạm khi thiếu FILE. Nên một cuộc họp bị gỡ 22 attendee suy đoán
+        # vẫn khoe đủ 22 người trên Base, vĩnh viễn.
+        #
+        # So bằng `Số người được mời` chứ không so từng tên: nó là con số duy
+        # nhất phản ánh `len(meta.attendees)` mà không tốn lời gọi API nào, và
+        # nó đã nằm sẵn trong `_DIFF_FIELDS`. Đổi người mà giữ nguyên SỐ người
+        # thì lượt này bỏ sót — chấp nhận, vì cái giá của phép so đầy đủ là một
+        # cú tra danh bạ cho MỌI record ở MỌI vòng.
+        stale_members = (rec is not None
+                         and float(cur.get(F_INVITEES) or 0)
+                         != float(want.get(F_INVITEES) or 0))
+        if rec is not None and not lacks and not stale_members \
+                and not _needs_push(rec, want):
             continue                      # không có gì đổi -> khỏi ghi
-        if lacks:
+        if lacks or stale_members:
             # Chỉ chạm phần đắt khi THIẾU thật: mỗi lần là một cú tra danh bạ +
-            # một cú upload. Bỏ qua upload nếu ô đã có file — upload lại chỉ
-            # sinh file_token mới và biến bản cũ thành rác trong Base.
+            # một cú upload. Bỏ qua upload nếu ô đã có file HOẶC nếu ta vào đây
+            # chỉ vì danh sách người dự đổi — upload lại chỉ sinh file_token mới
+            # và biến bản cũ thành rác trong Base.
             try:
                 meta = jobstore.meta_from_json(row["meta_json"])
-                want.update(_tracking_fields(meta, skip_file=has_file))
+                want.update(_tracking_fields(
+                    meta, skip_file=has_file or not lacks))
             except Exception as exc:      # noqa: BLE001 — ô phụ, đừng chặn ô chính
                 print(f"[base] {row['minute_token']} lấy ô theo dõi hỏng "
                       f"(vẫn ghi trạng thái): {exc}")

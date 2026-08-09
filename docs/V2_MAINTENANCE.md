@@ -4010,3 +4010,134 @@ sự gọi tool không (`tool mcp__meetings__… completed`) — nếu không c�
 nó đang trả lời theo trí nhớ hội thoại chứ không phải hệ thống hỏng.
 
 selftest: +21 → **PASS 364**.
+
+## 41. Một ngày người dùng tự bấm — chín lỗi lộ ra (04/08/2026)
+
+Không lỗi nào tìm ra bằng đọc code. Tất cả đến từ việc user ngồi nhắn thật với
+bot và mở thật các trang. Ghi theo *hình dạng lỗi*, vì hình dạng mới là thứ tái
+phát.
+
+### 41.1 `create_task`: hạn quá khứ + tên thay cho token
+
+User nhắn "thứ sáu tuần này", agent quy ra **31/07** trong khi hôm nay đã 04/08
+— nó neo vào **ngày cuộc họp** (30/07) chứ không phải hôm nay. `_parse_due` cố ý
+không đoán ngày, nhưng cũng **không kiểm**, nên task sẽ ra đời với hạn đã trôi
+qua: Lark trả `code=0`, task hiện bình thường, chỉ là quá hạn ngay lúc sinh.
+
+Sửa: chặn hạn < hôm nay, và **câu từ chối kèm NGÀY HÔM NAY** — agent không tự
+biết hôm nay là ngày nào. Kèm theo: `create_task` dùng chung
+`sendfile._resolve_token` nên nhận cả tên cuộc họp (§40.1 cùng một thói quen của
+agent; sửa một chỗ mà bỏ chỗ kia là để dành đúng lỗi đó cho lần sau).
+
+### 41.2 Bot hỏi vòng vo + tin nhắn râu ria
+
+User nhắn *"cho tôi xem các từ đang chờ duyệt"* — đúng nghĩa `glossary_pending`.
+Agent bày ba lựa chọn (*biên bản / Lark Task / từ khoá khác*), user chọn 3, nó
+hỏi tiếp *"ở hệ thống nào"*, user bỏ cuộc. Thủ phạm là toolset **`clarify`**.
+
+Tắt qua `agent.disabled_toolsets`, **KHÔNG** xoá khỏi `platform_toolsets.feishu`:
+`meetings` là MCP server chứ không phải toolset dựng sẵn, nên bỏ `clarify` đi là
+danh sách hết tên hợp lệ và resolver cảnh báo *"no valid toolsets configured —
+tools will be unavailable"*, tức suýt mất SẠCH tool của bot.
+
+Về hiển thị: tắt `busy_ack_detail` (bỏ "lặp lại 2/150") và
+`interim_assistant_messages`. Nhưng **giữ `long_running_notifications`** — Lark
+KHÔNG mở API typing cho bot, nên bong bóng "⏳ Working — N min" là tín hiệu duy
+nhất báo đã nhận tin; tắt nó thì cuộc 50 phút phiên âm xong mới có phản hồi.
+Thêm `cleanup_progress` để xoá bong bóng sau khi trả lời xong.
+
+### 41.3 Enroll: ba lỗi nối nhau
+
+1. **Chờ 5 phút.** Người mới bấm Đồng ý, trang báo "Đã cấp quyền ✓", nhưng code
+   nằm ở hộp thư Vercel và chỉ vòng `run` kéo về. Trong khoảng đó bot vẫn nói
+   "bấm link rồi chọn Đồng ý nhé" → người mới tưởng hỏng, bấm lại. Sửa:
+   `gate.check` kéo hộp thư NGAY khi gặp người chưa enroll (`poll_pending` tự bỏ
+   qua khi không có nonce sống, nên không đụng hạn mức Blob).
+2. **`unauth`.** `revoke` giữ dòng `tokens` với `status='revoked'` làm dấu vết,
+   nên cửa vào đi nhánh khác và KHÔNG diễn lại được cảnh người lạ nhắn lần đầu.
+   `unauth` xoá hẳn tokens + lời mời + vé phiên, GIỮ NGUYÊN jobs/transcript/
+   người dự/Base. Phải xoá lời mời, nếu không gate chỉ nhắc "bấm link cũ đi".
+3. **`--no-send` vẫn ghi lời mời.** Chạy `v2 gate --no-send` để CHẨN thôi, nhưng
+   nó ghi `enroll_invites` → lần nhắn thật ngay sau đó rơi vào nhánh "wait" và
+   bot nói *"link mình VỪA GỬI vẫn còn hiệu lực"* trong khi chưa gửi gì. Người
+   dùng chờ một tin nhắn không tồn tại suốt 30 phút; người chẩn lỗi mở DB thấy
+   có lời mời nên tưởng đã gửi. **Thử khô không được đổi trạng thái.**
+
+### 41.4 Quét rộng: bật nửa ngày rồi tắt
+
+Lark không xếp một người vào `participant_ids` của mọi bản ghi họ dự — đo trên
+tài khoản BOD: lọc theo người ra **5**, chỉ lọc thời gian ra **7**. Nên thêm
+`V2_SCAN_ALL_VISIBLE` để nạp cả minute "mở xem được".
+
+Rồi **tắt lại trong ngày**, vì đo được cái giá: danh sách mở-xem-được của một
+người kéo theo cả cuộc của phòng khác (CDP, BI Dashboard, HRIS) mà KHÔNG ai
+trong hệ thống dự — tốn CPU phiên âm, nằm trên Base. Đổi lại chỉ vớt được **1
+cuộc thật trong 7 ngày**. Giữ cờ để bật một đợt khi cần đi tìm cuộc bị sót.
+
+⚠️ Điều KHÔNG được nới kèm theo: `db.note_viewer` vẫn chỉ ghi cho nguồn có lọc
+người dự. Gộp hai nguồn là biến người **chỉ được chia sẻ** bản ghi thành "người
+dự" — mở toang phân quyền bằng một dòng. Có test riêng canh.
+
+**Danh sách của admin**: `_may_see` cho admin xem MỌI cuộc (cố ý, để chẩn lỗi),
+nhưng `list_meetings` trộn chung một khối thì admin tưởng hệ thống gán bừa người
+dự — đã gặp thật: 11 cuộc lẫn CDP/BI/HRIS mà người hỏi không dự cuộc nào. Nay
+tách hai khối, khối thứ hai ghi rõ "bạn thấy vì là QUẢN TRỊ".
+
+### 41.5 Base bị bỏ đói khi có cuộc dài
+
+`_backfill_base` chỉ chạy ở CUỐI `_process_queue`, mà một bản ghi 3,8 giờ nuốt
+cả lượt xử lý ~35 phút. Suốt thời gian đó cuộc mới phát hiện **không có dòng nào
+trên Base** — nhìn vào tưởng quét sót (đúng cảnh đã gặp: 5 cuộc nằm trong DB mà
+Base trống). Nay gọi ngay sau `scan_once`, TRƯỚC hàng đợi.
+
+### 41.6 Whisper restart giữa chừng → V2 quay 404 SÁU GIỜ
+
+⚠️ Đây KHÔNG phải sự cố hiếm: lần này là **người vận hành tự bật lại** whisper
+(xác nhận 04/08). Restart whisper là thao tác thường ngày — đổi model, sửa
+`run-server.bat`, máy khởi động lại — nên nhánh 404 này sẽ còn bị chạm đều đặn,
+không phải đường dự phòng cho một ca hiếm.
+
+Whisper giữ `job_id` trong RAM, không có sổ trên đĩa. Server khởi động lại thì
+`/status/<id>` trả 404 — nhưng vòng chờ không nhận ra: `.json()` của một 404 ra
+`{"detail": ...}`, `status` rỗng, và nó `continue` tới `timeout_sec` = **6 giờ**.
+Trong lúc đó whisper log 404 mỗi 5 giây và **cả hàng đợi đứng sau một job đã
+chết**. Trả giá thật: bản ghi 3,8 giờ kẹt với 4 lần thử, chặn 4 cuộc phía sau.
+
+Sửa: 404 → ném `TranscribeUnavailable` NGAY. Chọn loại ngoại lệ này có chủ ý —
+orchestrator TRẢ LẠI lượt thử và đưa job về `queued`, vì whisper restart là sự
+cố **hạ tầng**, không phải lỗi của cuộc họp. Lưới hai: trả lời không đọc ra
+trạng thái thì chịu ~1 phút rồi bỏ.
+
+### 41.7 Vercel: chính trang dashboard đốt hạn mức Blob
+
+User báo *"1 phút 10 lần chứ không phải 360/tháng"* — đúng, và ước lượng ban đầu
+của phía kỹ thuật sai một bậc vì chỉ nhìn nhịp ĐẨY. Nguồn thật:
+
+```
+api/status.js  handleGet -> loadSnapshot() -> list()      ← thao tác ĐẮT
+api/status.js  setTimeout(location.reload, 60000)         ← trang TỰ tải lại
+```
+
+**Một tab để quên = 1 `list()` mỗi phút, vĩnh viễn**, kể cả tab nền. Vài tab là
+ra đúng nhịp 10/phút. Nhịp đẩy 2 giờ/lần của máy chỉ là hạt cát.
+
+Sửa: `loadSnapshot` tải THẲNG URL công khai suy ra từ `BLOB_READ_WRITE_TOKEN`
+(`vercel_blob_rw_<STORE>_…` → `<store>.public.blob.vercel-storage.com`; file ghi
+bằng `addRandomSuffix:false` nên pathname cố định). Tải thẳng là thao tác **đơn
+giản**, không tính vào hạn mức advanced. Trang tải lại **5 phút/lần và chỉ khi
+tab đang được nhìn**. Áp cùng cách cho `/e/<code>` — đường mọi người mới đều đi.
+
+⚠️ Deploy PHẢI chạy từ **gốc repo** (`D:\MeetingxLark`), không phải từ
+`v2/vercel-oauth` — Root Directory của project đã là `v2/vercel-oauth` nên chạy
+từ trong đó sẽ nhân đôi đường dẫn. Lý do và danh sách trắng nằm ở `.vercelignore`.
+Trên máy này `vercel` không có trên PATH và PowerShell chặn `npx.ps1`
+(ExecutionPolicy) → dùng **`npx.cmd`**.
+
+### 41.8 `v2.bat`
+
+`python -m v2 …` chỉ chạy khi cwd đúng VÀ `python` trỏ đúng bản 3.12 của V2.
+Đứng ở `C:\Windows\system32` thì trúng venv của Hermes (3.11, thiếu httpx/
+cryptography) và báo `No module named v2` — câu báo lỗi không hé lộ nguyên nhân
+nào trong hai. `v2.bat` tự `cd`, ghi thẳng đường dẫn Python, đặt UTF-8.
+
+selftest: +21 → **PASS 385**.

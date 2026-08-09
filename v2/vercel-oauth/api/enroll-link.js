@@ -22,6 +22,18 @@
 import { put, list, del } from "@vercel/blob";
 
 const PREFIX = "enroll-link/";
+
+/**
+ * URL cong khai suy ra tu BLOB_READ_WRITE_TOKEN (`vercel_blob_rw_<STORE>_<...>`).
+ * Ghi bang addRandomSuffix:false nen pathname co dinh => doan duoc URL, tai
+ * thang la thao tac DON GIAN thay vi `list()` DAT. Xem ghi chu o api/status.js.
+ */
+function publicBlobUrl(pathname) {
+  const tok = process.env.BLOB_READ_WRITE_TOKEN || "";
+  const m = tok.match(/^vercel_blob_rw_([^_]+)_/);
+  if (!m) return "";
+  return `https://${m[1].toLowerCase()}.public.blob.vercel-storage.com/${pathname}`;
+}
 const MAX_TTL_MS = 48 * 60 * 60 * 1000;
 
 function secretEqual(a, b) {
@@ -99,28 +111,41 @@ export default async function handler(req, res) {
       "Đường dẫn thiếu mã hoặc mã sai định dạng. Xin lại link mới."));
   }
 
-  let blobs = [];
-  try {
-    ({ blobs } = await list({ prefix: PREFIX + code, limit: 5 }));
-  } catch (e) {
-    return res.status(500).send(page("Lỗi tạm thời", "Thử lại sau ít phút."));
+  // Tải THẲNG bằng URL suy ra từ token (04/08/2026) — ghi bằng
+  // `addRandomSuffix:false` nên pathname cố định. `list()` là thao tác ĐẮT và
+  // đây là đường MỌI người mới đều đi; xem ghi chú dài ở `api/status.js`.
+  let item = null;
+  let blobUrl = "";                 // URL thật của blob, để dọn khi hết hạn
+  const direct = publicBlobUrl(PREFIX + code);
+  if (direct) {
+    try {
+      const r = await fetch(direct, { cache: "no-store" });
+      if (r.ok) { item = await r.json(); blobUrl = direct; }
+    } catch { /* rơi xuống đường cũ */ }
   }
-  const hit = blobs.find((x) => x.pathname === PREFIX + code);
-  if (!hit) {
-    return res.status(404).send(page("Link đã hết hạn hoặc không tồn tại",
-      "Nhắn cho quản trị hệ thống để xin link mới."));
-  }
-
-  let item;
-  try {
-    const r = await fetch(hit.url, { cache: "no-store" });
-    item = await r.json();
-  } catch {
-    return res.status(500).send(page("Lỗi tạm thời", "Thử lại sau ít phút."));
+  if (!item) {
+    let blobs = [];
+    try {
+      ({ blobs } = await list({ prefix: PREFIX + code, limit: 5 }));
+    } catch (e) {
+      return res.status(500).send(page("Lỗi tạm thời", "Thử lại sau ít phút."));
+    }
+    const hit = blobs.find((x) => x.pathname === PREFIX + code);
+    if (!hit) {
+      return res.status(404).send(page("Link đã hết hạn hoặc không tồn tại",
+        "Nhắn cho quản trị hệ thống để xin link mới."));
+    }
+    try {
+      const r = await fetch(hit.url, { cache: "no-store" });
+      item = await r.json();
+      blobUrl = hit.url;
+    } catch {
+      return res.status(500).send(page("Lỗi tạm thời", "Thử lại sau ít phút."));
+    }
   }
 
   if (!item?.url || (item.exp && Date.now() > item.exp)) {
-    try { await del(hit.url); } catch { /* dọn được thì dọn */ }
+    if (blobUrl) { try { await del(blobUrl); } catch { /* dọn được thì dọn */ } }
     return res.status(410).send(page("Link đã hết hạn",
       "Nhắn cho quản trị hệ thống để xin link mới."));
   }

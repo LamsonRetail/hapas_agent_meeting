@@ -267,6 +267,16 @@ def minutes_list(access_token: str, start_ms: int, end_ms: int,
 
     Lọc theo `participant_ids` (không phải owner) để bắt cả cuộc họp người khác
     tạo mà mình được mời. Trả [] khi lỗi thay vì crash để poller vẫn sống.
+
+    `participant_open_id=""` -> BỎ hẳn bộ lọc người, trả về mọi minute mà token
+    này MỞ XEM ĐƯỢC. Thêm 04/08/2026 sau khi đo: Lark không xếp một người vào
+    `participant_ids` của mọi bản ghi họ dự (đo trên tài khoản BOD: lọc theo
+    người ra 5, chỉ lọc thời gian ra 7 — hai cuộc chênh đều là cuộc họ mở xem
+    được và khẳng định có dự). Người gọi PHẢI tự phân biệt hai nguồn: xem được
+    KHÔNG đồng nghĩa có dự, và `db.note_viewer` chỉ được ghi cho nguồn có lọc.
+
+    ⚠️ `page_size` trần THẬT là 30 — gửi 100 thì Lark trả `2094006` và 0 item
+    (đo 04/08/2026), tức hỏng im lặng nếu ai đó "tối ưu" bằng cách tăng số này.
     """
     items: list[dict[str, Any]] = []
     page_token = ""
@@ -282,7 +292,8 @@ def minutes_list(access_token: str, start_ms: int, end_ms: int,
                 json={"filter": {
                     "create_time": {"start_time": _iso(start_ms),
                                     "end_time": _iso(end_ms)},
-                    "participant_ids": [participant_open_id],
+                    **({"participant_ids": [participant_open_id]}
+                       if participant_open_id else {}),
                 }},
             )
             data = _check(resp, "minutes_search").get("data", {})
@@ -626,6 +637,17 @@ def im_send_text(receive_id: str, text: str, *,
                    id_type=id_type, uuid_key=uuid_key)
 
 
+def im_delete_message(message_id: str) -> None:
+    """Thu hồi một tin do chính bot gửi. Chỉ caller vận hành dùng trực tiếp."""
+    if not message_id:
+        raise LarkError(-1, "thiếu message_id", "im_delete")
+    resp = _http().delete(
+        f"/open-apis/im/v1/messages/{message_id}",
+        headers=_im_headers(),
+    )
+    _check(resp, "im_delete")
+
+
 def im_upload_file(path: Path, file_type: str = "stream") -> str:
     """Upload file cho IM. Trả file_key. Giới hạn Lark IM: 30 MB."""
     if not path.exists():
@@ -940,8 +962,15 @@ def base_record_find(base_token: str, table_id: str, field: str,
     return ""
 
 
+# Trần `limit` MỘT trang của base/v3 records. Xin hơn thì Lark im lặng cắt về
+# đây — không lỗi, không `has_more`, chỉ là thiếu record.
+_RECORDS_PAGE = 200
+# Chốt chặn vòng lặp nếu Lark trả mãi không hết (200 x 50 = 10.000 record).
+_RECORDS_MAX_PAGES = 50
+
+
 def base_records_all(base_token: str, table_id: str,
-                     limit: int = 200) -> list[dict[str, Any]]:
+                     limit: int = 1000) -> list[dict[str, Any]]:
     """Đọc record kèm GIÁ TRỊ các field. Trả list dict {field_name: value}.
 
     Dùng GET .../records để LIỆT KÊ. KHÔNG dùng .../records/search: endpoint đó
@@ -951,25 +980,77 @@ def base_records_all(base_token: str, table_id: str,
     Cả hai trả dữ liệu ở dạng CỘT (`fields` = tên field, `data` = từng hàng theo
     đúng thứ tự đó) chứ không phải list dict — phải ghép lại ở đây, nếu không
     chỗ gọi sẽ đọc sai cột.
+
+    CÓ PHÂN TRANG (sửa 05/08/2026). Trước đó hàm này gửi đúng một lời gọi với
+    `offset: 0` và trần cứng 200, không đọc `has_more`, không cộng offset — tức
+    record thứ 201 trở đi KHÔNG TỒN TẠI với cả hệ thống, im lặng. Cùng một họ
+    lỗi cắt-cụt đã phải sửa hai lần ở file này (`event_attendees` lấy đúng trang
+    đầu; `base_fields` của base/v3 cắt ở 20 field mà không báo).
+
+    Hậu quả nếu để nguyên, và vì sao nó nguy hiểm hơn vẻ ngoài: `qa.records()`
+    đọc qua đây, nên cuộc họp thứ 201 biến mất khỏi `list_meetings` /
+    `get_meeting` / `search_meetings` — người dự hỏi bot thì nhận "không tìm
+    thấy" cho một biên bản có thật. `bitable.sync_jobs()` cũng đọc qua đây, nên
+    những record đó không bao giờ được đồng bộ lại nữa.
+
+    `limit` là TỔNG số record tối đa, không phải cỡ trang.
     """
-    resp = _http().get(
-        f"/open-apis/base/v3/bases/{base_token}/tables/{table_id}/records",
-        headers=_im_headers(),
-        params={"limit": min(limit, 200), "offset": 0},
-    )
-    data = _check(resp, "base_records_all").get("data", {})
-    names = data.get("fields") or []
-    ids = data.get("record_id_list") or []
-    out = []
-    for i, row in enumerate(data.get("data") or []):
-        rec: dict[str, Any] = {"_record_id": ids[i] if i < len(ids) else ""}
-        for name, val in zip(names, row):
-            # select 1 lựa chọn về dạng ["draft"] -> lấy phần tử đầu cho gọn.
-            if isinstance(val, list) and len(val) == 1:
-                val = val[0]
-            rec[name] = val
-        out.append(rec)
+    out: list[dict[str, Any]] = []
+    offset = 0
+    for _ in range(_RECORDS_MAX_PAGES):
+        want = min(_RECORDS_PAGE, max(0, limit - len(out)))
+        if want <= 0:
+            return out
+        resp = _http().get(
+            f"/open-apis/base/v3/bases/{base_token}/tables/{table_id}/records",
+            headers=_im_headers(),
+            params={"limit": want, "offset": offset},
+        )
+        data = _check(resp, "base_records_all").get("data", {})
+        names = data.get("fields") or []
+        ids = data.get("record_id_list") or []
+        rows = data.get("data") or []
+        for i, row in enumerate(rows):
+            rec: dict[str, Any] = {"_record_id": ids[i] if i < len(ids) else ""}
+            for name, val in zip(names, row):
+                # select 1 lựa chọn về dạng ["draft"] -> lấy phần tử đầu cho gọn.
+                if isinstance(val, list) and len(val) == 1:
+                    val = val[0]
+                rec[name] = val
+            out.append(rec)
+        # Trang non = đã hết. KHÔNG tin `has_more`: endpoint này không hứa có
+        # trường đó, và đọc thiếu một trang ở đây là mất cuộc họp im lặng.
+        if len(rows) < want:
+            return out
+        offset += len(rows)
+    print(f"[lark_api] base_records_all: còn record sau {_RECORDS_MAX_PAGES} "
+          f"trang ({len(out)} đã đọc) — danh sách CÓ THỂ thiếu")
     return out
+
+
+def base_record_delete(base_token: str, table_id: str, record_id: str) -> None:
+    """Xoá MỘT record. KHÔNG hoàn tác được.
+
+    Chỉ dành cho người VẬN HÀNH chạy tay, cùng kỷ luật với
+    `im_delete_message`: không có đường nào từ bot/agent/MCP gọi tới đây, và
+    đừng thêm. Dữ liệu Base bắt nguồn từ lời nói trong họp và chảy vào prompt
+    của agent — một tool "xoá record" mà agent gọi được là thứ không gỡ lại được.
+
+    Dùng **bitable/v1** chứ không base/v3, cùng lý do với `base_field_delete`:
+    đó là họ endpoint có hợp đồng xoá đã đo được trên tenant này.
+
+    Ca dùng thật (05/08/2026): hai dòng rỗng hoàn toàn trên bảng `Biên bản` —
+    không `minute_token`, không tên, không giờ. Chúng vô hình với bot
+    (`qa._may_see("")` fail-closed) và `bitable.sync_jobs` không khớp được vào
+    job nào, nên chúng chỉ làm lệch mọi phép đếm "Base có bao nhiêu cuộc họp".
+    """
+    if not record_id:
+        raise LarkError(-1, "thiếu record_id", "base_record_delete")
+    resp = _http().delete(
+        f"/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}"
+        f"/records/{record_id}",
+        headers=_im_headers())
+    _check(resp, "base_record_delete")
 
 
 def base_record_update(base_token: str, table_id: str, record_id: str,
@@ -998,7 +1079,7 @@ def drive_members(token: str, doc_type: str = "bitable") -> list[dict[str, Any]]
 
 
 def drive_public(token: str, doc_type: str = "bitable") -> dict[str, Any]:
-    """Thiết lập chia sẻ bằng LINK của tài liệu này.
+    """Đọc thiết lập chia sẻ bằng LINK của tài liệu này.
 
     Khóa quan trọng nhất là `link_share_entity`: `closed` = chỉ cộng tác viên;
     `tenant_*` = mọi người trong công ty có link; `anyone_*` = bất kỳ ai trên
@@ -1011,6 +1092,29 @@ def drive_public(token: str, doc_type: str = "bitable") -> dict[str, Any]:
                        headers=_im_headers(), params={"type": doc_type})
     data = _check(resp, "drive_public").get("data", {})
     return dict(data.get("permission_public") or {})
+
+
+def drive_link_close(token: str, doc_type: str = "bitable") -> dict[str, Any]:
+    """Đóng chia sẻ-bằng-link và đọc lại để xác minh trạng thái thật.
+
+    Đây là thao tác THU HẸP quyền bên ngoài DB; caller phải có xác nhận của
+    người vận hành trước khi gọi. Chỉ đổi ``link_share_entity`` — không tự ý
+    đụng quyền của cộng tác viên tường minh hay trường chia sẻ đối tác khác.
+    """
+    if not token:
+        raise ValueError("drive_link_close cần token tài liệu")
+    resp = _http().patch(
+        f"/open-apis/drive/v2/permissions/{token}/public",
+        headers=_im_headers(), params={"type": doc_type},
+        json={"link_share_entity": "closed"},
+    )
+    _check(resp, "drive_link_close")
+    current = drive_public(token, doc_type)
+    if current.get("link_share_entity") != "closed":
+        raise LarkError(
+            -1, "PATCH trả thành công nhưng đọc lại link_share_entity chưa closed",
+            "drive_link_close_verify")
+    return current
 
 
 def drive_member_add(token: str, doc_type: str, member_id: str,

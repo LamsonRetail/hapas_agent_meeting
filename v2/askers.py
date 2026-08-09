@@ -109,8 +109,18 @@ def admin_view(label: str = "(quyền admin)") -> dict:
 
     Không bao giờ được dựng từ dữ liệu đến từ Lark: đây là cửa sau cho người
     ngồi trước máy, và người đó đã có `sqlite3` trong tay rồi.
+
+    `see_all` tách khỏi `admin` (04/08/2026, user chốt): trước đây hai thứ này
+    là MỘT cờ, nên một người là admin trong Lark hỏi bot "liệt kê cuộc họp của
+    tôi" thì `_may_see` cho qua hết và bot trả lời "hệ thống tìm thấy 22 cuộc
+    họp gắn với tài khoản của bạn" — 22 là toàn bộ cuộc họp của cả công ty.
+    Câu đó vừa sai vừa làm admin tưởng mình dự những cuộc chưa từng dự.
+
+    Nay: `admin` = được duyệt từ điển phiên âm (glossary). `see_all` = xem được
+    cuộc họp của người khác, và CHỈ đường terminal có nó.
     """
-    return {"union_id": "", "open_id": "", "name": label, "admin": True}
+    return {"union_id": "", "open_id": "", "name": label,
+            "admin": True, "see_all": True}
 
 
 def find_enrolled(needle: str) -> dict | None:

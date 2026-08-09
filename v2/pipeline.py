@@ -104,6 +104,16 @@ class MediaDenied(PipelineError):
     """
 
 
+class WaitingForAuth(PipelineError):
+    """Chưa có token của người có thể tải bản ghi — chờ họ TỰ OAuth.
+
+    Khác ``MediaDenied``: đây không phải job hỏng và cũng không được retry nóng.
+    Orchestrator đưa nó vào ``waiting_auth``; khi một người liên quan tự nhắn bot
+    rồi hoàn tất OAuth, ``jobstore.release_waiting_auth`` mới trả job về backlog.
+    Không có đường nào từ exception này chủ động gửi link OAuth cho người khác.
+    """
+
+
 def _reader_candidates(meta: MeetingMeta) -> list[str]:
     """Mọi open_id đã enroll đáng thử mượn token, CHỦ BẢN GHI đứng trước.
 
@@ -124,8 +134,8 @@ def _reader_candidates(meta: MeetingMeta) -> list[str]:
     Ba nguồn ứng viên, theo thứ tự khả năng thành công giảm dần:
       1. `meta.owner_open_id` — chủ bản ghi, luôn tải được (nếu họ đã enroll).
       2. `meta.attendees` — người dự tra được từ lịch.
-      3. `db.viewers_of()` — người đã enroll mà Lark báo có dự. Bắt được cả
-         người mà chuỗi tra lịch sót.
+      3. `db.viewers_of()` — người đã enroll có token từng tìm/đọc được bản ghi.
+         Đây chỉ là ứng viên kỹ thuật để tải, KHÔNG phải attendee/ACL/người nhận.
     """
     from . import db
     out: list[str] = []
@@ -186,14 +196,22 @@ def download_recording(meta: MeetingMeta) -> tuple[Path, str]:
         return dest, oid
 
     if not cands or (no_token and not denied and not other):
-        # Chưa ai đủ điều kiện thử. Để lỗi THƯỜNG (còn thử lại): người dự enroll
-        # về sau là vòng sau chạy được ngay, không cần ai can thiệp.
-        raise PipelineError(
+        # Chưa ai đủ điều kiện thử. KHÔNG để queued: vòng run sẽ thử lại mỗi 5
+        # phút dù chưa có gì thay đổi, rồi đốt hết MAX_ATTEMPTS. Chờ đúng sự kiện
+        # làm tình trạng thay đổi — một người liên quan tự OAuth.
+        raise WaitingForAuth(
             f"không có người dự nào đã enroll để đọc bản ghi "
             f"({len(no_token)} người chưa cấp quyền / token hết hạn)")
     if denied and not other:
         who = meta.owner_name or "(không rõ tên)"
-        raise MediaDenied(
+        # Chủ bản ghi chưa có token: những người đang enroll đã bị từ chối không
+        # chứng minh job hỏng; token của CHỦ vẫn là ứng viên mạnh nhất chưa thử.
+        # Park thay vì failed/retry nóng. Nếu chủ đã enroll mà vẫn 2091005 thì đó
+        # mới là lỗi thật cần người vận hành nhìn thấy.
+        exc_type = (WaitingForAuth
+                    if meta.owner_open_id and meta.owner_open_id in no_token
+                    else MediaDenied)
+        raise exc_type(
             f"không ai được phép tải bản ghi này ({len(denied)} người đã cấp "
             f"quyền đều bị Lark từ chối {_CODE_MEDIA_DENY}"
             + (f", {len(no_token)} người chưa cấp quyền" if no_token else "")
@@ -270,7 +288,11 @@ def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Path]:
     # Ghi .json xong mới kiểm, và kiểm TRƯỚC khi lưu `transcript_path`:
     # xem docstring `EmptyTranscript`.
     if t.word_count == 0:
+        # Mã `[empty_transcript]` ở đầu câu: `alerts` dùng nó để KHÔNG DM (bản
+        # ghi im lặng thì không có việc gì cho người vận hành làm), còn `qa`
+        # dùng nó để nói lý do bằng tiếng người khi có ai hỏi tới cuộc họp này.
         raise EmptyTranscript(
+            f"[{jobstore.ERR_EMPTY_TRANSCRIPT}] "
             f"whisper chạy xong nhưng KHÔNG ra chữ nào ({t.duration:.0f}s audio, "
             f"engine {t.engine}). Bản ghi im lặng thật, hoặc whisper đang hỏng "
             f"(sai model/VAD nuốt hết). Bằng chứng: {tpath.name}. "
@@ -410,6 +432,33 @@ def deliver_file(meta: MeetingMeta, t: Transcript,
     return sent, failed
 
 
+def _anchor_memory(union_id: str, minute_token: str, title: str) -> None:
+    """Thẻ vừa đẩy cho người này = cuộc họp họ đang nói tới.
+
+    Vì sao cần (ca thật 06/08/2026 19:51, người dùng gửi ảnh chụp): hệ thống
+    đẩy thẻ "Họp xong: 08-06 | Workforce AI Weekly Meeting", người dùng bấm
+    TRẢ LỜI ngay thẻ đó và gõ "Có recap rồi đó, phân tích". Agent không có gì
+    neo câu đó vào cuộc họp trong thẻ, nên nó lấy mục mới nhất trong
+    `chat_memory` — lúc ấy là một cuộc tên `work` từ hai tiếng trước — rồi
+    phân tích nhầm cuộc, kèm câu "chưa phải một cuộc họp có nội dung hoàn
+    chỉnh" trong khi cuộc được hỏi có đủ tóm tắt, 6 quyết định, 7 việc cần làm.
+
+    Ghi ở ĐÚNG đây, sau khi thẻ gửi THÀNH CÔNG: gửi hỏng mà vẫn ghi thì ta neo
+    người dùng vào một cuộc họp họ chưa từng thấy.
+
+    KHÔNG nới quyền: `recipients` đã là danh sách người dự đã xác minh của
+    chính cuộc này (`orchestrator._recipients`), tức mọi người ở đây đều đã qua
+    cùng phép kiểm mà `qa._may_see` dùng. Bảng chỉ giữ token + tiêu đề.
+    """
+    if not union_id:
+        return
+    try:
+        from . import db
+        db.remember_meeting(union_id, minute_token, title or "")
+    except Exception as exc:                  # noqa: BLE001 — phát tin quan trọng hơn ký ức
+        print(f"[deliver] không neo được ký ức cho {union_id}: {exc}")
+
+
 def deliver(meta: MeetingMeta, recap: Recap, t: Transcript,
             recipients: list[str], *,
             dry_run: bool = False) -> tuple[list[str], list[str]]:
@@ -444,6 +493,7 @@ def deliver(meta: MeetingMeta, recap: Recap, t: Transcript,
                                   uuid_key=f"recap-{token}-{rid}")
             jobstore.record_delivery(token, rid, "recap", True)
             sent.append(rid)
+            _anchor_memory(rid, token, meta.title)
         except lark_api.LarkError as exc:
             failed.append(rid)
             jobstore.record_delivery(token, rid, "recap", False, str(exc))

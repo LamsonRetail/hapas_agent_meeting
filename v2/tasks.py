@@ -75,10 +75,15 @@ def create_from_meeting(who: dict[str, Any] | None, minute_token: str,
     if not summary:
         return "Không tạo được: thiếu nội dung công việc."
 
-    minute_token = (minute_token or "").strip()
+    # Nhận cả TÊN cuộc họp, không chỉ `minute_token` — dùng CHUNG bộ giải tên
+    # với `send_transcript_file` (xem `sendfile._resolve_token`, §40.1). Cùng
+    # một agent, cùng một thói quen truyền tên; sửa một chỗ mà bỏ chỗ kia là để
+    # dành đúng lỗi đó cho lần sau. Cửa quyền bên dưới KHÔNG đổi.
+    from . import sendfile
+    minute_token, _err_tok = sendfile._resolve_token(who, minute_token)
     row = jobstore.get(minute_token) if minute_token else None
     if not row:
-        return NO_MEETING
+        return _err_tok or NO_MEETING
 
     # Ràng buộc 2: đúng bộ lọc của qa, không dựng luật thứ hai song song —
     # hai luật phân quyền sẽ lệch nhau, và cái lỏng hơn sẽ thắng.
@@ -101,9 +106,28 @@ def create_from_meeting(who: dict[str, Any] | None, minute_token: str,
         return NO_MEETING
 
     due_ms = _parse_due(due)
+    _today = datetime.now(_TZ).date()
     if due and due_ms is None:
-        return ("Không tạo được: hạn phải dạng YYYY-MM-DD (ví dụ 2026-08-15). "
-                "Hãy tự quy 'thứ sáu tuần sau' ra ngày cụ thể rồi gọi lại.")
+        return (f"Không tạo được: hạn phải dạng YYYY-MM-DD (ví dụ 2026-08-15). "
+                f"HÔM NAY là {_today:%Y-%m-%d} — tự quy 'thứ sáu tuần này' ra "
+                f"ngày cụ thể rồi gọi lại.")
+    # Hạn nằm trong QUÁ KHỨ (thêm 04/08/2026 sau ca thật): agent quy "thứ sáu
+    # tuần này" ra 31/07 trong khi hôm nay đã 04/08 — nhiều khả năng nó neo vào
+    # ngày CUỘC HỌP chứ không phải hôm nay. `_parse_due` cố ý không đoán ngày,
+    # nhưng cũng không kiểm, nên task sẽ được tạo với hạn đã trôi qua: Lark trả
+    # code=0, task hiện ra bình thường, chỉ là quá hạn ngay lúc sinh ra — đúng
+    # loại hỏng im lặng mà cả sổ tay này viết ra để chặn.
+    #
+    # Câu từ chối PHẢI kèm ngày hôm nay: agent không tự biết hôm nay là ngày
+    # nào, và dặn suông "tính lại cho đúng" thì nó tính sai y như cũ (§40.1 —
+    # chỉ thị bằng lời không điều khiển được agent, dữ liệu thì có).
+    if due_ms is not None:
+        _due_date = datetime.fromtimestamp(due_ms / 1000, timezone.utc).date()
+        if _due_date < _today:
+            return (f"Không tạo được: hạn {due} ĐÃ QUA — hôm nay là "
+                    f"{_today:%Y-%m-%d}. Đừng neo vào ngày diễn ra cuộc họp; "
+                    f"tính hạn từ HÔM NAY rồi gọi lại. Người dùng thật sự muốn "
+                    f"hạn trong quá khứ thì bảo họ tự sửa trong Lark Task.")
 
     parts = [f"Từ cuộc họp: {meta.title or '(không tiêu đề)'}"]
     if meta.app_link:

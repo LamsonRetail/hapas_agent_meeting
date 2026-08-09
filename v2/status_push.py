@@ -165,7 +165,11 @@ def build_snapshot(next_scan_at_ms: int | None = None,
     if with_checks:
         # Dùng đúng bộ kiểm tra của `doctor` để dashboard không lệch với CLI.
         from . import doctor
-        report = doctor.collect()
+        # Không tự chấm sức khỏe của chính status push trong snapshot đang chuẩn
+        # bị đẩy: nếu lần trước hỏng nhưng lần này vừa hồi phục, nhét lỗi cũ vào
+        # snapshot sẽ làm dashboard đỏ giả cho tới nhịp kế tiếp. CLI `doctor`
+        # vẫn đọc log lần đẩy gần nhất và báo relay đầy đủ.
+        report = doctor.collect(check_relay=False)
         # `scrub` BẮT BUỘC ở đây: doctor in đường dẫn đầy đủ cho người ngồi
         # trước máy, còn trang này ai cũng GET được (đo 02/08: HTTP 200, không
         # cần xác thực). Xem docstring `scrub`.

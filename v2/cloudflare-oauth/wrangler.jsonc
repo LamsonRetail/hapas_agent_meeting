@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "meetingxlark-oauth-relay",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-05",
+  "workers_dev": true,
+  "vars": {
+    "LARK_DOMAIN": "lark",
+    "LARK_APP_ID": "cli_aae288361ef89eed",
+    "OAUTH_SCOPES": "offline_access minutes:minutes:readonly minutes:minutes.basic:read minutes:minutes.search:read minutes:minutes.media:export minutes:minutes.transcript:export calendar:calendar:readonly calendar:calendar:read calendar:calendar.event:read vc:meeting:readonly vc:record:readonly vc:recording:read contact:user.base:readonly contact:user.id:readonly contact:user.employee_id:readonly task:task:write task:task:read docs:document.media:upload"
+  },
+  "queues": {
+    "producers": [
+      {
+        "binding": "OAUTH_QUEUE",
+        "queue": "meetingxlark-oauth"
+      }
+    ]
+  }
+}

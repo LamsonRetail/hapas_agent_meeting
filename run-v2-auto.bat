@@ -22,8 +22,6 @@ set PYTHONUNBUFFERED=1
 set PYTHONIOENCODING=utf-8
 set PY=C:\Users\PC\AppData\Local\Programs\Python\Python312\python.exe
 
-set WHISPER_BAT=D:\whisper\run-server.bat
-set HEALTH=http://localhost:8000/health
 set LOGDIR=%~dp0v2\data\logs
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
 
@@ -32,51 +30,33 @@ call :setlog
 
 call :log "================ khoi dong run-v2-auto ================"
 
-REM --- Chot chong chay TRUNG ------------------------------------
+REM --- Lop bao som chong chay TRUNG -----------------------------
 REM Hai orchestrator cung luc = hai lan phat (so tay muc 1). Bam hai lan vao file
 REM nay, hoac Startup item chay khi da co ban chay tay, la dung vao day.
 REM Da tu gap khi test 31/07: 2 tien trinh `python -m v2 run --send` song song.
-REM Loc theo Name='python.exe' la BAT BUOC: chinh dong lenh powershell nay cung
+REM Khoa NGUYEN TU that nam trong v2/singleton.py. Doan CIM nay chi bao som de
+REM wrapper thu hai thoat luon thay vi cu spawn Python. Loc theo Name='python.exe':
 REM chua chuoi '-m v2 run', nen neu khong loc thi no TU KHOP voi chinh no va
 REM lan nao cung bao "da co ban dang chay" (da gap 31/07, mat 10 phut).
-powershell -NoProfile -Command "$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match '-m v2 run' }; if ($p) { exit 1 } else { exit 0 }" >nul 2>&1
+powershell -NoProfile -Command "try { $p = Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match '-m v2 run' }; if ($p) { exit 1 } else { exit 0 } } catch { exit 2 }" >nul 2>&1
+if errorlevel 2 (
+    REM CIM co the bi policy Windows chan ca voi user dang nhap. Day chi la
+    REM lop bao som; mutex OS trong `python -m v2 run` moi la khoa chong trung
+    REM nguyen tu. Van khoi dong de mutex tu quyet dinh, neu khong app se tat
+    REM vinh vien sau moi lan reboot tren may bi chan CIM.
+    call :log "[!] KHONG KIEM TRA DUOC process bang CIM - tiep tuc, mutex Python se chan chay trung"
+    goto process_probe_done
+)
 if errorlevel 1 (
     call :log "[!] DA CO mot ban `v2 run` dang chay - thoat, khong bat ban thu hai"
     exit /b 0
 )
+:process_probe_done
 
 REM --- Whisper -------------------------------------------------
-curl -s -o nul %HEALTH%
-if %errorlevel%==0 (
-    call :log "[+] whisper da song"
-) else (
-    if not exist "%WHISPER_BAT%" (
-        call :log "[x] khong thay %WHISPER_BAT% - DUNG. Sua bien WHISPER_BAT."
-        exit /b 1
-    )
-    call :log "[*] bat whisper: %WHISPER_BAT%"
-    start "Whisper Server" /min cmd /c "%WHISPER_BAT%"
-)
-
-REM Cho toi 6 phut (lan dau nap model cham). Khong san sang thi VAN chay tiep:
-REM job se loi o buoc phien am va thu lai vong sau, thay vi khong chay gi ca.
-set /a tries=0
-:waitloop
-curl -s -o nul %HEALTH%
-if %errorlevel%==0 goto ready
-set /a tries+=1
-if %tries% geq 120 (
-    call :log "[!] cho whisper qua 6 phut - van chay orchestrator (job se thu lai)"
-    goto ready
-)
-REM `ping` chu khong `timeout` - xem ly do o vong chinh ben duoi. Voi cho nay
-REM hau qua rieng: `timeout` chet ngay nghia la 120 lan lap chay het trong vai
-REM giay, tuc "cho toi 6 phut cho whisper nap model" thuc te la khong cho.
-ping -n 4 127.0.0.1 >nul
-goto waitloop
-
-:ready
-call :log "[+] whisper san sang"
+REM Chinh `python -m v2 run` giam sat va tu bat lai Whisper local moi vong.
+REM De wrapper cung lam viec nay tao hai chu so huu, co the spawn HAI model CPU
+REM khi /health chua len trong luc nap model. Log rieng: v2\data\logs\whisper-*.log.
 
 REM --- Vong chinh: chet thi bat lai -----------------------------
 REM Tre 120s giua hai lan de khong quay vong dot khi cau hinh sai.
@@ -98,7 +78,12 @@ REM TRONG, roi ket luan he thong khong chay - dung kieu doc sai nguy hiem nhat.
 call :setlog
 call :log "[*] python -m v2 run --send"
 "%PY%" -m v2 run --send >> "%LOG%" 2>&1
-call :log "[!] orchestrator thoat (ma %errorlevel%) - bat lai sau 120s"
+set V2RC=%errorlevel%
+if "%V2RC%"=="73" (
+    call :log "[!] mutex bao da co orchestrator khac - wrapper nay thoat"
+    exit /b 0
+)
+call :log "[!] orchestrator thoat (ma %V2RC%) - bat lai sau 120s"
 ping -n 121 127.0.0.1 >nul
 goto loop
 

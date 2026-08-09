@@ -16,6 +16,7 @@ Job là bản ghi bền (không phải RAM) để khôi phục sau khi tiến tr
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from . import db
@@ -26,6 +27,55 @@ from .models import Attendee, MeetingMeta
 # hỏi (kéo). Terminal với vòng quét (scan không tạo lại), nhưng transcript vẫn
 # phục vụ được qua `sendfile` bất kể status.
 TERMINAL = {"delivered", "owner_only", "expired", "discarded", "held"}
+
+# MỌI status một job có thể mang, theo thứ tự máy trạng thái. Nguồn sự thật DUY
+# NHẤT cho các bảng ĐẾM (`v2 status`, `doctor._check_queue`).
+#
+# Vì sao phải gom về một chỗ (đo 05/08/2026): hai bảng đó liệt kê status bằng
+# tay, và cả hai đều QUÊN `held` — trạng thái mà mô hình kéo (03/08) biến thành
+# điểm dừng BÌNH THƯỜNG của gần như mọi cuộc họp. Hậu quả đo được: DB có 72 job,
+# `v2 status` cộng lại ra 61 — 11 cuộc họp vô hình. Và nó tệ dần: 46 job backlog
+# đang chờ rồi cũng thành `held`, tức đúng hai lệnh người vận hành dùng để biết
+# hệ thống đang làm gì sẽ sớm giấu đi phần lớn dữ liệu.
+#
+# Thêm status mới thì thêm vào ĐÂY, không thêm vào từng bảng đếm.
+ALL_STATUSES = (# `detected` là MẶC ĐỊNH của cột `jobs.status` trong schema, và
+                # là ô đầu của máy trạng thái ở đầu file. `create()` luôn ghi
+                # đè bằng 'queued' nên thực tế chưa gặp — nhưng một job lọt vào
+                # đó (chèn tay, đường ghi mới quên set status) sẽ vô hình đúng
+                # như `held` đã từng. Đếm nó thì rẻ, giấu nó thì đắt.
+                "detected",
+                "queued", "transcribing", "recapping", "waiting_auth",
+                "held", "delivered", "failed",
+                # 4 giá trị cuối là DI SẢN của cửa duyệt đã bỏ 30/07/2026: job
+                # mới không bao giờ vào nữa, nhưng job cũ trong DB vẫn phải
+                # hiện ra thay vì biến mất khỏi báo cáo.
+                "awaiting_approval", "owner_only", "expired", "discarded")
+
+
+# MÃ LỖI gắn ở đầu `jobs.error`, dạng `[ma_loi] câu mô tả`. Thêm 05/08/2026.
+#
+# Vì sao cần (user chốt sau khi nhận 3 cái DM liền): không phải lỗi nào cũng
+# đáng đánh thức người vận hành. `EmptyTranscript` là ví dụ rõ nhất — bản ghi
+# không có tiếng nói thì KHÔNG có việc gì để làm, mà DM vẫn nổ. Cảnh báo nào
+# cũng nổ thì người ta tắt thông báo, rồi lúc hỏng thật cũng không ai đọc.
+#
+# Nhận diện bằng MÃ chứ không bằng cách dò chuỗi tiếng Việt trong câu lỗi: câu
+# chữ sẽ được sửa, và một phép `in` trên câu chữ sẽ lặng lẽ ngừng khớp.
+ERR_EMPTY_TRANSCRIPT = "empty_transcript"
+
+_ERR_CODE_RE = re.compile(r"^\[([a-z_]+)\]\s*")
+
+
+def error_code(error: str | None) -> str:
+    """Mã lỗi ở đầu `jobs.error`, "" nếu không có. Lỗi cũ không có mã -> ""."""
+    m = _ERR_CODE_RE.match(error or "")
+    return m.group(1) if m else ""
+
+
+def error_text(error: str | None) -> str:
+    """Câu lỗi đã bỏ mã — thứ đem cho người đọc, không kèm dấu ngoặc vuông."""
+    return _ERR_CODE_RE.sub("", (error or "").strip())
 
 
 def _now_ms() -> int:
@@ -109,6 +159,47 @@ def set_status(minute_token: str, status: str, *, error: str | None = None,
     with db.tx() as c:
         c.execute(f"UPDATE jobs SET {', '.join(cols)} WHERE minute_token=?",
                   vals)
+
+
+def release_waiting_auth(open_id: str, union_id: str = "") -> list[str]:
+    """Đánh thức job ``waiting_auth`` liên quan tới người VỪA OAuth.
+
+    Chỉ khớp bằng ID có bằng chứng: owner hoặc attendees trong meta.
+    ``minute_viewers`` không được dùng: Search có thể trả bản ghi chỉ được share,
+    không chứng minh người đó tham dự. Không bao giờ mở tất cả job chỉ vì có
+    thêm một user mới. Job về priority 0 nên mỗi vòng chỉ dịch một backlog và
+    khi xong thành ``held`` — KHÔNG tự gửi transcript/recap cho người dự.
+    """
+    ids = {x for x in (open_id, union_id) if x}
+    if not ids:
+        return []
+    matched: list[str] = []
+    for row in by_status("waiting_auth"):
+        try:
+            meta = meta_from_json(row["meta_json"])
+        except Exception:                       # job cũ méo: không đoán quyền
+            continue
+        related = {x for x in (meta.owner_open_id,) if x}
+        # Tìm chuỗi con, KHÔNG dùng startswith: bản ghi bị cách ly ngày 05/08 mang
+        # tiền tố `unsafe_near_rejected:calendar[near19m]:…`, tức near nằm ở GIỮA
+        # chuỗi. `startswith` bỏ lọt đúng những row đã bị đánh dấu là không an toàn.
+        if "calendar[near" not in (meta.participants_source or ""):
+            related |= {x for a in meta.attendees
+                        for x in (a.open_id, a.union_id) if x}
+        if not (ids & related):
+            continue
+        matched.append(row["minute_token"])
+    if not matched:
+        return []
+    now = _now_ms()
+    with db.tx() as c:
+        c.executemany(
+            "UPDATE jobs SET status='queued', priority=0, attempts=0, "
+            "recap_fails=0, error=NULL, queued_at=? WHERE minute_token=? "
+            "AND status='waiting_auth'",
+            [(now, token) for token in matched],
+        )
+    return matched
 
 
 def update_meta(minute_token: str, meta: MeetingMeta) -> None:

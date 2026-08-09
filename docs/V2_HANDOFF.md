@@ -1,5 +1,10 @@
 # V2 — Giao việc (chốt phiên 30/07/2026)
 
+> **CẬP NHẬT 05/08/2026:** trạng thái Cloudflare OAuth, Base đóng, bản vá trả lời kép,
+> ACL, Workforce verified và số kiểm thử mới nằm trong
+> **[CURRENT_CONTEXT.md](CURRENT_CONTEXT.md)**. Đọc file đó trước; nó ưu tiên hơn các
+> mốc trạng thái cũ bên dưới. File này được giữ làm lịch sử và bối cảnh dài hạn.
+
 Đọc file này TRƯỚC khi sửa gì. Nó nói: đang ở đâu, cái gì đã kiểm chứng thật,
 cái gì chỉ mới test mock, và việc kế tiếp làm theo thứ tự nào.
 

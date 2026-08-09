@@ -160,14 +160,39 @@ def _resolve_token(who: dict[str, Any] | None, query: str) -> tuple[str, str]:
     if not vis:
         return "", NO_MEETING
     import time as _t
-    lines = []
-    for r in sorted(vis, key=lambda x: x["start_ts"] or 0, reverse=True):
-        when = (_t.strftime("%d/%m/%Y %H:%M", _t.localtime(r["start_ts"] / 1000))
-                if r["start_ts"] else "?")
-        lines.append(f"- {jobstore.meta_from_json(r['meta_json']).title} "
-                     f"({when}) — minute_token: {r['minute_token']}")
-    return "", (f"Có {len(vis)} cuộc họp trùng tên '{query}'. Hỏi người dùng muốn "
-                f"cuộc nào rồi gọi lại với `minute_token`:\n" + "\n".join(lines))
+
+    def _when_of(r: dict[str, Any]) -> str:
+        """Giờ họp để người dùng phân biệt hai cuộc trùng tên.
+
+        `jobs.start_ts` rỗng là chuyện có thật (job dựng từ search hit chưa tra
+        được giờ). Bản trước in "?" và người dùng nhận được dòng
+        "test luồng tự động (?)" — không phân biệt nổi với cuộc kia, tức câu hỏi
+        lại thành vô nghĩa. Rơi về giờ trên Base, chỗ danh sách vẫn lấy được.
+        """
+        if r["start_ts"]:
+            return _t.strftime("%d/%m/%Y %H:%M", _t.localtime(r["start_ts"] / 1000))
+        try:
+            from . import bitable
+            for rec in qa.records():
+                if qa._s(rec, bitable.F_TOKEN) == r["minute_token"]:
+                    return qa._dmy(qa._when(rec)) or "chưa rõ giờ"
+        except Exception:                     # noqa: BLE001 — hỏi lại quan trọng hơn
+            pass
+        return "chưa rõ giờ"
+
+    rows = sorted(vis, key=lambda x: x["start_ts"] or 0, reverse=True)
+    # HAI KÊNH: người dùng chỉ cần tên + giờ để chọn. `minute_token` và lời dặn
+    # "gọi lại tool" là việc của agent — bản trước nhét cả hai vào một chuỗi nên
+    # người dùng đọc được cả mã máy lẫn câu dặn dành cho bot.
+    user_lines = [f"- **{jobstore.meta_from_json(r['meta_json']).title}** "
+                  f"· {_when_of(r)}" for r in rows]
+    note_lines = [f"- {r['minute_token']} = {_when_of(r)}" for r in rows]
+    return "", qa.two_channel(
+        f"Có {len(vis)} cuộc họp trùng tên **{query}**. Bạn muốn cuộc nào?\n"
+        + "\n".join(user_lines),
+        "Hỏi xong thì gọi LẠI send_transcript_file với `minute_token` tương ứng "
+        "(người dùng chỉ nói ngày/giờ, tự map sang token):\n"
+        + "\n".join(note_lines))
 
 
 def _recent_send(minute_token: str, recipient: str) -> bool:
@@ -181,6 +206,33 @@ def _recent_send(minute_token: str, recipient: str) -> bool:
         return False
     import time
     return (time.time() * 1000 - int(row["sent_at"] or 0)) < RESEND_COOLDOWN_MIN * 60_000
+
+
+def _send_uuid(minute_token: str, recipient: str) -> str:
+    """Khoá chống trùng gửi cho Lark — PHẢI đổi theo thời gian.
+
+    Lark coi `uuid` là khoá idempotency: gửi lại cùng uuid thì nó trả về
+    message_id CŨ và KHÔNG tạo tin mới, mà cũng không báo lỗi. Bản trước dùng
+    `f"ond-{token}-{rid}"` cố định vĩnh viễn, nên mỗi người chỉ nhận được file
+    của một cuộc họp ĐÚNG MỘT LẦN TRONG ĐỜI. Lần thứ hai trở đi: V2 không thấy
+    exception -> ghi `deliveries.ok=1` -> báo "đã gửi" -> người dùng nhìn khung
+    chat trống. Đo thật 05/08/2026: ba dòng ok=1 cho cùng cặp token+người mà chỉ
+    dòng đầu tiên có tin nhắn thật trong Lark.
+
+    Chống lặp KHÔNG mất đi: `_recent_send` vẫn chặn ở tầng V2 trong
+    `RESEND_COOLDOWN_MIN` phút — đó mới là chỗ chặn vòng lặp của agent, và nó
+    chặn TRƯỚC khi sinh file nên còn rẻ hơn. Thùng thời gian ở đây chỉ để hai
+    lần xin CÁCH XA nhau thì thật sự được gửi.
+
+    Dùng băm thay vì nối chuỗi: Lark cắt uuid ở 50 ký tự, mà
+    `ond-` + token (24) + rid (35) đã 64 — nối thêm gì vào đuôi cũng bị cắt mất,
+    tức thùng thời gian sẽ vô tác dụng đúng theo cách khó thấy nhất.
+    """
+    import hashlib
+    import time
+    bucket = int(time.time() // (RESEND_COOLDOWN_MIN * 60))
+    raw = f"{minute_token}|{recipient}|{bucket}".encode()
+    return f"ond-{hashlib.sha1(raw).hexdigest()[:32]}"
 
 
 def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
@@ -201,6 +253,12 @@ def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
         return ("Cuộc họp này CÓ trong hệ thống nhưng bạn không có trong danh "
                 "sách người dự, nên mình không gửi biên bản được. Nếu bạn có dự "
                 "thì nhắn quản trị hệ thống — có thể việc tra người dự bị sót.")
+
+    # Ký ức hội thoại: ghi NGAY SAU cửa quyền (2), trước mọi nhánh lỗi gửi. Xin
+    # bản nguyên văn là tín hiệu "đang nói về cuộc này" mạnh nhất người dùng
+    # phát ra — và nó đúng cả khi lần gửi này hỏng, vì câu tiếp theo của họ
+    # ("thử lại đi") vẫn nói về chính cuộc đó.
+    qa.remember(who, minute_token, str(row.get("title") or ""))
 
     # (3) gửi cho CHÍNH người hỏi. `admin_view` (đường `v2 ask`) không có id nào
     # -> không gửi đi đâu cả, và nói rõ vì sao thay vì im lặng "đã gửi".
@@ -235,11 +293,21 @@ def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
         if st not in ("queued", "transcribing", "recapping"):
             jobstore.set_status(minute_token, "queued", error=None)
         jobstore.set_priority(minute_token, 2)
-        return ("Cuộc họp này CHƯA có bản transcript chuẩn (whisper). Mình đã "
-                "ƯU TIÊN DỊCH NGAY và sẽ TỰ GỬI cho bạn khi xong — bạn không cần "
-                "hỏi lại. Cuộc ngắn vài phút, cuộc dài thì lâu hơn. Trong lúc "
-                "chờ, bản Minute của Lark xem tạm được. Báo đúng vậy cho người "
-                "dùng, đừng bịa là đã gửi.")
+        # ƯỚC TÍNH bằng số đo, không bằng cảm giác (07/08/2026). Câu cũ nói
+        # "cuộc ngắn vài phút, cuộc dài thì lâu hơn" — đúng mà vô dụng: người ta
+        # hỏi để quyết ngồi chờ hay đi làm việc khác. Whisper trên máy này chạy
+        # ~0,14x thời gian thật và biên độ hẹp, nên con số này nói ra được.
+        # Xem `v2/eta.py`. Ước tính hỏng thì bỏ mệnh đề đó, KHÔNG bịa số.
+        from . import eta
+        khi_nao = eta.human(minute_token)
+        # Đặt priority TRƯỚC khi ước tính là cố ý: `eta.estimate` xếp hàng theo
+        # đúng thứ tự `process_queue` sẽ chạy, nên phải nhìn thấy job này đã ở
+        # mức cực cao — không thì nó tính nhầm là job đứng sau cả hàng backlog.
+        return ("Cuộc họp này chưa có bản nguyên văn. Mình đã cho chạy TRƯỚC "
+                "TIÊN và sẽ TỰ GỬI cho bạn ngay khi xong — không cần hỏi lại."
+                + (f" Ước tính {khi_nao} nữa." if khi_nao else "")
+                + " Nói lại đúng ý đó cho người dùng bằng lời của bạn, có kèm "
+                  "con số ước tính nếu có. Đừng bịa là đã gửi.")
     import json
     from .models import Transcript
     try:
@@ -258,13 +326,33 @@ def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
     doc = pipeline.write_doc(t, meta)
     try:
         lark_api.im_send_file(rid, doc, id_type=id_type,
-                              uuid_key=f"ond-{minute_token}-{rid}"[:50])
+                              uuid_key=_send_uuid(minute_token, rid))
     except lark_api.LarkError as exc:
         jobstore.record_delivery(minute_token, rid, KIND, False, str(exc))
         return (f"Gửi file hỏng: {exc}. Nói thẳng với người dùng là chưa gửi "
                 f"được, đừng nói đã gửi.")
     jobstore.record_delivery(minute_token, rid, KIND, True)
-    return (f"ĐÃ gửi file '{doc.name}' vào khung chat này. Báo ngắn gọn cho "
-            f"người dùng là file đã ở trong chat, và nhắc một câu rằng đó là "
-            f"bản máy phiên âm nên có lỗi nghe nhầm. KHÔNG chép lại nội dung "
-            f"biên bản ra tin nhắn — người dùng xin FILE.")
+
+    # Kèm TÓM TẮT ngắn ngay trong chat (chốt 05/08/2026): chỉ báo "đã gửi file"
+    # thì người dùng phải mở .docx mới biết cuộc họp nói gì — đúng cái họ than
+    # phiền. Tóm tắt đi qua `two_channel` để agent CHÉP y nguyên: nội dung cuộc
+    # họp là thành phẩm dựng bằng Python, không để LLM tự viết lại. Không có
+    # recap thì bỏ dòng đó, KHÔNG bịa và cũng không chặn việc gửi file.
+    summary = ""
+    try:
+        summary = (json.loads(row["recap_json"] or "{}").get("summary")
+                   or "").strip()
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        summary = ""
+
+    user_text = f"Đã gửi file biên bản **{meta.title}** vào khung chat này."
+    if summary:
+        user_text += f"\n\n**Tóm tắt nội dung:** {summary}"
+    user_text += ("\n\n(Đây là bản máy phiên âm nên có thể nghe nhầm tên riêng "
+                  "và thuật ngữ.)")
+
+    return qa.two_channel(
+        user_text,
+        f"ĐÃ gửi file '{doc.name}' rồi — đừng gọi lại tool này. KHÔNG chép "
+        f"NGUYÊN VĂN transcript ra tin nhắn: người dùng đã cầm file, khối trên "
+        f"đã có đủ tóm tắt.")
