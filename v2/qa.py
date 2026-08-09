@@ -989,11 +989,22 @@ def get_meeting(who: dict[str, Any] | None, query: str) -> str:
         pend = [p for p in pending_meetings(who)
                 if p["minute_token"] == query or q in p["title"].lower()]
         if len(pend) == 1:
-            # Chưa lên Base KHÔNG có nghĩa là không đọc được nội dung: bản chép
-            # của Lark thường đã sẵn từ lúc cuộc họp vừa tan. Thử cửa đó trước
-            # khi trả lời "chưa có gì để nói" — xem chú thích ở `from_lark`.
+            # Chưa lên Base KHÔNG có nghĩa là không đọc được nội dung. Hai cửa,
+            # theo đúng thứ tự chất lượng — đừng đảo:
+            #   1. nguyên văn whisper, nếu đã phiên âm xong (job `held` mà ghi
+            #      record hỏng thì vẫn rơi vào khối "chưa có biên bản" này);
+            #   2. bản chép sẵn của Lark, cho cuộc còn đang phiên âm.
             from . import jobstore as _js
             job = _js.get(pend[0]["minute_token"])
+            if job and (job.get("transcript_path") or "").strip():
+                remember(who, pend[0]["minute_token"], pend[0]["title"])
+                return (f"Cuộc họp '{pend[0]['title']}' ĐÃ có bản nguyên văn "
+                        f"đầy đủ do hệ thống phiên âm, chỉ là phần tóm tắt chưa "
+                        f"dựng xong. Gọi get_transcript với "
+                        f"minute_token={pend[0]['minute_token']} để đọc nội "
+                        f"dung mà trả lời. Người dùng muốn cầm cả file thì gọi "
+                        f"send_transcript_file. ĐỪNG nói với họ là chưa có nội "
+                        f"dung, và đừng bảo họ chờ phiên âm — đã xong rồi.")
             if job and (served := from_lark(job, pend[0]["title"])):
                 remember(who, pend[0]["minute_token"], pend[0]["title"])
                 return served
@@ -1188,7 +1199,19 @@ def from_lark(row: dict[str, Any], title: str, *, part: int = 1) -> str:
 
     KHÔNG kiểm quyền ở đây — caller phải qua `_may_see` trước. Cùng lý lẽ với
     `larktext`: một luật quyền thứ hai song song thì sớm muộn cũng lệch.
+
+    ĐÃ CÓ nguyên văn whisper thì TRẢ RỖNG (chặn 09/08/2026, lỗi tự tạo ra khi
+    thêm đường này). Bản whisper tốt hơn hẳn — có tên người dự nhồi vào prompt
+    và có glossary đã duyệt — nên phục vụ bản Lark lúc đó là đưa bản kém hơn.
+    Tệ hơn cả kém: lời mời đi kèm nói "hệ thống phiên âm lại, mất khoảng 10
+    phút" trong khi file đã nằm sẵn trên đĩa, tức bot hứa một việc nó không cần
+    làm và bắt người ta chờ vô cớ.
+    Đường vào lỗi này KHÔNG phải `get_transcript` (nó tra `transcript_path`
+    trước rồi mới tới đây) mà là `get_meeting`: một job `held` CÓ whisper nhưng
+    ghi record hỏng thì rơi vào khối "chưa có biên bản" và đi thẳng xuống đây.
     """
+    if (row.get("transcript_path") or "").strip():
+        return ""
     body = _lark_body(row, title, part)
     if not body:
         return ""

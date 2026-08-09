@@ -4540,6 +4540,37 @@ def _main() -> int:
               "chưa đọc được bản chép nào" in _outNone
               and qa.OFFER_MARK not in _outNone, _outNone[:200])
 
+        # (e2) ĐÃ CÓ whisper thì TUYỆT ĐỐI không được phục vụ bản Lark.
+        # Lỗi tự tạo ra khi thêm đường này (bắt được 09/08/2026 lúc kiểm lại):
+        # job `held` CÓ nguyên văn nhưng ghi record hỏng thì vẫn nằm trong khối
+        # "chưa có biên bản", nên `get_meeting` đi thẳng xuống `from_lark` và
+        # đưa bản KÉM HƠN — rồi còn mời "phiên âm lại, mất khoảng 10 phút"
+        # trong khi file đã nằm sẵn trên đĩa. Bot hứa một việc nó không cần làm.
+        _mDONE = meta(minute_token="mtLARK3", title="Da co whisper roi",
+                      owner_open_id="ou_LTOWN", attendees=_attLT,
+                      participants_source="calendar[verified]:x")
+        jobstore.create(_mDONE, status="held")
+        jobstore.set_status("mtLARK3", "held", transcript_path=_mk_transcript(
+            "mtLARK3", [(0.0, "cau whisper chinh xac hon")]))
+        _rowDONE = dict(jobstore.get("mtLARK3"))
+        _lt.path_of("mtLARK3").write_text("BAN LARK KEM HON", encoding="utf-8")
+        check("đã có nguyên văn whisper -> from_lark TỪ CHỐI phục vụ bản Lark",
+              qa.from_lark(_rowDONE, "Da co whisper roi") == "")
+        _keepEnLT2, _keepRowsLT2 = qa.bitable.enabled, qa.lark_api.base_records_all
+        qa.bitable.enabled = lambda: True
+        qa.lark_api.base_records_all = lambda *a, **k: []
+        _outDONE = qa.get_meeting(_whoLTA, "Da co whisper roi")
+        qa.bitable.enabled, qa.lark_api.base_records_all = _keepEnLT2, _keepRowsLT2
+        check("...get_meeting chỉ sang nguyên văn, KHÔNG đưa bản Lark",
+              "BAN LARK KEM HON" not in _outDONE
+              and "get_transcript" in _outDONE, _outDONE[:200])
+        check("...và KHÔNG mời phiên âm lại thứ đã phiên âm xong",
+              qa.OFFER_MARK not in _outDONE
+              and "chờ phiên âm" not in _outDONE.replace("đừng bảo họ chờ "
+                                                         "phiên âm", ""),
+              _outDONE[:200])
+        _lt.path_of("mtLARK3").unlink(missing_ok=True)
+
         # (f) Danh sách: cuộc đã tải được bản Lark phải được NÓI RA, không thì
         # agent tưởng không có gì để đọc và lại trả lời "chưa có biên bản".
         _pend = [p for p in qa.pending_meetings(_whoLTA)
