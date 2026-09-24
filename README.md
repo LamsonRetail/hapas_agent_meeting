@@ -1,7 +1,14 @@
-# Luồng tự động Meeting Note — Lark × Whisper
+# Mino Lê — Meeting Agent (MeetingxLark)
 
-Cuộc họp kết thúc → tự phát hiện → phiên âm → sinh recap → gửi biên bản
-cho những người được mời. Không cần ai yêu cầu.
+Hồ sơ quản trị tập trung của agent nằm trong [Base Mino Lê - Meeting Agent](https://o4pvcegwn6b.sg.larksuite.com/wiki/APkuwBIoLipcURk1KQLl6kmngSf?fromScene=spaceOverview). Trong chính Base này có tài liệu **Kỹ thuật và luồng vận hành** và **Change log**. MeetingxLark là tên hệ thống/repo của Mino Lê, không phải agent riêng. Kho GitHub bàn giao: [LamsonRetail/hapas_agent_meeting](https://github.com/LamsonRetail/hapas_agent_meeting).
+
+Folder này là nguồn chính cho cấu trúc và hành vi kỹ thuật. Đọc `docs/CURRENT_CONTEXT.md` trước, rồi đến `docs/TECHNICAL.md` và phần liên quan trong `docs/V2_MAINTENANCE.md`; các con số và trạng thái vận hành phải đối chiếu tại thời điểm đọc. Base sản xuất MeetingxLark giữ biên bản và audit theo quyền riêng; Base quản trị chỉ nhận audit thô khi quyền xem tương đương nguồn.
+
+## Luồng tự động Meeting Note — Lark × Whisper
+
+Cuộc họp kết thúc → tự phát hiện → phiên âm → sinh recap → lưu Base. Hệ có thể
+gửi thẻ thông báo cho người dự đã cấp quyền; file Word chỉ được gửi theo yêu cầu
+và sau khi kiểm quyền người nhận.
 
 ---
 
