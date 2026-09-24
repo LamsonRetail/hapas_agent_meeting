@@ -47,8 +47,12 @@ def is_admin(union_id: str = "", open_id: str = "") -> bool:
 
 
 def issue(union_id: str, open_id: str = "", name: str = "",
-          *, min_ttl_s: int = 120) -> str:
+          *, min_ttl_s: int = 120, room_chat_id: str = "") -> str:
     """Cấp (hoặc gia hạn) vé phiên cho một người. Trả token.
+
+    `room_chat_id` khác rỗng = vé này của một câu hỏi TRONG NHÓM, và
+    `qa._may_see` sẽ chỉ mở những cuộc mà chính nhóm đó được mời. Vé của phòng
+    và vé chat 1-1 KHÔNG dùng chung: xem chỗ tra vé cũ ở dưới.
 
     DÙNG LẠI vé còn sống của cùng người thay vì cấp mới mỗi tin: một cuộc hội
     thoại nhiều lượt thì vé giữ nguyên, nên agent lấy lại được vé từ lượt trước
@@ -61,20 +65,28 @@ def issue(union_id: str, open_id: str = "", name: str = "",
     ttl = config.QA_TOKEN_TTL * 1000
     with db.tx() as c:
         c.execute("DELETE FROM qa_sessions WHERE expires_at < ?", (now,))
+    # Dùng lại vé cũ CHỈ khi cùng phòng. Cùng một người hỏi trong nhóm rồi nhắn
+    # riêng (hoặc ngược lại) mà xài chung vé là phạm vi của lượt trước rò sang
+    # lượt sau: hỏi riêng thì đọc được cuộc của cả nhóm, hoặc hỏi trong nhóm lại
+    # kéo được cuộc riêng ra giữa phòng. Khoá theo `room_chat_id` để hai ngữ
+    # cảnh không bao giờ dùng chung một vé.
     row = db.conn().execute(
         "SELECT token FROM qa_sessions WHERE union_id=? AND expires_at > ? "
+        "AND IFNULL(room_chat_id,'')=? "
         "ORDER BY expires_at DESC LIMIT 1",
-        (union_id, now + min_ttl_s * 1000),
+        (union_id, now + min_ttl_s * 1000, room_chat_id or ""),
     ).fetchone() if union_id else None
 
     token = row["token"] if row else secrets.token_urlsafe(12)
     with db.tx() as c:
         c.execute(
-            "INSERT INTO qa_sessions(token, union_id, open_id, name, expires_at) "
-            "VALUES (?,?,?,?,?) "
+            "INSERT INTO qa_sessions(token, union_id, open_id, name, "
+            "  expires_at, room_chat_id) "
+            "VALUES (?,?,?,?,?,?) "
             "ON CONFLICT(token) DO UPDATE SET open_id=excluded.open_id, "
-            "  name=excluded.name, expires_at=excluded.expires_at",
-            (token, union_id, open_id, name, now + ttl),
+            "  name=excluded.name, expires_at=excluded.expires_at, "
+            "  room_chat_id=excluded.room_chat_id",
+            (token, union_id, open_id, name, now + ttl, room_chat_id or ""),
         )
     return token
 
@@ -89,19 +101,28 @@ def resolve(token: str) -> dict | None:
     if not token:
         return None
     row = db.conn().execute(
-        "SELECT union_id, open_id, name, expires_at FROM qa_sessions WHERE token=?",
+        "SELECT union_id, open_id, name, expires_at, "
+        "       IFNULL(room_chat_id,'') AS room_chat_id "
+        "FROM qa_sessions WHERE token=?",
         (token,),
     ).fetchone()
     if not row or _now_ms() > int(row["expires_at"] or 0):
         return None
-    return who(row["union_id"], row["open_id"], row["name"] or "")
+    return who(row["union_id"], row["open_id"], row["name"] or "",
+               room_chat_id=row["room_chat_id"])
 
 
-def who(union_id: str = "", open_id: str = "", name: str = "") -> dict:
-    """Dựng người hỏi từ id đã biết (đường `v2 ask --as`, không qua vé)."""
+def who(union_id: str = "", open_id: str = "", name: str = "",
+        *, room_chat_id: str = "") -> dict:
+    """Dựng người hỏi từ id đã biết (đường `v2 ask --as`, không qua vé).
+
+    `room_chat_id` rỗng = chat 1-1, quyền tính theo NGƯỜI như cũ. Khác rỗng =
+    câu hỏi trong nhóm, quyền tính theo PHÒNG (xem `qa._may_see`).
+    """
     return {"union_id": union_id or "", "open_id": open_id or "",
             "name": name or (union_id or open_id or "(không rõ)"),
-            "admin": is_admin(union_id, open_id)}
+            "admin": is_admin(union_id, open_id),
+            "room_chat_id": room_chat_id or ""}
 
 
 def admin_view(label: str = "(quyền admin)") -> dict:

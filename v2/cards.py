@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import config
+
 from .models import MeetingMeta, Recap
 
 
@@ -50,15 +52,16 @@ def enroll_card(name: str, link: str) -> dict[str, Any]:
     `open_url` KHÔNG cần callback: Lark tự mở trình duyệt. Đây là loại nút duy
     nhất chạy được mà không cần ai nghe `card.action.trigger`.
     """
+    bot_name = config.BOT_NAME
     return {
         "config": {"wide_screen_mode": True},
         "header": {"template": "blue",
                    "title": {"tag": "plain_text",
-                             "content": "Cấp quyền cho trợ lý biên bản họp"}},
+                             "content": f"Cấp quyền cho {bot_name}"[:100]}},
         "elements": [
             {"tag": "div", "text": {"tag": "lark_md", "content": (
-                f"Chào **{name}**! Để đọc được biên bản các cuộc họp "
-                "**của bạn**, mình cần bạn cho phép một lần.")}},
+                f"Chào **{name}**! Mình là **{bot_name}**.\n"
+                "Để đọc được biên bản các cuộc họp **của bạn**, mình cần bạn cho phép một lần.")}},
             {"tag": "div", "text": {"tag": "lark_md", "content": (
                 "Bấm nút dưới rồi chọn **Đồng ý**. Xong là mình gửi ngay danh "
                 "sách cuộc họp 7 ngày qua của bạn.")}},
@@ -96,24 +99,22 @@ def list_card(body: str) -> dict[str, Any]:
 
 
 def welcome_card(name: str, body: str) -> dict[str, Any]:
-    """Thẻ chào sau khi cấp quyền xong: lời chào + danh sách 7 ngày. Hết.
-
-    `body` là chuỗi danh sách THÀNH PHẨM do `qa.list_text` dựng — dùng lại đúng
-    bộ dựng của bot để hai chỗ không bao giờ lệch định dạng.
-
-    BỎ khối nút "Nhận bản nguyên văn" (user chốt 05/08/2026). Nó lặp lại đúng
-    câu đã có trong chân trang của `body` ngay phía trên ("Nhắn *gửi nguyên văn
-    <tên cuộc họp>* để nhận file Word"), và hai ô vuông tên cuộc họp cắt cụt ở 20
-    ký tự làm cuối thẻ trông rối. Một lời mời nói một lần là đủ.
-
-    Đường xử lý cú bấm nút (`_rewrite_card_click` bên plugin) GIỮ NGUYÊN dù giờ
-    không thẻ nào sinh nút: nó là cầu duy nhất giữ cho một nút thêm sau này khỏi
-    rơi vào nhánh "Unknown command" của Hermes.
-    """
+    """Thẻ chào sau khi cấp quyền xong: lời chào + danh sách 7 ngày + hướng dẫn tính năng."""
+    bot_name = config.BOT_NAME
     elements: list[dict[str, Any]] = [
         {"tag": "div", "text": {"tag": "lark_md",
-                                "content": f"Xong rồi **{name}**!"}},
+                                "content": f"Chào **{name}**! Mình là **{bot_name}**. Cảm ơn bạn đã cấp quyền! 🎉"}},
         {"tag": "div", "text": {"tag": "lark_md", "content": body[:4000]}},
+        {"tag": "hr"},
+        {"tag": "div", "text": {"tag": "lark_md", "content": (
+            "💡 **CÁC TÍNH NĂNG MÌNH CÓ THỂ GIÚP BẠN:**\n"
+            "• **Họp xong nhận ngay tóm tắt**: Tự động gửi thẻ tóm tắt (ý chính, quyết định, việc cần làm) về chat 1-1.\n"
+            "• **Hỏi đáp nội dung cuộc họp**: Nhắn hỏi về bất kỳ cuộc họp nào bạn có tham dự.\n"
+            "• **Nhận bản dịch chuẩn từ Hapas**: Sau mỗi cuộc họp mình sẽ hỏi "
+            "bạn có muốn lấy không; nếu bạn đồng ý, bản chưa có sẽ được ưu tiên "
+            "xử lý và tự gửi khi xong.\n"
+            "• **Tạo việc trên Lark Task**: Tự động tạo task từ cuộc họp và giao việc cho bạn."
+        )}},
     ]
     return {
         "config": {"wide_screen_mode": True},
@@ -146,13 +147,14 @@ def recap_card(meta: MeetingMeta, recap: Recap) -> dict[str, Any]:
     }
 
 
-def minute_notice_card(meta: MeetingMeta, recap: Recap) -> dict[str, Any]:
+def minute_notice_card(meta: MeetingMeta, recap: Recap, *,
+                       hapas_ready: bool = False) -> dict[str, Any]:
     """Thẻ báo NGAY khi họp xong (mô hình kéo, 03/08/2026).
 
-    Gửi liền: tóm tắt NỘI DUNG MINUTE LARK + link Minute + LỜI MỜI lấy bản
-    transcript whisper chuẩn. KHÔNG kèm transcript (whisper chạy nền, giữ chờ
-    hỏi). Không có nút (card action đi vào WebSocket của Hermes, không phải V2)
-    — người dùng NHẮN để lấy, và plugin gate + bot Q&A lo phần đó.
+    Gửi liền tóm tắt NỘI DUNG MEETING NOTE LARK + link Minute, rồi LUÔN hỏi
+    người nhận có muốn lấy bản dịch chuẩn từ Hapas không. Nếu bản chưa có thì
+    chỉ xử lý sau khi chính người dùng đồng ý; nút bấm đi qua gate + ACL như
+    yêu cầu gõ tay, không tự gửi transcript.
     """
     when = _fmt_time_range(meta)
     elements: list[dict[str, Any]] = []
@@ -165,10 +167,33 @@ def minute_notice_card(meta: MeetingMeta, recap: Recap) -> dict[str, Any]:
         elements.append({"tag": "div", "text": {"tag": "lark_md",
                         "content": f"📄 [Mở bản Minute trên Lark]({meta.app_link})"}})
     elements.append({"tag": "hr"})
-    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": (
-        "💬 Cần **bản nguyên văn** — chép lại đúng từng câu mọi người đã nói, "
-        "đầy đủ hơn bản tóm tắt ở trên? Nhắn mình: "
-        f"**gửi nguyên văn {meta.title}** — mình làm ngay và tự gửi khi xong.")}})
+    # KHÔNG có nút ở thẻ này (bỏ 19/08/2026 — user chốt sau khi đo).
+    #
+    # Nút cũ `value={"v2": "transcript", ...}` là đồ trang trí từ 13/08 tới 19/08:
+    # đo trên MỌI file log của Hermes (gateway/agent/stdio/errors) không có một
+    # dòng `card action` / `Routing card` / `/card` nào — Lark chưa từng đẩy
+    # `card.action.trigger` về app, nên hàm dịch cú bấm bên plugin chưa chạy lần
+    # nào. Và kể cả nếu Lark đẩy về thì vẫn bị bỏ: adapter Feishu gọi
+    # `_resolve_source_chat_type(..., event_chat_type="group")` GHIM CỨNG cho card
+    # action, hàm đó chỉ trả "dm" khi tham số ấy là "p2p", nên cú bấm trong chat
+    # 1-1 bị dán nhãn `group` và plugin bỏ đúng theo luật chỉ-trả-lời-DM.
+    #
+    # Vì sao BỎ chứ không sửa: nút đó phụ thuộc HAI thứ nằm ngoài repo — event
+    # subscription trong Lark Console và nội bộ adapter của Hermes — không test
+    # nào phủ được, và khi hỏng thì im lặng. Đường gõ chữ làm đúng việc đó và đã
+    # chạy thật. Ít mảnh chuyển động hơn = bền hơn.
+    #
+    # ĐỪNG dựng lại nút callback ở đây mà không có đường kiểm live: `selftest`
+    # có phép kiểm chặn đúng việc này.
+    if hapas_ready:
+        offer = ("💬 Bạn có muốn lấy **bản dịch chuẩn từ Hapas** không? "
+                 "Bản này đã sẵn sàng — trả lời **có** là mình gửi file Word ngay.")
+    else:
+        offer = ("💬 Bạn có muốn lấy **bản dịch chuẩn từ Hapas** không? "
+                 "Trả lời **có** thì mình ưu tiên xử lý và tự gửi file Word khi "
+                 "xong.")
+    elements.append({"tag": "div", "text": {"tag": "lark_md",
+                                               "content": offer}})
     return {
         "config": {"wide_screen_mode": True},
         "header": {"template": "blue",

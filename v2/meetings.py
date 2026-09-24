@@ -84,13 +84,15 @@ def _tail(src: str) -> str:
     """Phần sau dấu ':' của participants_source, dịch các hậu tố sang tiếng Việt.
 
     Hậu tố do `resolve_participants` gắn: `+vcN` (gộp thêm N người thật sự vào
-    phòng họp) và `-declineN` (đã bỏ N người từ chối lời mời). Đây là hai con số
-    người vận hành cần thấy ngay trên dòng log `[deliver]` — chúng nói "danh
-    sách người nhận vừa bị sửa so với lời mời trên lịch", và đó chính là câu hỏi
-    đầu tiên khi ai đó thắc mắc vì sao mình nhận / không nhận biên bản.
+    phòng họp), `+chatN` (giãn N người từ nhóm chat được mời) và `-declineN`
+    (đã bỏ N người từ chối lời mời). Đây là những con số người vận hành cần thấy
+    ngay trên dòng log `[deliver]` — chúng nói "danh sách người nhận vừa bị sửa
+    so với lời mời trên lịch", và đó chính là câu hỏi đầu tiên khi ai đó thắc
+    mắc vì sao mình nhận / không nhận biên bản.
     """
     tail = src.split(":", 1)[-1]
     for token, fmt in (("+vc", "+{n} người vào họp thật"),
+                       ("+chat", "+{n} người trong nhóm chat được mời"),
                        ("-decline", "bỏ {n} người đã từ chối")):
         if token not in tail:
             continue
@@ -332,6 +334,79 @@ def _vc_joiners(access_token: str, meeting_id: str) -> list[str]:
     return out
 
 
+# Nhóm chat đông hơn ngần này thì KHÔNG giãn ra. Van an toàn, không phải con số
+# thiêng: mời một nhóm 11 người là mời 11 người, còn "mời" một nhóm 300 người
+# thì gần như chắc chắn không ai có ý cho cả 300 người đọc biên bản. Vượt ngưỡng
+# thì bỏ qua nhóm đó VÀ in ra — im lặng cắt danh sách người nhận đúng là kiểu
+# hỏng mà file này chống suốt.
+#
+# 60 -> 80 và đưa ra biến môi trường (28/08/2026, user chốt). Ca thật: cuộc
+# `08-27 | Workforce AI Weekly Meeting` mời nhóm `CĐS_AI & Automation_Workforce
+# AI Team` — **71 người**, tức vượt trần cũ, nên dù có mời bot vào nhóm thì vẫn
+# không giãn. 80 chọn có chủ ý: đủ cho nhóm 71 người đó, vẫn chặn
+# `CĐS_Data Mindset` (106 người) — một nhóm quy mô gần-toàn-công-ty mà không ai
+# có ý dùng làm danh sách nhận biên bản.
+#
+# Đọc từ config để đổi được bằng `.env`, không phải sửa code rồi restart:
+# lần sau gặp nhóm 85 người, người vận hành cần một dòng env chứ không cần
+# một commit.
+MAX_CHAT_INVITE_MEMBERS = config.MAX_CHAT_INVITE_MEMBERS
+
+
+def _chat_invitees(access_token: str, items: list[dict],
+                   skip: set[str]) -> tuple[list[str], list[str]]:
+    """(union_id người trong nhóm chat được mời, chat_id các nhóm đó).
+
+    HAI giá trị trả về là hai chuyện khác nhau, và tách chúng là có chủ đích
+    (26/08/2026): danh sách `chat_id` được ghi CẢ KHI không giãn được ai —
+    thiếu quyền, nhóm quá đông, bot chưa vào nhóm. "Nhóm nào được mời" là dữ
+    kiện do Lark cấp và luôn đọc được; "giãn ra được ai" thì phụ thuộc quyền.
+    Bản trước trộn hai thứ đó nên khi giãn hỏng là mất luôn cả chat_id.
+
+    Vì sao cần (20/08/2026): sự kiện lịch mời được CẢ MỘT NHÓM CHAT. Lúc đó
+    `event_attendees` trả về một mục `{"type": "chat", "chat_id": ...}` không
+    kèm id người nào, và `_attendee_map` loại nó vì `type != "user"` — bộ lọc
+    đó vốn để loại PHÒNG HỌP (`resource_…`), nhưng phòng họp không phải người
+    còn nhóm chat thì là người thật.
+
+    Đo thật trên `Weekly Meeting CĐS`: lịch có chủ trì + nhóm
+    `DIGITAL TRANSFORMATION` (11 người, 7 đã enroll). Trước thay đổi này V2
+    dựng được đúng 1 người từ lịch; người được mời qua nhóm vừa không nhận biên
+    bản vừa bị bot giấu luôn cuộc họp, y như lỗi người-vào-phòng-VC hồi 02/08.
+
+    Gộp thêm chứ không thay thế, giống `_vc_joiners`. Không đọc được nhóm thì
+    trả về rỗng và mọi thứ chạy y như cũ — `lark_api.chat_members` đã nuốt lỗi
+    sẵn, đây chỉ là lớp thứ hai.
+    """
+    out: list[str] = []
+    chats: list[str] = []
+    for a in items:
+        if a.get("type") != "chat":
+            continue
+        chat_id = a.get("chat_id") or ""
+        if not chat_id:
+            continue
+        if chat_id not in chats:
+            chats.append(chat_id)
+        members = lark_api.chat_members(access_token, chat_id,
+                                        id_type="union_id")
+        if not members:
+            print(f"[meetings] nhóm {a.get('display_name') or chat_id} được mời "
+                  f"nhưng KHÔNG đọc được thành viên — người trong nhóm sẽ không "
+                  f"nhận biên bản cuộc này (bot đã ở trong nhóm chưa?)")
+            continue
+        if len(members) > MAX_CHAT_INVITE_MEMBERS:
+            print(f"[meetings] nhóm {a.get('display_name') or chat_id} có "
+                  f"{len(members)} người (> {MAX_CHAT_INVITE_MEMBERS}) — KHÔNG "
+                  f"giãn, người trong nhóm sẽ không nhận biên bản cuộc này")
+            continue
+        for m in members:
+            uid = m.get("member_id") or ""
+            if uid and uid not in skip and uid not in out:
+                out.append(uid)
+    return out, chats
+
+
 def _recording_matches(access_token: str, meeting_id: str,
                        minute_token: str) -> bool:
     """Bản ghi của cuộc họp này có đúng minute_token đang xử lý không."""
@@ -452,12 +527,43 @@ def resolve_participants(access_token: str, meta: MeetingMeta) -> MeetingMeta:
         else:
             continue
 
-        try:
-            atts = lark_api.event_attendees(access_token, cal_id, event_id,
-                                            id_type="union_id")
-            atts_open = lark_api.event_attendees(access_token, cal_id, event_id,
-                                                 id_type="open_id")
-        except lark_api.LarkError:
+        # SỰ KIỆN LẶP: id của MỘT BUỔI không tra được khách mời (28/08/2026).
+        #
+        # `calendar_events` (instance view) trả `event_id` dạng
+        # `<id gốc>_<mốc thời gian buổi đó>`, ví dụ `bd5e66c3…7807_1787814000`.
+        # Gọi `event_attendees` bằng id đó thì Lark trả **193001 event not
+        # found**, còn gọi bằng `recurring_event_id` (`…7807_0`) thì ra đủ
+        # khách mời. Id trần (không hậu tố) thì 190014.
+        #
+        # Hậu quả trước bản vá: mọi cuộc LẶP không tra được người dự -> rơi về
+        # `fallback:owner` -> CHỈ CHỦ BẢN GHI nhận biên bản, im lặng. Đo
+        # 28/08/2026 trên 489 job: **94 cuộc (19%) đang ở `fallback:owner`**,
+        # riêng từ 14/08 là 36 — toàn các cuộc lặp hàng ngày (`Daily CDP
+        # Checkin`, `Daily CX Genie`, `Check in daily Thu Đông - POD`). Ca lộ ra
+        # chuyện này: `Team Weekly CĐS` 27/08 — lịch có mời nhóm
+        # `DIGITAL TRANSFORMATION`, mà job chỉ ghi đúng 1 người.
+        #
+        # Thử id BUỔI trước rồi mới rơi về id CHUỖI: khách mời có thể được sửa
+        # riêng cho một buổi, và bản của buổi đó mới đúng. Chỉ khi Lark nói
+        # không có buổi đó mới dùng danh sách của cả chuỗi.
+        recur_id = (ev.get("recurring_event_id") or "").strip()
+        atts = atts_open = None
+        for eid in (event_id, recur_id):
+            if not eid or (eid == recur_id and atts is not None):
+                continue
+            try:
+                atts = lark_api.event_attendees(access_token, cal_id, eid,
+                                                id_type="union_id")
+                atts_open = lark_api.event_attendees(access_token, cal_id, eid,
+                                                     id_type="open_id")
+            except lark_api.LarkError as exc:
+                atts = atts_open = None
+                if eid == event_id and recur_id:
+                    print(f"[meetings] {event_id}: không tra được khách mời "
+                          f"({exc}) — thử lại bằng id CHUỖI {recur_id}")
+                continue
+            break
+        if atts is None or atts_open is None:
             continue
         umap, declined = _attendee_map(atts)
         omap, _ = _attendee_map(atts_open)
@@ -470,7 +576,14 @@ def resolve_participants(access_token: str, meta: MeetingMeta) -> MeetingMeta:
         extra = [u for u in _vc_joiners(access_token, meeting_id)
                  if u not in unions] if meeting_id else []
 
-        if not (unions or opens or extra):
+        # Nhóm chat được mời -> giãn ra thành người. Chạy được cả khi
+        # `how == "title"` (không như `extra`, vốn cần `meeting_id` đã xác
+        # minh): danh sách thành viên nhóm lấy từ CHÍNH sự kiện này qua
+        # `chat_id` của nó, không phải đoán từ một cuộc họp VC khác.
+        chat_extra, invited_chats = _chat_invitees(
+            access_token, atts, skip=set(unions) | set(extra))
+
+        if not (unions or opens or extra or chat_extra):
             continue
 
         # Ghép theo `attendee_id`, KHÔNG theo thứ tự (mục 11b — đóng
@@ -490,11 +603,15 @@ def resolve_participants(access_token: str, meta: MeetingMeta) -> MeetingMeta:
             attendees += le
 
         attendees += [Attendee(union_id=u) for u in extra]
+        attendees += [Attendee(union_id=u) for u in chat_extra]
 
         meta.attendees = attendees
+        meta.invited_chats = invited_chats
         src = f"calendar[{how}]:{name}"
         if extra:
             src += f" +vc{len(extra)}"
+        if chat_extra:
+            src += f" +chat{len(chat_extra)}"
         if declined:
             src += f" -decline{declined}"
         meta.participants_source = src

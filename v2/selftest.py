@@ -280,6 +280,7 @@ def _main() -> int:
     for label, boom in (
             ("WaitingForAuth", pipeline.WaitingForAuth("chờ người tự OAuth")),
             ("MediaDenied", pipeline.MediaDenied("không ai được tải")),
+            ("SilentRecording", pipeline.SilentRecording("không có lời nói")),
             ("EmptyTranscript", pipeline.EmptyTranscript("0 từ")),
             ("TranscribeUnavailable", transcribe.TranscribeUnavailable("whisper tắt")),
             ("lỗi lạ", RuntimeError("mạng hỏng"))):
@@ -296,6 +297,8 @@ def _main() -> int:
             ("WaitingForAuth -> park, không retry nóng",
              pipeline.WaitingForAuth("chờ người tự OAuth"), "waiting_auth", 3),
             ("MediaDenied -> failed ngay", pipeline.MediaDenied("x"), "failed", 3),
+            ("SilentRecording -> discarded", pipeline.SilentRecording("x"),
+             "discarded", 3),
             # Cùng họ "không tự khỏi": chạy lại whisper trên cùng audio cho ra
             # đúng 0 từ đó. Trước 02/08/2026 nó KHÔNG được bắt riêng nên job đi
             # thẳng tới `delivered` và không ai được báo.
@@ -531,6 +534,154 @@ def _main() -> int:
     (lark_api.calendar_primary, lark_api.calendar_events,
      lark_api.event_meeting_ids, lark_api.event_attendees,
      meetings._meeting_ids_via_no) = keep6b
+
+    # -----------------------------------------------------------------
+    # NHÓM CHAT được mời thẳng trên lịch. Đường này thêm 20/08/2026 mà KHÔNG
+    # có test nào — và đo ngày 26/08 cho thấy nó chưa chạy được lần nào
+    # (0/479 job có dấu `+chat`; 0/36 người có scope `im:chat:readonly`).
+    # Nó hỏng im lặng vì `chat_members` nuốt lỗi. Các test dưới khoá lại đúng
+    # ba thứ đã trả giá.
+    keep6c = (lark_api.calendar_primary, lark_api.calendar_events,
+              lark_api.event_meeting_ids, lark_api.event_attendees,
+              lark_api.chat_members, meetings._meeting_ids_via_no)
+    lark_api.calendar_primary = lambda tok: "cal1"
+    lark_api.calendar_events = lambda tok, cal, lo, hi: [
+        {"event_id": "ev-chat", "summary": "CĐS: Training",
+         "start_time": {"timestamp": str(_t6)}}]
+    lark_api.event_meeting_ids = lambda tok, cal, ids: {}
+    meetings._meeting_ids_via_no = lambda tok, cal, ev: []
+    # Đúng hình dạng Lark trả về cho cuộc `CĐS: Training` ngày 26/08/2026:
+    # một mục `chat` + một mục `user` (chủ trì).
+    lark_api.event_attendees = lambda tok, cal, eid, id_type="union_id", **k: (
+        [{"type": "chat", "chat_id": "oc_TEAM", "display_name": "Team chat"},
+         {"type": "user", "attendee_id": "a1", "user_id": "on_CHU"}]
+        if id_type == "union_id" else
+        [{"type": "user", "attendee_id": "a1", "user_id": "ou_CHU"}])
+
+    lark_api.chat_members = lambda tok, cid, id_type="union_id", **k: [
+        {"member_id": "on_CHU"}, {"member_id": "on_X"}, {"member_id": "on_Y"}]
+    m6d = meta(minute_token="obsgCHAT00000000001", title="CĐS: Training")
+    m6d.start = _t6
+    m6d.attendees = []
+    meetings.resolve_participants("tok", m6d)
+    got6d = sorted(a.union_id for a in m6d.attendees if a.union_id)
+    check("nhóm chat được mời -> giãn ra thành người, không trùng chủ trì",
+          got6d == ["on_CHU", "on_X", "on_Y"], f"thực tế: {got6d}")
+    check("...và chat_id của nhóm được GIỮ vào meta",
+          m6d.invited_chats == ["oc_TEAM"], f"thực tế: {m6d.invited_chats}")
+    check("...nguồn ghi rõ có bao nhiêu người vào bằng đường nhóm",
+          "+chat2" in m6d.participants_source, m6d.participants_source)
+
+    # Giãn HỎNG (bot chưa vào nhóm / thiếu quyền / nhóm đã xoá) thì vẫn phải
+    # GIỮ chat_id. Hai việc khác nhau: "nhóm nào được mời" và "giãn được ai".
+    lark_api.chat_members = lambda tok, cid, id_type="union_id", **k: []
+    m6e = meta(minute_token="obsgCHAT00000000002", title="CĐS: Training")
+    m6e.start = _t6
+    m6e.attendees = []
+    meetings.resolve_participants("tok", m6e)
+    check("giãn nhóm hỏng -> vẫn nhận chủ trì, KHÔNG gãy cả cuộc họp",
+          [a.union_id for a in m6e.attendees if a.union_id] == ["on_CHU"],
+          f"thực tế: {[a.union_id for a in m6e.attendees]}")
+    check("giãn nhóm hỏng -> chat_id VẪN được giữ (dữ kiện của Lark, không mất)",
+          m6e.invited_chats == ["oc_TEAM"], f"thực tế: {m6e.invited_chats}")
+
+    # Nhóm quá đông: không giãn (đúng như cũ), nhưng chat_id vẫn giữ.
+    lark_api.chat_members = lambda tok, cid, id_type="union_id", **k: [
+        {"member_id": f"on_{i}"} for i in range(meetings.MAX_CHAT_INVITE_MEMBERS + 1)]
+    m6f = meta(minute_token="obsgCHAT00000000003", title="CĐS: Training")
+    m6f.start = _t6
+    m6f.attendees = []
+    meetings.resolve_participants("tok", m6f)
+    check("nhóm > trần thì KHÔNG giãn (không phát cho cả trăm người)",
+          [a.union_id for a in m6f.attendees if a.union_id] == ["on_CHU"],
+          f"thực tế: {len(m6f.attendees)} người")
+    check("...nhưng chat_id vẫn giữ",
+          m6f.invited_chats == ["oc_TEAM"], f"thực tế: {m6f.invited_chats}")
+    (lark_api.calendar_primary, lark_api.calendar_events,
+     lark_api.event_meeting_ids, lark_api.event_attendees,
+     lark_api.chat_members, meetings._meeting_ids_via_no) = keep6c
+
+    # -----------------------------------------------------------------
+    # SỰ KIỆN LẶP: id của MỘT BUỔI không tra được khách mời (28/08/2026).
+    # `calendar_events` trả `<id gốc>_<mốc buổi>`; gọi `event_attendees` bằng
+    # id đó -> 193001 event not found, phải dùng `recurring_event_id` (`…_0`).
+    # Trước bản vá: mọi cuộc LẶP rơi về `fallback:owner`, tức CHỈ CHỦ BẢN GHI
+    # nhận biên bản — đo trên DB thật: 94/489 job (19%) đang ở trạng thái đó.
+    keep6d = (lark_api.calendar_primary, lark_api.calendar_events,
+              lark_api.event_meeting_ids, lark_api.event_attendees,
+              meetings._meeting_ids_via_no)
+    _BASE = "bd5e66c3-0000-0000-0000-00000000_0"
+    _INST = "bd5e66c3-0000-0000-0000-00000000_1787814000"
+    lark_api.calendar_primary = lambda tok: "cal1"
+    lark_api.calendar_events = lambda tok, cal, lo, hi: [
+        {"event_id": _INST, "recurring_event_id": _BASE,
+         "summary": "Team Weekly CĐS", "start_time": {"timestamp": str(_t6)}}]
+    lark_api.event_meeting_ids = lambda tok, cal, ids: {}
+    meetings._meeting_ids_via_no = lambda tok, cal, ev: []
+    _asked: list[str] = []
+
+    def _att_recur(tok, cal, eid, id_type="union_id", **k):
+        _asked.append(eid)
+        if eid == _INST:                       # đúng như Lark thật trả về
+            raise lark_api.LarkError(193001, "event not found", "event_attendees")
+        return [{"type": "user", "attendee_id": "a1",
+                 "user_id": "on_LAP" if id_type == "union_id" else "ou_LAP"},
+                {"type": "chat", "chat_id": "oc_LAP", "display_name": "Nhóm lặp"}]
+    lark_api.event_attendees = _att_recur
+    lark_api.chat_members = lambda tok, cid, id_type="union_id", **k: []
+    m6g = meta(minute_token="obsgLAP00000000000001", title="Team Weekly CĐS")
+    m6g.start = _t6
+    m6g.attendees = []
+    meetings.resolve_participants("tok", m6g)
+    check("sự kiện LẶP: id buổi hỏng -> tự thử id CHUỖI, tra ra người dự",
+          [a.union_id for a in m6g.attendees if a.union_id] == ["on_LAP"],
+          f"thực tế: {[a.union_id for a in m6g.attendees]} "
+          f"nguồn={m6g.participants_source}")
+    check("...và KHÔNG rơi về fallback:owner nữa",
+          m6g.participants_source.startswith("calendar["),
+          m6g.participants_source)
+    check("...thử id BUỔI trước, id CHUỖI sau (buổi có thể sửa riêng khách mời)",
+          _asked[0] == _INST and _BASE in _asked, str(_asked[:3]))
+    check("...nhóm chat mời trong sự kiện lặp cũng được giữ",
+          m6g.invited_chats == ["oc_LAP"], str(m6g.invited_chats))
+    # Sự kiện KHÔNG lặp mà hỏng thì vẫn hỏng — đừng bịa ra lượt thử thứ hai.
+    _asked.clear()
+    lark_api.calendar_events = lambda tok, cal, lo, hi: [
+        {"event_id": "ev-thuong", "summary": "Team Weekly CĐS",
+         "start_time": {"timestamp": str(_t6)}}]
+    lark_api.event_attendees = lambda tok, cal, eid, id_type="union_id", **k: (
+        _asked.append(eid),
+        (_ for _ in ()).throw(lark_api.LarkError(193001, "x", "event_attendees")))[1]
+    m6h = meta(minute_token="obsgLAP00000000000002", title="Team Weekly CĐS")
+    m6h.start = _t6
+    m6h.attendees = []
+    meetings.resolve_participants("tok", m6h)
+    check("sự kiện KHÔNG lặp hỏng -> chỉ thử MỘT lần, không đoán id khác",
+          _asked == ["ev-thuong"], str(_asked))
+    (lark_api.calendar_primary, lark_api.calendar_events,
+     lark_api.event_meeting_ids, lark_api.event_attendees,
+     meetings._meeting_ids_via_no) = keep6d
+
+    # Trần giãn nhóm đọc từ config (28/08: 60 -> 80 vì nhóm `CĐS_AI &
+    # Automation_Workforce AI Team` có 71 người, vượt trần cũ nên cuộc
+    # `08-27 | Workforce AI Weekly Meeting` không giãn được ai).
+    check("trần giãn nhóm lấy từ config, không đóng cứng trong meetings.py",
+          meetings.MAX_CHAT_INVITE_MEMBERS == config.MAX_CHAT_INVITE_MEMBERS
+          and config.MAX_CHAT_INVITE_MEMBERS >= 71,
+          f"meetings={meetings.MAX_CHAT_INVITE_MEMBERS} "
+          f"config={config.MAX_CHAT_INVITE_MEMBERS}")
+
+    # `invited_chats` phải SỐNG QUA vòng lưu/đọc DB, và job cũ (479 bản ghi
+    # trước 26/08) không có khoá này thì đọc ra rỗng chứ không nổ.
+    _mm = meta(minute_token="obsgCHAT00000000004", title="x")
+    _mm.invited_chats = ["oc_A", "oc_B"]
+    check("invited_chats sống qua meta_to_json -> meta_from_json",
+          jobstore.meta_from_json(jobstore.meta_to_json(_mm)).invited_chats
+          == ["oc_A", "oc_B"])
+    check("meta CŨ không có khoá invited_chats -> đọc ra [] chứ không nổ",
+          jobstore.meta_from_json(
+              '{"minute_token": "obsgOLD000000000001", "title": "cũ"}'
+          ).invited_chats == [])
 
     keep7 = lark_api.vc_meeting_participants
     lark_api.vc_meeting_participants = lambda tok, mid, id_type="union_id": [
@@ -1039,16 +1190,9 @@ def _main() -> int:
     with db.tx() as c:
         c.execute("DELETE FROM enroll_invites")
 
-    # Người vừa OAuth nhắn lại đúng lúc gate tự kéo Queue: auth phải hoàn tất
-    # VÀ welcome phải được gửi.
-    #
-    # ĐẢO LẠI 05/08/2026 (user chốt). Bản trước ép `notify=False` ở đây để tránh
-    # "bot trả lời hai lần", nhưng đổi lấy một lỗi nặng hơn: đường này vẫn hoàn
-    # tất OAuth và ACK Queue, chỉ bỏ welcome — và KHÔNG có ai gửi bù. Ai lỡ nhắn
-    # trước khi vòng nền kịp poll thì mất hẳn danh sách 7 ngày, tức mất đúng
-    # luồng chính của sản phẩm. Hai tin lúc đó khác nội dung nên không phải trả
-    # lời trùng, và `_sleep_with_fast_enroll` kéo hộp thư mỗi 5 giây khi có người
-    # enroll dở nên welcome gần như luôn tới trước.
+    # Người vừa OAuth nhắn lại đúng lúc gate tự kéo Queue: auth phải hoàn tất,
+    # nhưng gate KHÔNG được đồng thời gửi welcome. Tin hiện tại đã đi tiếp vào
+    # agent; notify=True ở đây sẽ tạo hai câu trả lời chạy song song.
     keep_gate_poll = oauth.poll_pending
     gate_poll_notify: list[bool] = []
 
@@ -1060,8 +1204,8 @@ def _main() -> int:
     oauth.poll_pending = _gate_poll
     d = gate.check("on_AFTER_AUTH", name="Vua Auth", send=False)
     oauth.poll_pending = keep_gate_poll
-    check("gate hoàn tất auth inline và VẪN gửi welcome (không nuốt danh sách)",
-          d["decision"] == "allow" and gate_poll_notify == [True],
+    check("gate hoàn tất auth inline nhưng KHÔNG trả lời kép (notify=False)",
+          d["decision"] == "allow" and gate_poll_notify == [False],
           f"decision={d.get('decision')} notify={gate_poll_notify}")
 
     keep_transition = (config.CF_RELAY_URL, config.OAUTH_STATE_SECRET,
@@ -1236,6 +1380,45 @@ def _main() -> int:
         return rows[-1]                       # dòng nói về chia sẻ bằng link
 
     check("link đóng -> OK", judge("closed")[0] == _doc.OK)
+
+    # --- Lệch giữa plugin LIVE (ngoài repo) và plugin trong repo ------------
+    # Ca thật 19/08/2026: `install-plugin.bat` in `Access is denied` giữa lúc cài.
+    # Lần đó cả hai file vẫn sang được, nhưng nếu chỉ `plugin.yaml` sang mà
+    # `__init__.py` thì không, hệ thống sẽ báo "1.13.0" trong khi luật vẫn là luật
+    # cũ — và không ai biết. Mọi thứ NGOÀI repo mà hệ thống phụ thuộc đều phải có
+    # một phép đo, không thì nó là điểm hỏng im lặng.
+    import os as _os_lp
+    import shutil as _sh_lp
+    _repo_lp = Path(_doc.__file__).resolve().parent.parent / "hermes" / "v2-enroll-gate"
+    _keep_lad = _os_lp.environ.get("LOCALAPPDATA")
+    _tmp_lp = Path(tempfile.mkdtemp(prefix="v2plug-"))
+    try:
+        _os_lp.environ["LOCALAPPDATA"] = str(_tmp_lp)
+        # (a) chưa cài gì
+        _r1 = _doc.Report(); _doc._check_live_plugin(_r1)
+        check("doctor: plugin chưa cài -> WARN, nói rõ chạy install-plugin.bat",
+              _r1.rows[0][0] == _doc.WARN and "CHƯA được cài" in _r1.rows[0][1],
+              str(_r1.rows))
+        # (b) cài đúng bản repo
+        _live_lp = _tmp_lp / "hermes" / "plugins" / "v2-enroll-gate"
+        _live_lp.mkdir(parents=True)
+        for _n in ("__init__.py", "plugin.yaml"):
+            _sh_lp.copyfile(_repo_lp / _n, _live_lp / _n)
+        _r2 = _doc.Report(); _doc._check_live_plugin(_r2)
+        check("doctor: live khớp repo -> OK",
+              _r2.rows[0][0] == _doc.OK, str(_r2.rows))
+        # (c) đúng ca đã sợ: version mới mà CODE cũ
+        (_live_lp / "__init__.py").write_text("POLICY_VERSION = khac", encoding="utf-8")
+        _r3 = _doc.Report(); _doc._check_live_plugin(_r3)
+        check("doctor: yaml mới + code cũ -> WARN LỆCH (không im lặng)",
+              _r3.rows[0][0] == _doc.WARN and "LỆCH" in _r3.rows[0][1]
+              and "__init__.py" in _r3.rows[0][2], str(_r3.rows))
+    finally:
+        if _keep_lad is None:
+            _os_lp.environ.pop("LOCALAPPDATA", None)
+        else:
+            _os_lp.environ["LOCALAPPDATA"] = _keep_lad
+        _sh_lp.rmtree(_tmp_lp, ignore_errors=True)
     check("tenant_readable -> FAIL (bypass ACL người dự của bot)",
           judge("tenant_readable")[0] == _doc.FAIL)
     check("anyone_readable -> FAIL (ngoài công ty cũng đọc được)",
@@ -1463,7 +1646,128 @@ def _main() -> int:
     check(f"tối đa {orchestrator.BACKFILL_RECAPS_PER_ROUND} recap mỗi vòng",
           len(calls) == orchestrator.BACKFILL_RECAPS_PER_ROUND, str(len(calls)))
 
+    # (e) `held` — TRẠNG THÁI CUỐI của mô hình kéo — cũng phải được vá.
+    # Hàm này viết 02/08 khi luồng kết thúc ở `delivered`; mô hình kéo (03/08)
+    # đổi trạng thái cuối thành `held` mà không ai sửa chỗ lọc. Đo ngày
+    # 27/08/2026: 7 cuộc có transcript mà tóm tắt rỗng, TẤT CẢ đều `held`,
+    # cũ nhất từ 16/07 — đường tự vá chưa từng nhìn thấy chúng.
+    def mk_held(tok, recap_summary):
+        jobstore.create(meta(minute_token=tok, title="Hop " + tok),
+                        status="queued")
+        jobstore.set_status(
+            tok, "held", transcript_path=str(tpath), recap_fails=3,
+            transcribed_at=777888,
+            recap_json=_json.dumps({"summary": recap_summary, "decisions": [],
+                                    "action_items": []}, ensure_ascii=False))
+
+    wipe_jobs()
+    hits.clear()
+    mk_held("obsgHELDFIX0000000001", "")          # rỗng hẳn, đúng ca 26/08
+    summarize.summarize = lambda t, m: Recap(summary="Tom tat that cho held",
+                                             decisions=["chot B"])
+    orchestrator._backfill_recaps()
+    rh = jobstore.get("obsgHELDFIX0000000001")
+    check("job `held` tóm tắt rỗng -> ĐƯỢC vá (trước 27/08 bị bỏ quên)",
+          "Tom tat that cho held" in (rh["recap_json"] or ""))
+    # Cùng cái bẫy với nhánh `delivered`, nhưng cột thời gian KHÁC: trả nhầm
+    # `held` thành `delivered` là nói dối rằng đã phát cho người dự.
+    check("...và giữ nguyên `held`, KHÔNG hoá thành delivered/recapping",
+          rh["status"] == "held", rh["status"])
+    check("...giữ nguyên mốc transcribed_at", rh["transcribed_at"] == 777888)
+    check("...Base vẫn được cập nhật", hits == ["obsgHELDFIX0000000001"])
+
     summarize.summarize, _bt.update_recap = keep8
+
+    # =================================================================
+    part("25c. Băng KHÔNG CÓ TIẾNG NÓI và PROMPT VỌNG LẠI (28/08/2026)")
+    # =================================================================
+    # Hai job `failed` ngày 28/08, đo bằng ffmpeg:
+    #   Review định biên team MKT (25 phút): peak -7.1  mean -48.3
+    #   [IDI-TET] MM-01-258-13   (75 giây): peak -44.2 mean -81.9
+    # Cả hai không có tiếng nói, nhưng lưới cũ chỉ đo PEAK nên cái đầu (-7.1,
+    # "rất to") bị đánh `failed` — đòi người xử lý và chặn `doctor`.
+    check("mean thấp + whisper 0 chữ -> im lặng (bỏ job, không phiền ai)",
+          -48.3 <= pipeline._NO_SPEECH_MEAN_DB
+          and -81.9 <= pipeline._NO_SPEECH_MEAN_DB,
+          f"ngưỡng={pipeline._NO_SPEECH_MEAN_DB}")
+    check("...nhưng băng nói bình thường (-25 dB) thì KHÔNG dính ngưỡng",
+          -25.0 > pipeline._NO_SPEECH_MEAN_DB)
+    # Mean chỉ dùng để PHÂN LOẠI sau khi whisper đã câm, KHÔNG để bỏ qua whisper:
+    # cuộc 25 phút mà người ta chỉ nói 2 phút cũng có mean thấp.
+    _src_pipe = Path("v2/pipeline.py").read_text(encoding="utf-8")
+    check("mean KHÔNG được dùng để chặn trước whisper",
+          "mean_db <= _NO_SPEECH_MEAN_DB" not in
+          _src_pipe.split("t0 = time.time()")[0])
+
+    # PROMPT VỌNG: whisper chép lại `initial_prompt` khi không nghe được gì.
+    # Ca thật: 1491s audio -> 12 từ, và cả 12 nằm trong prompt.
+    _hint = ("Cuộc họp kỹ thuật bằng tiếng Việt, có xen thuật ngữ tiếng Anh: "
+             "token, backlog. Người dự: Lê Quý Thiện, Nguyễn Thùy Chi.")
+    check("12 từ trùng prompt -> nhận ra là vọng",
+          pipeline._is_prompt_echo(
+              "Cuộc họp kỹ thuật bằng tiếng Việt, có xen thuật ngữ token", _hint))
+    check("nội dung THẬT (không nằm trong prompt) -> KHÔNG bị coi là vọng",
+          not pipeline._is_prompt_echo(
+              "Chốt ngân sách quý bốn tăng hai trăm triệu cho kênh bán lẻ", _hint))
+    # Bài dài thì dù có lặp prompt cũng đã có nội dung thật xen vào — cắt cả bài
+    # là mất biên bản. Chỉ cắt khi NGẮN và gần như toàn chữ của prompt.
+    check("transcript DÀI thì không cắt, dù mở đầu có lặp prompt",
+          not pipeline._is_prompt_echo(_hint + " " + " ".join(
+              f"nội_dung_thật_{i}" for i in range(80)), _hint))
+    check("prompt rỗng -> không có gì để vọng, không chặn nhầm",
+          not pipeline._is_prompt_echo("một câu bất kỳ", ""))
+    check("transcript rỗng -> không phải vọng (đã có nhánh 0 từ lo)",
+          not pipeline._is_prompt_echo("", _hint))
+    # `_volume_db` phải trả CẢ HAI, và `_max_volume_db` cũ vẫn chạy được.
+    check("_volume_db trả (peak, mean); không đo được thì (None, None)",
+          pipeline._volume_db(Path("khong-ton-tai-xyz.wav")) == (None, None))
+
+    # =================================================================
+    part("25b. LLM trả RỖNG là HỎNG, không phải 'không có gì để tóm tắt'")
+    # =================================================================
+    # Ca thật 26/08/2026: Codex trả HTTP 400 rải rác ~50 phút, nhưng vài lượt
+    # trả *thành công* với nội dung rỗng. `_parse` dựng `Recap(summary="")`,
+    # pipeline coi là xong -> job `held`, ghi Base, thẻ "Họp xong" đi ra KHÔNG
+    # có tóm tắt cho 12 người, và `recap_fails` = 0 suốt (không lớp nào biết).
+    # Lớp bảo vệ 31/07 chỉ bắt lỗi MẠNG, bỏ lọt câu trả lời hợp lệ mà rỗng.
+    _keep_call = summarize._call_llm
+    _tr_empty = Transcript(minute_token="obsgEMPTY000000000001", lang="vi",
+                           duration=60, engine="t",
+                           segments=[Segment(start=0, end=5,
+                                             text="co noi dung that")])
+    for _label, _raw in (("JSON rỗng", '{"summary": "", "decisions": [], '
+                                       '"action_items": []}'),
+                         ("chuỗi trắng", "   ")):
+        summarize._call_llm = lambda *a, **k: _raw
+        try:
+            summarize.summarize(_tr_empty, meta(minute_token="obsgEMPTY000000000001"))
+            _threw = False
+        except summarize.RecapUnavailable:
+            _threw = True
+        check(f"LLM trả {_label} cho transcript CÓ chữ -> ném RecapUnavailable",
+              _threw)
+    # Đường tin báo KHÔNG BAO GIỜ được ném (thẻ phải gửi được kể cả khi LLM
+    # hỏng) — nhưng phải ra CÂU GIỮ CHỖ NÓI RÕ LÝ DO, không phải ô trống.
+    # Ô trống chính là thứ khiến sự cố 26/08 im lặng: nó không mang dấu vết nào
+    # của một lần hỏng, nên `_backfill_recaps` cũng không có gì để bám vào.
+    summarize._call_llm = lambda *a, **k: '{"summary": "", "decisions": []}'
+    _r = summarize.recap_from_text("nội dung minute có thật", "Hop X")
+    check("recap_from_text: LLM rỗng -> giữ chỗ có lý do, KHÔNG ném",
+          summarize.is_placeholder(_r)
+          and _r.summary.startswith(summarize.PLACEHOLDER_PREFIX), _r.summary)
+    # Nguồn RỖNG thì rỗng là đúng — đừng biến nó thành lỗi hạ tầng rồi thử lại
+    # mãi. (Bản ghi im lặng đã bị `discarded` từ trước đó.)
+    summarize._call_llm = lambda *a, **k: '{"summary": "", "decisions": []}'
+    _tr_none = Transcript(minute_token="obsgEMPTY000000000002", lang="vi",
+                          duration=1, engine="t", segments=[])
+    try:
+        summarize.summarize(_tr_none, meta(minute_token="obsgEMPTY000000000002"))
+        _threw2 = False
+    except summarize.RecapUnavailable:
+        _threw2 = True
+    check("transcript RỖNG + LLM rỗng -> KHÔNG ném (không có gì để tóm tắt thật)",
+          not _threw2)
+    summarize._call_llm = _keep_call
 
     # =================================================================
     part("26. Bot CHỈ trả lời chat 1-1, không trả lời trong group")
@@ -1496,6 +1800,224 @@ def _main() -> int:
     r = gate.check("on_chua_enroll", name="y", send=False, chat_type="group")
     check("người chưa enroll trong group -> không mời, không nhắn",
           r["decision"] == "wait" and "nonce" not in r, str(r))
+
+    # ----------------------------------------------------------------
+    # 26b. NHÓM TRONG DANH SÁCH TRẮNG (27/08/2026) — mở theo chat_id
+    # ----------------------------------------------------------------
+    # Không phá luật 02/08 mà đổi ĐƠN VỊ quyền: trong nhóm X chỉ trả lời về
+    # cuộc mà chính nhóm X được mời. Phần siết phạm vi nằm ở `qa`; đây là lớp
+    # cửa. Đo 27/08 cho thấy vì sao phải là danh sách trắng: MỘT nhóm kéo theo
+    # 41 cuộc, trong đó có `HỌP ĐỊNH KÌ THỨ 2 - ALL CÔNG TY`.
+    _keep_wl = config.GROUP_QA_CHATS
+    _keep_botid = lark_api.bot_open_id
+    # Từ 06/09/2026 trong nhóm còn phải @ đích danh bot (nhóm 26e). Các phép
+    # kiểm dưới đây nói về DANH SÁCH TRẮNG, nên luôn kèm mention hợp lệ để
+    # không lẫn hai luật vào nhau.
+    lark_api.bot_open_id = lambda: "ou_BOT"
+    config.GROUP_QA_CHATS = ("oc_CHO_PHEP",)
+    r = gate.check("on_g1", name="x", send=False, chat_type="group",
+                   chat_id="oc_CHO_PHEP", mentions="ou_BOT")
+    check("nhóm CÓ trong danh sách trắng -> cho vào",
+          r["decision"] == "allow", str(r))
+    r = gate.check("on_g1", name="x", send=False, chat_type="group",
+                   chat_id="oc_KHONG_CO")
+    check("nhóm NGOÀI danh sách trắng -> vẫn chặn",
+          r["decision"] != "allow", str(r))
+    # Thiếu chat_id mà vẫn là group -> ĐÓNG. Không biết phòng nào thì không
+    # biết được phép xem cuộc nào, và "không biết" phải là từ chối.
+    r = gate.check("on_g1", name="x", send=False, chat_type="group")
+    check("group mà THIẾU chat_id -> đóng (không đoán)",
+          r["decision"] != "allow", str(r))
+    # Khớp CHÍNH XÁC, không theo tên/tiền tố: 27/08 đo được hai nhóm trùng tên
+    # `DIGITAL TRANSFORMATION` khác thành viên nhau.
+    r = gate.check("on_g1", name="x", send=False, chat_type="group",
+                   chat_id="oc_CHO_PHEP_THEM_DUOI")
+    check("chat_id chỉ TRÙNG TIỀN TỐ -> chặn (khớp chính xác)",
+          r["decision"] != "allow", str(r))
+    # Danh sách rỗng = tắt hoàn toàn, quay về đúng hành vi trước 27/08.
+    config.GROUP_QA_CHATS = ()
+    r = gate.check("on_g1", name="x", send=False, chat_type="group",
+                   chat_id="oc_CHO_PHEP")
+    check("danh sách trắng RỖNG -> chặn mọi nhóm (mặc định an toàn)",
+          r["decision"] != "allow", str(r))
+    # Chat 1-1 KHÔNG bị ảnh hưởng bởi danh sách trắng, dù có chat_id lạ.
+    r = gate.check("on_g1", name="x", send=False, chat_type="dm",
+                   chat_id="oc_BAT_KY")
+    check("chat 1-1 không dính luật nhóm", r["decision"] == "allow", str(r))
+
+    # ----------------------------------------------------------------
+    # 26c. PHẠM VI PHÒNG — lớp quyết định an toàn của hỏi đáp trong nhóm
+    # ----------------------------------------------------------------
+    # Mở cổng (26b) mà KHÔNG có lớp này là quay đúng về lỗ mà `_refuse_group`
+    # sinh ra để chặn. Đơn vị quyền đổi từ NGƯỜI sang PHÒNG: trong nhóm X chỉ
+    # trả lời về cuộc mà chính nhóm X được mời.
+    from v2 import askers as _askers, qa as _qa
+    wipe_jobs()
+    _qa._rooms_cache = None
+    _mA = meta(minute_token="obsgROOM00000000001", title="Cuộc CỦA nhóm")
+    _mA.invited_chats = ["oc_PHONG"]
+    _mA.attendees = [Attendee(union_id="on_NGUOI_DU")]
+    jobstore.create(_mA)
+    _mB = meta(minute_token="obsgROOM00000000002", title="Cuộc RIÊNG, nhóm không được mời")
+    _mB.attendees = [Attendee(union_id="on_NGUOI_DU")]
+    jobstore.create(_mB)
+
+    idx = _qa.viewers_index()
+    trong_phong = _askers.who("on_NGUOI_DU", name="Người dự",
+                              room_chat_id="oc_PHONG")
+    check("trong nhóm: cuộc mà NHÓM được mời -> xem được",
+          _qa._may_see("obsgROOM00000000001", trong_phong, idx))
+    # Đây là phép kiểm QUAN TRỌNG NHẤT của nhóm này: chính người đó CÓ dự cuộc
+    # B, nhưng hỏi trong phòng thì không được — nếu không, nội dung B đổ ra cho
+    # cả phòng chỉ vì một người trong phòng từng dự.
+    check("trong nhóm: cuộc mình CÓ DỰ nhưng nhóm KHÔNG được mời -> KHÔNG xem",
+          not _qa._may_see("obsgROOM00000000002", trong_phong, idx))
+    ngoai_phong = _askers.who("on_NGUOI_DU", name="Người dự")
+    check("nhắn riêng: vẫn xem được cuộc mình dự (luật cũ không đổi)",
+          _qa._may_see("obsgROOM00000000002", ngoai_phong, idx))
+    # Người KHÔNG dự cuộc nào, nhưng ở trong phòng -> xem được cuộc của phòng.
+    # Đó chính là điều user muốn, và là hệ quả đã được nêu rõ trước khi chốt.
+    nguoi_la = _askers.who("on_KHONG_DU", name="Không dự",
+                           room_chat_id="oc_PHONG")
+    check("trong nhóm: người KHÔNG dự vẫn xem được cuộc của nhóm (đúng ý)",
+          _qa._may_see("obsgROOM00000000001", nguoi_la, idx))
+    check("...nhưng vẫn không xem được cuộc ngoài nhóm",
+          not _qa._may_see("obsgROOM00000000002", nguoi_la, idx))
+    # Phòng lạ (không cuộc nào mời) -> rỗng, không phải "mở hết".
+    phong_la = _askers.who("on_NGUOI_DU", name="x", room_chat_id="oc_LA")
+    check("phòng không có cuộc nào -> không xem được gì (không fail-open)",
+          not _qa._may_see("obsgROOM00000000001", phong_la, idx)
+          and not _qa._may_see("obsgROOM00000000002", phong_la, idx))
+    # `see_all` (đường terminal) KHÔNG được mở cửa phòng.
+    admin_phong = dict(_askers.admin_view())
+    admin_phong["room_chat_id"] = "oc_PHONG"
+    check("see_all KHÔNG mở cửa phòng cho cuộc ngoài nhóm",
+          not _qa._may_see("obsgROOM00000000002", admin_phong, idx))
+
+    # Vé phiên phải MANG phạm vi phòng, và vé phòng ≠ vé chat 1-1.
+    t_room = _askers.issue("on_NGUOI_DU", "ou_ND", "Người dự",
+                           room_chat_id="oc_PHONG")
+    t_dm = _askers.issue("on_NGUOI_DU", "ou_ND", "Người dự")
+    check("vé trong nhóm KHÁC vé chat 1-1 của cùng một người", t_room != t_dm,
+          f"{t_room} vs {t_dm}")
+    check("vé nhóm giải ra đúng phòng",
+          (_askers.resolve(t_room) or {}).get("room_chat_id") == "oc_PHONG")
+    check("vé chat 1-1 không mang phòng nào",
+          (_askers.resolve(t_dm) or {}).get("room_chat_id") == "")
+    _qa._rooms_cache = None
+    wipe_jobs()
+    config.GROUP_QA_CHATS = _keep_wl
+    lark_api.bot_open_id = _keep_botid
+
+    # ----------------------------------------------------------------
+    # 26e. `@All` KHÔNG được đánh thức bot (06/09/2026)
+    # ----------------------------------------------------------------
+    # Ca thật, nhóm `Digital Transformation Chat`: anh Thiện nhắn
+    # `@All ae hnay k đi họp tháng à, sao có mỗi vài người vậy ?` và BOT TRẢ
+    # LỜI — xen vào một câu hỏi dành cho người. Gốc ở adapter Hermes
+    # (`_mentions_self`: `if "@_all" in raw_content: return True`), nên
+    # `require_mention: true` không chặn gì. Sửa ở đây vì đây là lớp có test.
+    _keep_bot = lark_api.bot_open_id
+    lark_api.bot_open_id = lambda: "ou_BOT"
+    config.GROUP_QA_CHATS = ("oc_CHO_PHEP",)
+    r = gate.check("on_g1", name="x", send=False, chat_type="group",
+                   chat_id="oc_CHO_PHEP", mentions="ou_BOT")
+    check("@ đích danh bot -> cho vào", r["decision"] == "allow", str(r)[:90])
+    # `@All` không mang open_id nào nên danh sách mention rỗng.
+    r = gate.check("on_g1", name="x", send=False, chat_type="group",
+                   chat_id="oc_CHO_PHEP", mentions="")
+    check("@All (không mention ai) -> KHÔNG trả lời",
+          r["decision"] != "allow", str(r)[:90])
+    # @ người khác, không @ bot -> im. Đây là ca `@All` kèm gọi tên đồng nghiệp.
+    r = gate.check("on_g1", name="x", send=False, chat_type="group",
+                   chat_id="oc_CHO_PHEP", mentions="ou_NGUOI_KHAC")
+    check("@ người khác mà không @ bot -> KHÔNG trả lời",
+          r["decision"] != "allow", str(r)[:90])
+    r = gate.check("on_g1", name="x", send=False, chat_type="group",
+                   chat_id="oc_CHO_PHEP", mentions="ou_NGUOI_KHAC,ou_BOT")
+    check("@ cả người khác LẪN bot -> vẫn cho vào",
+          r["decision"] == "allow", str(r)[:90])
+    # FAIL-CLOSED: không lấy được id bot thì đóng, không đoán là "có gọi".
+    lark_api.bot_open_id = lambda: ""
+    r = gate.check("on_g1", name="x", send=False, chat_type="group",
+                   chat_id="oc_CHO_PHEP", mentions="ou_BOT")
+    check("không biết id bot -> ĐÓNG (không đoán bừa)",
+          r["decision"] != "allow", str(r)[:90])
+    lark_api.bot_open_id = _keep_bot
+    # Chat 1-1 KHÔNG cần mention — ở đó mọi tin đều là nói với bot.
+    r = gate.check("on_g1", name="x", send=False, chat_type="dm", mentions="")
+    check("chat 1-1 không đòi mention", r["decision"] == "allow", str(r)[:90])
+    config.GROUP_QA_CHATS = _keep_wl
+    lark_api.bot_open_id = _keep_botid
+
+    # Plugin phải LẤY HỘ open_id của người được @, vì V2 không thấy payload Lark.
+    _pl = Path("hermes/v2-enroll-gate/__init__.py").read_text(encoding="utf-8")
+    check("plugin có hàm đọc mention từ payload gốc",
+          "def _mention_ids(" in _pl and 'getattr(event, "raw_message"' in _pl)
+    check("plugin truyền mentions xuống gate",
+          "_mention_ids(event)" in _pl)
+    _b = Path("v2-gate.bat").read_text(encoding="utf-8", errors="replace")
+    check("v2-gate.bat chuyển tiếp tham số thứ 6 thành --mentions",
+          '--mentions "%~6"' in _b)
+
+    # ----------------------------------------------------------------
+    # 26d. CHƯA ENROLL: hỏi được trong nhóm, nhưng KHÔNG cầm được file
+    # ----------------------------------------------------------------
+    # User chốt 28/08 (phương án B): quyền hỏi đến từ việc Ở TRONG PHÒNG, còn
+    # nguyên văn thì vẫn phải enroll — file là toàn văn và nó rơi vào chat
+    # RIÊNG, tức ra khỏi phạm vi phòng vốn là cơ sở cấp quyền.
+    config.GROUP_QA_CHATS = ("oc_CHO_PHEP",)
+    lark_api.bot_open_id = lambda: "ou_BOT"
+    r = gate.check("on_chua_enroll_2", name="Người lạ", send=False,
+                   chat_type="group", chat_id="oc_CHO_PHEP", mentions="ou_BOT")
+    check("chưa enroll + nhóm trong danh sách trắng -> CHO VÀO (đọc)",
+          r["decision"] == "allow", str(r)[:120])
+    check("...và vẫn được cấp vé mang phòng",
+          bool(r.get("asker_token")), str(r)[:120])
+    # Chat 1-1 thì KHÔNG mở: ở đó không có phòng nào định nghĩa phạm vi, bỏ lớp
+    # enroll là mở toang mọi cuộc người đó từng dự cho một danh tính chưa xác thực.
+    r = gate.check("on_chua_enroll_2", name="Người lạ", send=False,
+                   chat_type="dm")
+    check("chưa enroll + chat 1-1 -> vẫn phải cấp quyền (không mở)",
+          r["decision"] != "allow", str(r)[:100])
+    # Nhóm NGOÀI danh sách trắng cũng không mở.
+    r = gate.check("on_chua_enroll_2", name="Người lạ", send=False,
+                   chat_type="group", chat_id="oc_NGOAI_DS")
+    check("chưa enroll + nhóm ngoài danh sách trắng -> chặn",
+          r["decision"] != "allow", str(r)[:100])
+    config.GROUP_QA_CHATS = _keep_wl
+    lark_api.bot_open_id = _keep_botid
+
+    # Đường FILE: chưa enroll thì từ chối, dù đã qua được cửa quyền của phòng.
+    from v2 import sendfile as _sf
+    wipe_jobs()
+    _qa._rooms_cache = None
+    _mF = meta(minute_token="obsgFILE00000000001", title="Cuộc của nhóm")
+    _mF.invited_chats = ["oc_PHONG"]
+    jobstore.create(_mF)
+    chua_enroll = _askers.who("on_KHONG_TOKEN", name="Chưa enroll",
+                              room_chat_id="oc_PHONG")
+    out = _sf.send_transcript(chua_enroll, "obsgFILE00000000001")
+    check("chưa enroll xin FILE -> từ chối, kèm lời mời cấp quyền",
+          "cấp quyền" in out and "nhắn riêng" in out, out[:110])
+    check("...và KHÔNG phải câu 'không thấy cuộc họp' (họ CÓ quyền đọc)",
+          "chưa tìm thấy" not in out.lower(), out[:110])
+    _qa._rooms_cache = None
+    wipe_jobs()
+
+    # Plugin KHÔNG được tự chặn tin nhóm nữa: luật nằm ở V2 (một luật, một chỗ),
+    # và plugin phải GỬI KÈM chat_id, nếu không V2 fail-closed mọi nhóm.
+    _plug_src = Path("hermes/v2-enroll-gate/__init__.py").read_text(
+        encoding="utf-8")
+    check("plugin bỏ nhánh tự chặn `chat_type != dm` (để V2 quyết)",
+          'return {"action": "skip", "reason": "v2: chi tra loi chat 1-1"}'
+          not in _plug_src)
+    check("plugin truyền chat_id xuống gate",
+          'chat_id: str = ""' in _plug_src
+          and 'getattr(source, "chat_id", "")' in _plug_src)
+    _bat = Path("v2-gate.bat").read_text(encoding="utf-8", errors="replace")
+    check("v2-gate.bat chuyển tiếp tham số thứ 5 thành --chat-id",
+          '--chat-id "%~5"' in _bat)
 
     # =================================================================
     part("27. Thử lại khi Lark chập — CHỈ cho lời gọi ĐỌC")
@@ -1793,7 +2315,16 @@ def _main() -> int:
         return "tok"
 
     tokenstore.get_access_token = _gat33
-    lark_api.minutes_list = lambda tok, s, e, oid: (seen33.append(oid), [])[1]
+    own33: list = []
+
+    def _ml33(tok, s, e, oid, **k):
+        if k.get("owner_open_id"):          # nguồn (1b), 19/08/2026
+            own33.append(k["owner_open_id"])
+            return []
+        seen33.append(oid)
+        return []
+
+    lark_api.minutes_list = _ml33
     orchestrator.scan_once()
     # Từ 04/08/2026 mỗi người được hỏi HAI lượt: lọc theo người dự (open_id) và
     # không lọc (""), xem `config.SCAN_ALL_VISIBLE`.
@@ -1801,6 +2332,11 @@ def _main() -> int:
           [x for x in seen33 if x] == ["ou_LANH"], f"đã quét: {seen33}")
     check("quét thêm lượt KHÔNG lọc người (bắt cuộc chỉ mở xem được)",
           "" in seen33 if config.SCAN_ALL_VISIBLE else True, f"đã quét: {seen33}")
+    # Lượt (1b): Lark không xếp CHỦ bản ghi vào `participant_ids` của chính bản
+    # ghi họ tạo, nên thiếu lượt này là mù với cuộc do người đã enroll làm chủ —
+    # đúng ca `Chat bot Nhân sự` 18/08.
+    check("mỗi người còn được hỏi lượt lọc theo CHỦ bản ghi",
+          own33 == ["ou_LANH"], f"đã hỏi theo chủ: {own33}")
     tokenstore.get_access_token, lark_api.minutes_list = keep33
 
     # --- Quét rộng KHÔNG được nới quyền (04/08/2026) -------------------
@@ -1814,25 +2350,36 @@ def _main() -> int:
                orchestrator.enqueue_minute)
     tokenstore.get_access_token = lambda oid: "tok"
     MINE, SEEN_ONLY = "obsgSCANMINE0000001", "obsgSCANSEEN0000001"
-    lark_api.minutes_list = (lambda tok, s, e, oid:
-                             [{"token": MINE}] if oid else
-                             [{"token": MINE}, {"token": SEEN_ONLY}])
+    OWNED_ONLY = "obsgSCANOWNED000001"      # chỉ hiện ở lượt lọc theo CHỦ
+
+    def _ml33b(tok, s, e, oid, **k):
+        if k.get("owner_open_id"):
+            return [{"token": OWNED_ONLY}]
+        if oid:
+            return [{"token": MINE}]
+        return [{"token": MINE}, {"token": SEEN_ONLY}, {"token": OWNED_ONLY}]
+
+    lark_api.minutes_list = _ml33b
     enq33: list = []
     def _enq33(oid, mt, it=None, **k):
         enq33.append(mt)
         # Chỉ MINE có metadata độc lập xác nhận đúng người; SEEN_ONLY chỉ là
-        # bản ghi mở/share và không bao giờ được cấp viewer.
+        # bản ghi mở/share và không bao giờ được cấp viewer. OWNED_ONLY thì
+        # `minutes_get.owner_id` trả về CHÍNH người đó — bằng chứng độc lập với
+        # bộ lọc, nên `_explicit_viewer` mở đúng và không cần luật mới.
         atts = ([Attendee(open_id="ou_LANH", union_id="on_LANH")]
                 if mt == MINE else [])
-        jobstore.create(meta(minute_token=mt, owner_open_id="ou_OWNER_OTHER",
+        owner = "ou_LANH" if mt == OWNED_ONLY else "ou_OWNER_OTHER"
+        jobstore.create(meta(minute_token=mt, owner_open_id=owner,
                              attendees=atts), status="queued")
         return True
 
     orchestrator.enqueue_minute = _enq33
     keep_sav = config.SCAN_ALL_VISIBLE
     config.SCAN_ALL_VISIBLE = True        # mặc định TẮT — bật để kiểm chính nó
-    db.clear_seen(MINE); db.clear_seen(SEEN_ONLY)
+    db.clear_seen(MINE); db.clear_seen(SEEN_ONLY); db.clear_seen(OWNED_ONLY)
     db.note_seen(MINE); db.note_seen(SEEN_ONLY)          # giả lập đã qua settle
+    db.note_seen(OWNED_ONLY)
     with db.tx() as c:
         c.execute("UPDATE minutes_seen SET first_seen_at=? ",
                   (int(time.time() * 1000) - 99 * 60_000,))
@@ -1847,6 +2394,10 @@ def _main() -> int:
           SEEN_ONLY not in _vw, f"viewers: {_vw}")
     check("chỉ metadata owner/attendee xác nhận thì mới ghi reader",
           MINE in _vw, f"viewers: {_vw}")
+    check("cuộc chỉ thấy qua lượt CHỦ bản ghi vẫn được nạp",
+          OWNED_ONLY in enq33, f"đã nạp: {enq33}")
+    check("...và ĐƯỢC ghi viewer, vì owner_id của Lark là bằng chứng độc lập",
+          OWNED_ONLY in _vw, f"viewers: {_vw}")
 
     # Reader của một search hit không được biến thành owner/fallback attendee
     # khi minutes_get thiếu owner tạm thời.
@@ -1872,8 +2423,209 @@ def _main() -> int:
      meetings.resolve_participants, tokenstore.list_users,
      config.FALLBACK_TO_OWNER) = keep33c
     config.SCAN_ALL_VISIBLE = keep_sav
-    check("mặc định SCAN_ALL_VISIBLE TẮT (bật là kéo cả cuộc phòng khác vào)",
-          config.SCAN_ALL_VISIBLE is False)
+    # 18/08/2026: máy này ĐANG bật cờ qua `v2/.env` theo quyết định của user (ca
+    # "Chat bot Nhân sự": Lark không xếp ai vào `participant_ids`, kể cả chủ bản
+    # ghi, nên đường lọc-theo-người mù hoàn toàn). Vì vậy thôi kiểm giá trị LIVE
+    # — đó là việc của người vận hành. Cái phải khoá là DEFAULT TRONG CODE: đừng
+    # ai lặng lẽ bật nó cho mọi máy triển khai.
+    _cfg_src = Path(config.__file__).read_text(encoding="utf-8")
+    check("code vẫn để SCAN_ALL_VISIBLE mặc định TẮT (chỉ env mới bật được)",
+          '_get_bool("V2_SCAN_ALL_VISIBLE", False)' in _cfg_src)
+    check("code để chần thẻ 'họp xong' mặc định 6h",
+          '_get_int("V2_NOTIFY_MAX_AGE_HOURS", 6)' in _cfg_src)
+
+    # --- Thẻ "họp xong" chỉ dành cho cuộc CÒN MỚI (18/08/2026) ----------
+    # Ca thật: bật `SCAN_ALL_VISIBLE` xong, vòng quét kế nạp ba bản ghi 12-13/08
+    # rồi gửi 5 thẻ "họp xong" cho cuộc đã họp gần một tuần, lúc 18:43 tối.
+    # `scan_once` chỉ có raw item nên không biết tuổi cuộc họp; chần phải nằm
+    # trong `enqueue_minute` — chỗ duy nhất đã có `meta.start` thật.
+    wipe_jobs()
+    keep_age = (tokenstore.get_access_token, meetings.build_meta,
+                meetings.resolve_participants, orchestrator._notify_minute,
+                config.NOTIFY_MAX_AGE_HOURS)
+    notified: list = []
+    tokenstore.get_access_token = lambda oid: "tok"
+    meetings.resolve_participants = lambda tok, m: m
+    orchestrator._notify_minute = lambda m: notified.append(m.minute_token)
+
+    def _age_meta(ago_h):
+        return lambda tok, mt, raw=None: meta(
+            minute_token=mt,
+            start=None if ago_h is None else time.time() - ago_h * 3600,
+            attendees=[Attendee(open_id="ou_LANH", union_id="on_LANH")])
+
+    config.NOTIFY_MAX_AGE_HOURS = 6
+    OLD_M, NEW_M = "obsgAGEOLD000000001", "obsgAGENEW000000001"
+    meetings.build_meta = _age_meta(30)
+    check("cuộc họp 30h trước VẪN được nạp (còn phiên âm, chỉ thôi báo)",
+          orchestrator.enqueue_minute("ou_LANH", OLD_M, {"token": OLD_M}))
+    check("...và KHÔNG gửi thẻ 'họp xong' cho cuộc tuần trước",
+          OLD_M not in notified, f"đã báo: {notified}")
+    meetings.build_meta = _age_meta(0.5)
+    check("cuộc vừa xong 30 phút thì VẪN báo bình thường",
+          orchestrator.enqueue_minute("ou_LANH", NEW_M, {"token": NEW_M})
+          and NEW_M in notified, f"đã báo: {notified}")
+    # Không tra được giờ họp thì đừng đoán: im lặng bỏ báo là mất thẻ cuộc thật.
+    NOSTART_M = "obsgAGENOSTART00001"
+    meetings.build_meta = _age_meta(None)
+    check("thiếu giờ họp thì VẪN báo (fail-open, khỏi mất thẻ cuộc thật)",
+          orchestrator.enqueue_minute("ou_LANH", NOSTART_M,
+                                      {"token": NOSTART_M})
+          and NOSTART_M in notified, f"đã báo: {notified}")
+    # Phải còn đường về hành vi cũ mà không sửa code.
+    config.NOTIFY_MAX_AGE_HOURS = 0
+    OFF_M = "obsgAGEOFF000000001"
+    meetings.build_meta = _age_meta(30)
+    check("NOTIFY_MAX_AGE_HOURS<=0 thì thôi chần (đường về hành vi cũ)",
+          orchestrator.enqueue_minute("ou_LANH", OFF_M, {"token": OFF_M})
+          and OFF_M in notified, f"đã báo: {notified}")
+    # notify=False của đường enroll vẫn phải thắng, đừng để chần làm lộ backlog.
+    config.NOTIFY_MAX_AGE_HOURS = 6
+    BL_M = "obsgAGEBACKLOG00001"
+    meetings.build_meta = _age_meta(0.2)
+    check("notify=False vẫn im dù cuộc còn mới (backlog lúc enroll)",
+          orchestrator.enqueue_minute("ou_LANH", BL_M, {"token": BL_M},
+                                      notify=False)
+          and BL_M not in notified, f"đã báo: {notified}")
+    (tokenstore.get_access_token, meetings.build_meta,
+     meetings.resolve_participants, orchestrator._notify_minute,
+     config.NOTIFY_MAX_AGE_HOURS) = keep_age
+
+    # --- Lark bóp tần suất KHÔNG được biến job đáng-park thành failed --------
+    # Ca thật 18/08/2026: job `08-17 | HỌP ĐỊNH KÌ THỨ 2` (56 người), chủ bản ghi
+    # CHƯA enroll -> kết luận đúng là `WaitingForAuth`. Nhưng một ứng viên vấp
+    # 99991400, cú đó vào giỏ `other`, `denied and not other` thành sai, hàm ném
+    # PipelineError thường -> đốt 5 lần thử -> `failed` vĩnh viễn, kèm câu lỗi
+    # không ai đọc ra được là "chỉ cần chủ bản ghi cấp quyền".
+    keep_rl = (tokenstore.get_access_token, lark_api.minutes_media_url,
+               db.viewers_of, lark_api.download_to,
+               config.MEDIA_THROTTLE_BACKOFF_S)
+    db.viewers_of = lambda mt: []
+    config.MEDIA_THROTTLE_BACKOFF_S = 0        # khỏi bắt test ngồi nghỉ thật
+    OWNER_NO_TOK, DENY_OID, THROTTLE_OID = "ou_CHUA_ENROLL", "ou_DENIED", "ou_BOP"
+
+    def _tok_rl(oid):
+        if oid == OWNER_NO_TOK:
+            raise tokenstore.TokenError("chưa enroll")
+        return "tok"
+
+    def _media_rl(tok, mt):
+        raise lark_api.LarkError(pipeline._CODE_RATE_LIMIT,
+                                 "request trigger frequency limit")
+
+    meta_rl = meta(minute_token="obsgRATELIMIT000001",
+                   owner_open_id=OWNER_NO_TOK, owner_name="Chu Chua Enroll",
+                   attendees=[Attendee(open_id=DENY_OID, union_id="on_D"),
+                              Attendee(open_id=THROTTLE_OID, union_id="on_B")])
+    tokenstore.get_access_token = _tok_rl
+
+    # (a) mọi ứng viên có token đều bị bóp -> RateLimited, KHÔNG phải kết luận quyền
+    lark_api.minutes_media_url = _media_rl
+    _rl_exc = None
+    try:
+        pipeline.download_recording(meta_rl)
+    except Exception as exc:                          # noqa: BLE001
+        _rl_exc = exc
+    check("bị bóp tần suất -> RateLimited (không kết luận quyền)",
+          isinstance(_rl_exc, pipeline.RateLimited), repr(_rl_exc))
+    check("...và KHÔNG phải MediaDenied (đánh failed ngay là bịa)",
+          not isinstance(_rl_exc, pipeline.MediaDenied), repr(_rl_exc))
+
+    # (b) lẫn cả denied + bóp: vẫn RateLimited, vì người bị bóp chưa được hỏi
+    def _media_mix(tok, mt):
+        # Không biết oid ở đây; dùng biến đếm để người ĐẦU bị từ chối, người sau bị bóp.
+        _media_mix.n += 1
+        raise lark_api.LarkError(
+            pipeline._CODE_MEDIA_DENY if _media_mix.n == 1
+            else pipeline._CODE_RATE_LIMIT, "x")
+    _media_mix.n = 0
+    lark_api.minutes_media_url = _media_mix
+    _mix_exc = None
+    try:
+        pipeline.download_recording(meta_rl)
+    except Exception as exc:                          # noqa: BLE001
+        _mix_exc = exc
+    check("một người bị từ chối + một người bị bóp -> vẫn RateLimited",
+          isinstance(_mix_exc, pipeline.RateLimited), repr(_mix_exc))
+
+    # (c) hết bóp thì mới được kết luận: chủ chưa enroll -> WaitingForAuth (park)
+    lark_api.minutes_media_url = (
+        lambda tok, mt: (_ for _ in ()).throw(
+            lark_api.LarkError(pipeline._CODE_MEDIA_DENY, "no permission")))
+    _wa_exc = None
+    try:
+        pipeline.download_recording(meta_rl)
+    except Exception as exc:                          # noqa: BLE001
+        _wa_exc = exc
+    check("hết bóp, chủ bản ghi chưa enroll -> WaitingForAuth (park, chờ họ cấp quyền)",
+          isinstance(_wa_exc, pipeline.WaitingForAuth), repr(_wa_exc))
+
+    # (d) Lượt hai là cái cứu job khỏi nằm `queued` vô hạn: cú bóp không tự khỏi
+    # ở vòng quét sau (đo trên job 56 người), nên phải hỏi lại ngay trong lượt.
+    _wf_keep = config.WORK_DIR
+    config.WORK_DIR = Path(tempfile.mkdtemp(prefix="v2dl-"))
+    try:
+        def _media_2nd(tok, mt):
+            _media_2nd.n += 1
+            if _media_2nd.n <= 2:      # cả hai ứng viên đều bị bóp lượt đầu
+                raise lark_api.LarkError(pipeline._CODE_RATE_LIMIT, "bop")
+            return "https://x/media.mp4"
+        _media_2nd.n = 0
+        lark_api.minutes_media_url = _media_2nd
+        lark_api.download_to = (lambda url, dest, token=None:
+                                (dest.write_bytes(b"mp4"), 3)[1])
+        _got = pipeline.download_recording(meta_rl)
+        check("bị bóp lượt đầu nhưng lượt hai tải được -> KHÔNG ném lỗi",
+              _got[0].name.endswith(".mp4") and _got[1] in (DENY_OID,
+                                                            THROTTLE_OID),
+              str(_got))
+        check("...và có hỏi lại đúng người bị bóp (gọi thêm lượt hai)",
+              _media_2nd.n >= 3, f"số lần gọi: {_media_2nd.n}")
+    finally:
+        _shutil2 = __import__("shutil")
+        _shutil2.rmtree(config.WORK_DIR, ignore_errors=True)
+        config.WORK_DIR = _wf_keep
+    (tokenstore.get_access_token, lark_api.minutes_media_url,
+     db.viewers_of, lark_api.download_to,
+     config.MEDIA_THROTTLE_BACKOFF_S) = keep_rl
+    check("code để nhịp nghỉ khi bị bóp mặc định 5s",
+          '_get_int("V2_MEDIA_THROTTLE_BACKOFF_S", 5)'
+          in Path(config.__file__).read_text(encoding="utf-8"))
+
+    # --- Lá chắn work/ phải hỏi STATUS JOB, không phải đếm file --------------
+    # Ca thật: file 238 MB đọng từ 13/08 của một job đã `held` làm `restart-v2.ps1`
+    # tự huỷ MỌI lần restart trong 5 ngày — bản vá nào cũng không vào được máy.
+    wipe_jobs()
+    import shutil as _shutil            # `shutil` không có ở scope này
+    _wf_dir = config.WORK_DIR
+    config.WORK_DIR = Path(tempfile.mkdtemp(prefix="v2wf-"))
+    try:
+        BUSY_T, STALE_T, ORPHAN_T = ("obsgWFBUSY000000001",
+                                     "obsgWFSTALE00000001",
+                                     "obsgWFORPHAN0000001")
+        jobstore.create(meta(minute_token=BUSY_T), status="transcribing")
+        jobstore.create(meta(minute_token=STALE_T), status="held")
+        for t in (BUSY_T, STALE_T, ORPHAN_T):
+            (config.WORK_DIR / f"{t}.mp4").write_bytes(b"x")
+        _wf = {r["name"]: r for r in pipeline.work_files()}
+        check("file của job đang phiên âm = ĐANG DÙNG (đừng restart đè)",
+              _wf[f"{BUSY_T}.mp4"]["busy"] is True, str(_wf))
+        check("file của job đã held = RÁC (không được chặn restart)",
+              _wf[f"{STALE_T}.mp4"]["busy"] is False, str(_wf))
+        check("file không còn job nào = RÁC",
+              _wf[f"{ORPHAN_T}.mp4"]["busy"] is False, str(_wf))
+        # `queued` cũng phải tính là đang dùng: `download_recording` tải xong mới
+        # đặt `transcribing`, nên có cửa sổ file đã nằm đó mà status còn `queued`.
+        jobstore.set_status(BUSY_T, "queued")
+        check("status còn queued mà đã có file = VẪN đang dùng (cửa sổ lúc tải)",
+              {r["name"]: r for r in pipeline.work_files()}[f"{BUSY_T}.mp4"]["busy"],
+              "queued phải nằm trong WORK_BUSY_STATUSES")
+        check("work/ trống thì không có gì để phân loại",
+              (lambda: [f.unlink() for f in config.WORK_DIR.iterdir()]
+               and pipeline.work_files() == [])())
+    finally:
+        _shutil.rmtree(config.WORK_DIR, ignore_errors=True)
+        config.WORK_DIR = _wf_dir
 
     # --- `unauth`: xoá quyền để diễn lại luồng người mới ----------------
     # Khác `revoke` (giữ dòng tokens với status='revoked' làm dấu vết): `unauth`
@@ -1921,10 +2673,10 @@ def _main() -> int:
     import inspect as _inspect
     _src = _inspect.getsource(orchestrator.run).splitlines()
     _i_poll = next(i for i, l in enumerate(_src) if "oauth.poll_pending()" in l)
-    _i_scan = next(i for i, l in enumerate(_src) if "scan_once()" in l)
+    _i_scan = next(i for i, l in enumerate(_src) if "_scan_cycle()" in l)
     check("hộp thư enroll và vòng quét KHÔNG chung một khối try",
           "except" in "\n".join(_src[_i_poll:_i_scan]),
-          "poll_pending hỏng sẽ kéo theo scan_once + process_queue")
+          "poll_pending hỏng sẽ kéo theo scan cycle + process_queue")
 
     # =================================================================
     part("32. Gửi hỏng MỘT PHẦN phải được gửi bù, và chỉ cho đúng người")
@@ -2186,6 +2938,48 @@ def _main() -> int:
         "mtTEMPTY", [(0.0, "   ")]))
     # mtTNONE: cố ý KHÔNG có transcript_path (job mới, chưa phiên âm xong)
 
+    # --- HAI NGUỒN: mặc định Lark, `source="hapas"` thì phải ra bản Hapas -----
+    # Ca thật 19/08/2026 07:45: user hỏi "phân tích qua bản dịch từ server của
+    # Hapas", bot đáp "chưa thể phân tích trực tiếp từ bản Hapas". Bot nói ĐÚNG —
+    # thứ tự nguồn bị đóng cứng và không có tham số nào chọn nguồn, nên bản Hapas
+    # chỉ ra ngoài được dưới dạng file Word mà agent không đọc nổi.
+    from v2 import larktext as _lt36
+    jobstore.create(meta(minute_token="mtTBOTH", title="Hop hai ban",
+                         owner_open_id="ou_A",
+                         attendees=[Attendee(open_id="ou_A", union_id="on_A")]),
+                    status="delivered")
+    jobstore.set_status("mtTBOTH", "delivered", transcript_path=_mk_transcript(
+        "mtTBOTH", [(0.0, "CAU CUA BAN HAPAS")]))
+    _lt36.path_of("mtTBOTH").write_text("CAU CUA BAN LARK", encoding="utf-8")
+
+    _both_default = qa.get_transcript(wA, "mtTBOTH")
+    check("mặc định VẪN là bản Lark khi có cả hai (quyết định 10/08 giữ nguyên)",
+          "CAU CUA BAN LARK" in _both_default
+          and "CAU CUA BAN HAPAS" not in _both_default, _both_default[:200])
+    _both_hapas = qa.get_transcript(wA, "mtTBOTH", source="hapas")
+    check("source='hapas' -> ra ĐÚNG bản Hapas, không lặng lẽ trả bản Lark",
+          "CAU CUA BAN HAPAS" in _both_hapas
+          and "CAU CUA BAN LARK" not in _both_hapas, _both_hapas[:200])
+    check("...và gọi đúng tên nguồn để agent khỏi nói 'faster-whisper' ra chat",
+          "bản dịch từ server của Hapas" in _both_hapas, _both_hapas[:300])
+    check("source lạ -> fail-soft về mặc định, không từ chối câu hỏi",
+          "CAU CUA BAN LARK" in qa.get_transcript(wA, "mtTBOTH", source="xyz"))
+    # Chỉ định Hapas mà chưa có file thì phải nói TÌNH TRẠNG, tuyệt đối không
+    # rơi về Lark — rơi về là trả lời câu KHÁC câu được hỏi.
+    # Token RIÊNG: đừng ghi bản Lark vào `mtTNONE` — nó đang giữ ca "chưa có bản
+    # nào" cho phép kiểm bên dưới, và ghi vào là làm ca đó đo nhầm thứ khác.
+    jobstore.create(meta(minute_token="mtTLARKONLY", title="Chi co ban Lark",
+                         owner_open_id="ou_A",
+                         attendees=[Attendee(open_id="ou_A", union_id="on_A")]),
+                    status="delivered")
+    _lt36.path_of("mtTLARKONLY").write_text("BAN LARK CO SAN", encoding="utf-8")
+    _none_hapas = qa.get_transcript(wA, "mtTLARKONLY", source="hapas")
+    check("xin Hapas mà chưa có -> nói tình trạng, KHÔNG tráo bản Lark vào",
+          "chưa có bản dịch từ server của Hapas" in _none_hapas
+          and "BAN LARK CO SAN" not in _none_hapas, _none_hapas[:200])
+    check("source='hapas' KHÔNG được lách ACL (dùng chung _may_see)",
+          "BI MAT" not in qa.get_transcript(wA, "mtTB", source="hapas"))
+
     _outA = qa.get_transcript(wA, "mtTA")
     check("người CÓ dự đọc được nguyên văn",
           "cau mot cua A" in _outA and "cau hai cua A" in _outA)
@@ -2193,8 +2987,12 @@ def _main() -> int:
           "[00:00]" in _outA and "[01:05]" in _outA, _outA[:200])
     _outAB = qa.get_transcript(wA, "mtTB")
     check("người KHÔNG dự bị chặn, và KHÔNG lộ một chữ nào của nguyên văn",
-          "BI MAT" not in _outAB and "không có trong danh sách người dự" in _outAB,
+          "BI MAT" not in _outAB and "trong các cuộc họp bạn có quyền xem" in _outAB,
           _outAB[:200])
+    check("câu chặn là thành phẩm: không thể nối Workforce/quản trị từ ký ức cũ",
+          _outAB.startswith(qa.SEND_MARK)
+          and "Workforce" not in _outAB and "quản trị" not in _outAB,
+          _outAB[:240])
     check("who=None -> get_transcript từ chối",
           qa.get_transcript(None, "mtTA") == qa.NO_ASKER)
     # ĐỔI 04/08/2026: nguyên văn là chỗ rò nặng nhất — admin qua BOT không còn
@@ -2204,12 +3002,16 @@ def _main() -> int:
           "BI MAT" not in qa.get_transcript(wAd, "mtTB"))
     check("đường terminal vẫn đọc được nguyên văn cuộc bất kỳ",
           "BI MAT" in qa.get_transcript(askers.admin_view(), "mtTB"))
+    _out_empty = qa.get_transcript(wA, "mtTEMPTY")
     check("transcript RỖNG nói rõ là rỗng, không nói 'không có cuộc họp'",
-          "KHÔNG có chữ nào" in qa.get_transcript(wA, "mtTEMPTY"))
+          "chưa có nội dung" in _out_empty
+          and "chưa tìm thấy" not in _out_empty,
+          _out_empty[:200])
     check("job chưa phiên âm xong -> nói tình trạng, KHÔNG bịa nội dung",
-          "chưa có nguyên văn" in qa.get_transcript(wA, "mtTNONE"))
+          "chưa có bản dịch từ server của Hapas"
+          in qa.get_transcript(wA, "mtTNONE"))
     check("không khớp cuộc nào -> chỉ đường lấy minute_token",
-          "Không tìm thấy" in qa.get_transcript(wA, "khongcogi"))
+          "chưa tìm thấy" in qa.get_transcript(wA, "khongcogi"))
 
     # Cắt phần: một transcript dài phải ra nhiều phần, và phần CUỐI không được
     # mời gọi đọc tiếp — agent tin lời đó rồi gọi part=n+1 là một vòng vô ích.
@@ -2243,6 +3045,28 @@ def _main() -> int:
           all("asker_token" in (t["inputSchema"]["required"] or [])
               for t in mcp_server.public_tools()),
           str(sorted(_tnames)))
+    _gt36 = [t for t in mcp_server.public_tools()
+             if t["name"] == "get_transcript"][0]
+    check("schema get_transcript khai báo `source` với đúng hai giá trị",
+          _gt36["inputSchema"]["properties"]["source"]["enum"] == ["lark",
+                                                                  "hapas"],
+          str(_gt36["inputSchema"]["properties"].get("source")))
+    check("mô tả tool dạy khi nào dùng source=hapas và luật một-nguồn-một-lượt",
+          "hapas" in _gt36["description"]
+          and "MỘT NGUỒN MỘT LƯỢT" in _gt36["description"])
+    # Khai báo mà không truyền xuống thì schema chỉ là lời hứa: đo bằng cách bắt
+    # `qa.get_transcript` ghi lại tham số nó thực sự nhận.
+    _keep_gt = qa.get_transcript
+    _got_src: list = []
+    qa.get_transcript = lambda who, q, **k: _got_src.append(k.get("source")) or ""
+    try:
+        mcp_server._tool_get_transcript({"asker_token": "on_A", "query": "mtTA",
+                                         "source": "hapas"})
+    finally:
+        qa.get_transcript = _keep_gt
+    check("_tool_get_transcript TRUYỀN source xuống qa (không rơi dọc đường)",
+          _got_src == ["hapas"], str(_got_src))
+
     check("public_tools không để lọt `_fn` ra ngoài dây",
           all(not any(k.startswith("_") for k in t)
               for t in mcp_server.public_tools()))
@@ -2361,6 +3185,11 @@ def _main() -> int:
     # Nên phép kiểm nặng nhất là: sai điều kiện thì KHÔNG có lời gọi API nào.
     from v2 import sendfile as _sf
     wipe_jobs()
+    # Nhóm test 32 xoá sạch `tokens`, mà từ 28/08/2026 `send_transcript` từ chối
+    # người CHƯA ENROLL (quyền hỏi trong nhóm không đủ để cầm nguyên văn — xem
+    # `sendfile` mục 2b). Nhóm này kiểm hành vi GỬI, không kiểm enroll, nên cấp
+    # lại danh tính cho `on_A`; ca chưa-enroll có test riêng ở nhóm 26d.
+    add_user("ou_A", "on_A", "An")
     with db.tx() as c:
         c.execute("DELETE FROM deliveries")
     for _tok, _att, _owner in (
@@ -2401,17 +3230,20 @@ def _main() -> int:
     check("người KHÔNG dự: KHÔNG gọi API lần nào",
           len(_sent38) == _n_before, str(_sent38))
     check("và câu từ chối không lộ nội dung",
-          "BI MAT" not in _rb and "không có trong danh sách người dự" in _rb)
+          "BI MAT" not in _rb and "trong các cuộc họp bạn có quyền xem" in _rb
+          and "quản trị" not in _rb)
     check("who=None -> từ chối, không gửi",
           _sf.send_transcript(None, "mtSA") == qa.NO_ASKER
           and len(_sent38) == _n_before)
     check("minute_token rỗng -> từ chối",
-          _sf.send_transcript(wA, "") == _sf.NO_MEETING)
+          "trong các cuộc họp bạn có quyền xem" in
+          _sf.send_transcript(wA, ""))
     check("cuộc họp không có thật -> từ chối, không gửi",
-          _sf.send_transcript(wA, "mtKHONGCO") == _sf.NO_MEETING
+          "trong các cuộc họp bạn có quyền xem" in
+          _sf.send_transcript(wA, "mtKHONGCO")
           and len(_sent38) == _n_before)
     check("transcript rỗng -> KHÔNG gửi file mở ra trắng",
-          "KHÔNG có chữ nào" in _sf.send_transcript(wA, "mtSEMPTY")
+          "chưa có nội dung" in _sf.send_transcript(wA, "mtSEMPTY")
           and len(_sent38) == _n_before)
     # `admin_view()` là cửa sau cho người ngồi trước máy (`v2 ask` không có
     # --as): nó KHÔNG có union_id/open_id nào. Đừng nhầm với `who("on_ADMIN",…)`
@@ -2473,6 +3305,8 @@ def _main() -> int:
 
     check("send_transcript_file có trong tools/list",
           "send_transcript_file" in {t["name"] for t in mcp_server.public_tools()})
+    check("latest_meeting có trong tools/list để backend chọn cuộc mới nhất",
+          "latest_meeting" in {t["name"] for t in mcp_server.public_tools()})
     check("`.docx` -> file_type 'doc' ở MỘT chỗ duy nhất (lark_api.FILE_TYPES)",
           lark_api.FILE_TYPES.get(".docx") == "doc"
           and "FILE_TYPES" in _inspect.getsource(lark_api.im_send_file),
@@ -2630,8 +3464,10 @@ def _main() -> int:
     check("tên KHÔNG có thật -> báo KHÔNG TRA RA, và cấm agent diễn giải thành "
           "'không xuất được file'",
           sendfile._resolve_token(_w, "cuộc họp không tồn tại")[0] == ""
-          and "KHÔNG TRA RA" in sendfile.NO_MEETING
-          and "ĐỪNG nói" in sendfile.NO_MEETING)
+          and "trong các cuộc họp bạn có quyền xem" in
+          sendfile._resolve_token(_w, "cuộc họp không tồn tại")[1]
+          and "quản trị" not in
+          sendfile._resolve_token(_w, "cuộc họp không tồn tại")[1])
     check("giữ dấu tiếng Việt khi so ('CDS' KHÔNG khớp 'CĐS')",
           sendfile._resolve_token(_w, "CDS flow backlog")[0] == "")
 
@@ -2667,7 +3503,7 @@ def _main() -> int:
     # Tra tên KHÔNG được nới quyền: giải xong vẫn phải qua `qa._may_see`.
     _msg_name = sendfile.send_transcript(_w, "cđs flow backlog")
     check("tra được tên nhưng KHÔNG dự -> vẫn chặn ở cửa quyền như cũ",
-          "không có trong danh sách người dự" in _msg_name, _msg_name[:80])
+          "trong các cuộc họp bạn có quyền xem" in _msg_name, _msg_name[:120])
     # Trùng tên: chỉ nêu cuộc mà chính người đó được xem, và đòi minute_token.
     _name_att = [Attendee(open_id="ou_X", union_id="on_X")]
     jobstore.update_meta("obsgNAME00000000001",
@@ -2729,9 +3565,14 @@ def _main() -> int:
     _line = qa.fmt_pending(_held_row)
     check("held trong pending -> KHÔNG lộ 'Base'/'held' cho người dùng",
           "Base" not in _line and "held" not in _line, _line)
-    check("held trong pending -> 'chưa tạo xong', không 'CHƯA CÓ BIÊN BẢN'",
-          "CHƯA TẠO XONG BIÊN BẢN" in _line and "CHƯA CÓ BIÊN BẢN" not in _line,
-          _line)
+    # Chữ "biên bản" bỏ khỏi nhãn tình trạng 10/08/2026 (anh Thiện: "đã có biên
+    # bản => dễ bị hiểu nhầm"): ở đây "biên bản" là BẢN TÓM TẮT, nhưng người đọc
+    # hiểu thành "server đã xử lý xong cuộc này". Nói thẳng "bản tóm tắt".
+    check("held trong pending -> 'chưa dựng xong', không 'CHƯA CÓ...'",
+          "CHƯA DỰNG XONG BẢN TÓM TẮT" in _line
+          and "CHƯA CÓ BẢN TÓM TẮT" not in _line, _line)
+    check("...và không còn dùng chữ 'biên bản' cho tình trạng xử lý",
+          "BIÊN BẢN" not in _line, _line)
 
     # (i) delivery_status(held) -> nhãn RIÊNG, KHÔNG nhầm 'chưa ai cấp quyền'
     #     (sửa 03/08/2026): held có 0 dòng recap-delivery nên nhánh đếm cũ gán
@@ -3143,27 +3984,152 @@ def _main() -> int:
     check("NO_ASKER: dòng '[Cho agent...]' không còn nằm trong phần người dùng",
           "asker_token" not in qa.NO_ASKER.split(_int)[0])
 
-    # Tổng số phải là PHÉP TÍNH, không phải câu chữ do LLM đếm lại.
-    _done = [{qa.bitable.F_TITLE: f"Cuộc {i}", qa.bitable.F_WHEN: f"2026-08-0{i} 09:00:00",
-              qa.bitable.F_TOKEN: f"mt{i}", qa.bitable.F_LINK: ""} for i in (1, 2, 3)]
-    _pend = [{"title": "Cuộc chờ", "when": "2026-08-04 09:00:00", "status": "held",
-              "tinh_trang": "chưa xong", "minute_token": "mtP", "link": "", "error": ""}]
-    _out = qa._render_list(_done, _pend)
-    # Chuỗi có markdown từ 05/08/2026: danh sách đi bằng thẻ `lark_md` nên in
-    # đậm được. Đo cả dấu ** để không ai lỡ tay gỡ mất định dạng.
-    check("danh sách: tổng số = đã có + chưa có (3+1=4)",
-          "Bạn có **4 cuộc họp**:" in _out)
-    check("danh sách: đánh số chạy LIÊN TỤC sang khối chưa có biên bản",
-          "4. 04/08/2026 09:00 · Cuộc chờ" in _out)
-    check("danh sách: hai khối đều ghi rõ số của mình",
-          "**ĐÃ CÓ BIÊN BẢN (3)**" in _out
-          and "**CHƯA CÓ BIÊN BẢN (1)**" in _out)
-    check("danh sách: TÊN cuộc họp được in đậm để dễ quét mắt",
-          "**Cuộc 3**" in _out, _out[:120])
-    # Bỏ 04/08/2026 theo yêu cầu user: câu "Còn N cuộc họp khác..." khong con
-    # duoc gan vao cuoi. Khoa lai de khong ai vo tinh dat lai.
-    check("danh sách: KHÔNG còn câu đếm cuộc họp của người khác",
-          "cuộc họp khác" not in _out and "không thấy ở đây" not in _out)
+    # =================================================================
+    #  PHÂN LOẠI THEO NGUỒN BẢN DỊCH — trục chính của danh sách
+    # =================================================================
+    # Anh Thiện 10/08/2026, sau khi đọc danh sách thật: "đã có biên bản => dễ bị
+    # hiểu nhầm nhé", "ví dụ 11 biên bản kia server xử lý rồi", "phân biệt: bản
+    # dịch từ Lark / bản dịch từ server của Hapas (chất lượng hơn)", "bám cái này
+    # mà build luồng hệ thống".
+    #
+    # Nhóm cũ chia theo "có record Base hay chưa" — một sự thật SỔ SÁCH nội bộ.
+    # Người đọc hiểu thành "server xử lý xong bao nhiêu cuộc", tức hiểu sai hẳn.
+    # Trục đúng là NGUỒN, và nó phải đọc từ DB chứ không đoán.
+    _J = dict(minute_token="mtX", meta_json="{}", status="held",
+              transcript_path="", lark_chars=0, lark_tried_at=0)
+    _src_hapas = _tdir / "source-hapas.json"
+    _src_hapas.write_text("{}", encoding="utf-8")
+    check("DB có đường dẫn + file thật -> nguồn là server Hapas",
+          qa.source_of(dict(_J, transcript_path=str(_src_hapas)))[0]
+          == qa.SRC_HAPAS)
+    check("DB có đường dẫn nhưng file không tồn tại -> KHÔNG quảng cáo Hapas",
+          qa.source_of(dict(_J, transcript_path=str(_tdir / "missing.json")))[0]
+          != qa.SRC_HAPAS)
+    check("chưa có whisper nhưng ĐÃ ĐỌC ĐƯỢC bản Lark -> nguồn là Lark",
+          qa.source_of(dict(_J, lark_chars=1200))[0] == qa.SRC_LARK)
+    check("có CẢ HAI -> vẫn tính là server Hapas (bản tốt hơn)",
+          qa.source_of(dict(_J, transcript_path=str(_src_hapas),
+                            lark_chars=1200))[0] == qa.SRC_HAPAS)
+    # Cái bẫy: thử đọc rồi KHÔNG được (quyền đọc bản chép thuộc CHỦ bản ghi).
+    # Xếp vào nhóm "có bản Lark" là hứa một thứ mình lấy không được.
+    _tried = qa.source_of(dict(_J, lark_tried_at=1, status="queued"),
+                          has_link=True)
+    check("thử đọc bản Lark mà không được -> KHÔNG hứa là có",
+          _tried[0] == qa.SRC_NONE and "quyền" in _tried[1], _tried)
+    # Cùng cái bẫy, dạng nguy hiểm hơn vì cuộc nào cũng có link Minutes.
+    _wa = qa.source_of(dict(_J, status="waiting_auth"), has_link=True)
+    check("waiting_auth (chủ bản ghi chưa cấp quyền) -> CHƯA CÓ BẢN NÀO",
+          _wa[0] == qa.SRC_NONE, _wa)
+    check("...và nói đúng tình trạng, không nói trống không",
+          "xác thực" in _wa[1] or "quyền" in _wa[1], _wa[1])
+    check("đang xếp hàng dịch + có link -> Lark đọc được (hệ thống có vé)",
+          qa.source_of(dict(_J, status="queued"), has_link=True)[0]
+          == qa.SRC_LARK)
+    check("job hỏng -> CHƯA CÓ BẢN NÀO, kèm lý do",
+          qa.source_of(dict(_J, status="failed"), has_link=True)[0]
+          == qa.SRC_NONE)
+    check("không có job nào -> không nổ, trả CHƯA CÓ BẢN NÀO",
+          qa.source_of(None)[0] == qa.SRC_NONE)
+
+    # --- Danh sách dựng theo ba nhóm đó -----------------------------------
+    def _row(i, tok=None, when=None):
+        return {qa.bitable.F_TITLE: f"Cuộc {i}",
+                qa.bitable.F_WHEN: when or f"2026-08-{i:02d} 09:00:00",
+                qa.bitable.F_TOKEN: tok or f"mt{i}",
+                qa.bitable.F_LINK: f"https://lark.example/minutes/mt{i}"}
+
+    _keep_srcs = qa.sources_for
+    _fake = {}
+    qa.sources_for = lambda toks: {
+        t: _fake.get(t, {"src": qa.SRC_NONE, "why": "x"}) for t in toks}
+    try:
+        _done = [_row(i) for i in (5, 4, 3, 2, 1)]
+        _pend = [{"title": "Cuộc chờ", "when": "2026-08-06 09:00:00",
+                  "status": "waiting_auth", "tinh_trang": "chờ cấp quyền",
+                  "minute_token": "mtP", "link": "", "error": ""}]
+        _fake = {"mt5": {"src": qa.SRC_HAPAS, "why": ""},
+                 "mt4": {"src": qa.SRC_HAPAS, "why": ""},
+                 "mt3": {"src": qa.SRC_HAPAS, "why": ""},
+                 "mt2": {"src": qa.SRC_LARK, "why": "đọc được rồi"},
+                 "mt1": {"src": qa.SRC_LARK, "why": "đọc được rồi"},
+                 "mtP": {"src": qa.SRC_NONE, "why": "chờ cấp quyền"}}
+        _out = qa._render_list(_done, _pend)
+        check("danh sách: tổng số = tất cả các nhóm (5+1=6)",
+              "Bạn có **6 cuộc họp**:" in _out, _out[:60])
+        check("danh sách: chia theo NGUỒN, không còn 'ĐÃ CÓ BIÊN BẢN'",
+              "BIÊN BẢN" not in _out, _out[:200])
+        check("danh sách: ba nhóm ghi đúng số của mình",
+              "**ĐÃ CÓ BẢN HAPAS (3)**" in _out
+              and "**CHỈ CÓ BẢN LARK (2)**" in _out
+              and "**CHƯA ĐỌC ĐƯỢC BẢN NÀO (1)**" in _out, _out[:400])
+        check("danh sách: nhóm tốt nhất đứng TRƯỚC",
+              _out.index("BẢN HAPAS") < _out.index("BẢN LARK")
+              < _out.index("CHƯA ĐỌC ĐƯỢC"))
+        check("danh sách: đánh số chạy LIÊN TỤC qua cả ba nhóm (1..6)",
+              all(f"\n{i}. **" in _out for i in range(1, 7)), _out)
+        check("danh sách: TÊN cuộc họp được in đậm để dễ quét mắt",
+              "**Cuộc 5**" in _out, _out[:200])
+        check("nhóm Lark nói rõ tình trạng đọc được hay chưa",
+              "đọc được rồi" in _out)
+        check("chân trang đếm ĐÚNG số cuộc đã có bản Hapas (anh Thiện chốt)",
+              "**3/6** cuộc của bạn đã có **bản dịch từ server Hapas**" in _out,
+              _out[-300:])
+        check("danh sách có cuộc -> luôn mời lấy bản Hapas",
+              qa._FOOT_ASK in _out)
+        # Tất cả đều Hapas thì lời mời chuyển thành nhận file đã sẵn sàng.
+        _fake = {f"mt{i}": {"src": qa.SRC_HAPAS, "why": ""} for i in range(1, 6)}
+        _all_hapas = qa._render_list(_done, [])
+        check("đã có file Hapas -> lời mời nhận file là đúng sự thật",
+              "**5/5**" in _all_hapas and qa._FOOT_ASK in _all_hapas,
+              _all_hapas[-200:])
+        _fake = {f"mt{i}": {"src": qa.SRC_LARK, "why": "đọc được"}
+                 for i in range(1, 6)}
+        _only_lark = qa._render_list(_done, [])
+        check("chỉ có Lark -> vẫn hỏi có muốn bản chuẩn Hapas không",
+              qa._FOOT_ASK in _only_lark
+              and "ưu tiên xử lý" in _only_lark, _only_lark[-240:])
+
+        # --- Trần hiển thị: MỘT tin nhắn phải vừa MỘT khung chat -----------
+        # Adapter Feishu cắt ở 8.000 ký tự rồi gửi làm NHIỀU tin, nên danh sách
+        # dài tự nó phá vỡ luật "một câu hỏi một tin nhắn" (user chốt 10/08).
+        _many = [_row(i, tok=f"mtL{i}", when=f"2026-07-{i:02d} 09:00:00")
+                 for i in range(30, 0, -1)]
+        _mp = [dict(_pend[0], title=f"Chờ {i}", minute_token=f"mtP{i}")
+               for i in range(1, 9)]
+        _fake = {f"mtL{i}": {"src": qa.SRC_HAPAS, "why": ""}
+                 for i in range(1, 31)}
+        _fake.update({f"mtP{i}": {"src": qa.SRC_NONE, "why": "chờ cấp quyền"}
+                      for i in range(1, 9)})
+        _big = qa._render_list(_many, _mp)
+        _shown = len([ln for ln in _big.splitlines()
+                      if ln[:3].strip().rstrip(".").isdigit()])
+        check("danh sách dài: chỉ hiện tối đa LIST_MAX_ITEMS dòng",
+              _shown == qa.LIST_MAX_ITEMS, f"{_shown} dòng")
+        check("danh sách dài: TỔNG SỐ đầu câu vẫn là tổng THẬT (30+8=38)",
+              "Bạn có **38 cuộc họp**:" in _big)
+        # Đây chính là chỗ anh Thiện hiểu nhầm: con số trong ngoặc phải là tổng
+        # của NHÓM, không phải số dòng đang hiện ra.
+        check("số trong ngoặc là tổng NHÓM, không phải số dòng đang hiện",
+              "**ĐÃ CÓ BẢN HAPAS (30)**" in _big
+              and "**CHƯA ĐỌC ĐƯỢC BẢN NÀO (8)**" in _big, _big[:300])
+        check("cắt thì PHẢI NÓI, không cắt im lặng",
+              "còn **26 cuộc** nữa" in _big, _big[-400:])
+        check("...và nói luôn cách xem tiếp",
+              "khoảng thời gian hẹp hơn" in _big)
+        check("nhóm CHƯA CÓ BẢN NÀO không bị nhóm đông đè cho biến mất",
+              "Chờ 1" in _big, _big[-800:])
+        check("cuộc MỚI NHẤT được giữ, cuộc cũ nhất bị cắt",
+              "**Cuộc 30**" in _big and "**Cuộc 1**" not in _big)
+        check("một tin nhắn dài dưới trần 8.000 ký tự của Feishu",
+              len(_big) < 8000, f"{len(_big)} ký tự")
+        check("ngắn hơn trần thì KHÔNG cắt gì và không có câu 'còn N cuộc'",
+              "còn **" not in qa._render_list(_many[:5], _mp[:2]))
+        check("tên cuộc họp dài bất thường -> cắt thêm cho vừa trần ký tự",
+              len(qa._render_list(
+                  [dict(r, **{qa.bitable.F_TITLE: "X" * 600}) for r in _many],
+                  [])) < qa.LIST_MAX_CHARS + 900)
+    finally:
+        qa.sources_for = _keep_srcs
 
     # Một cuộc họp: khối người dùng đọc CHỈ có nội dung, sổ sách đi kênh nội bộ.
     # Ca này sinh ra từ lỗi thật 05/08/2026: câu dặn agent ("Nói với người dùng
@@ -3192,90 +4158,87 @@ def _main() -> int:
     check("sổ sách vẫn tới được agent qua kênh nội bộ",
           "mtFMT001" in qa._record_notes(_rec))
 
+    # --- TÊN GỌI theo NGUỒN (user chốt 10/08/2026) -------------------------
+    # Hai bản chép của cùng một cuộc họp khác nhau về CHẤT LƯỢNG, nên tên phải
+    # nói được nguồn: "bản dịch từ Lark" (nhanh, tên riêng dễ sai) và "bản dịch
+    # từ server của Hapas" (hệ thống tự phiên âm, chất lượng hơn). Tên cũ "bản
+    # nguyên văn" nói đúng tính chất nhưng không phân biệt được nguồn nào.
+    _foot = qa._FOOT_COUNT + qa._FOOT_ASK
+    check("chân trang danh sách gọi tên theo NGUỒN, không còn 'nguyên văn'",
+          "server Hapas" in qa._FOOT_COUNT
+          and "nguyên văn" not in _foot.lower(), _foot[:200])
+    check("...và nói rõ hơn bản của Lark ở điểm nào",
+          "chất lượng hơn bản dịch từ Lark" in qa._FOOT_COUNT, qa._FOOT_COUNT)
+    # Chân trang hỏi cho MỌI cuộc; chưa có file thì chỉ xử lý sau khi user đồng ý.
+    check("chân trang luôn hỏi bản chuẩn Hapas, không dạy cú pháp lệnh",
+          "có muốn lấy" in qa._FOOT_ASK
+          and "ưu tiên xử lý" in qa._FOOT_ASK
+          and not any(x in qa._FOOT_ASK for x in ("Nhắn ", "<", "ví dụ")),
+          qa._FOOT_ASK)
+    # Nói như người thì họ cứ nói — nhưng câu họ nói vẫn phải qua được cổng
+    # write-tool, nếu không thì bot mời rồi tự chặn.
+    _nouns_ok = "ban dich"
+    # Khoá cả hai: lệnh theo lời mời chạy, lệnh cũ KHÔNG chết.
+    _nouns = (Path(__file__).resolve().parent.parent / "hermes"
+              / "v2-enroll-gate" / "__init__.py").read_text(encoding="utf-8")
+    _nouns = _nouns.split("_TRANSCRIPT_NOUNS = (", 1)[1].split(")", 1)[0]
+    check("cổng write-tool nhận đúng câu lệnh chân trang mời gõ",
+          '"ban dich"' in _nouns)
+    check("...và lệnh cũ 'gửi nguyên văn' vẫn chạy cho ai đã quen",
+          '"nguyen van"' in _nouns)
+
     check("ngày giờ MỘT định dạng dd/mm/yyyy HH:MM",
           qa._dmy("2026-08-04 15:34:00") == "04/08/2026 15:34")
     check("tên cuộc họp gỡ escape HTML ('&amp;' -> '&')",
           qa._title("Review HRIS &amp; feedback") == "Review HRIS & feedback")
 
     # =================================================================
-    part("34c. sendlist — agent KHÔNG cầm nội dung, và không chọn được người nhận")
+    part("34c. list_meetings — MỘT câu hỏi thì MỘT tin nhắn")
     # =================================================================
-    # Đây là chỗ thay thế cho "bảo agent chép nguyên văn" — thứ đã thất bại ba
-    # lượt. Giá trị nằm ở chỗ nó là CODE, nên phải kiểm như code.
-    from v2 import sendlist as _sl
-
+    # Ca thật 10/08/2026 (ảnh chụp chat của anh Thiện): hỏi "các cuộc họp tuần
+    # trước" thì nhận về HAI tin — một thẻ danh sách do V2 tự gửi (`sendlist`,
+    # đã bỏ), và một câu "Danh sách các cuộc họp tuần trước của bạn ở trên nhé"
+    # do agent viết. User chốt: trả lời một tin thôi.
+    #
+    # Nên phép kiểm ở đây không phải "gửi cho đúng người" nữa mà là KHÔNG TOOL
+    # NÀO ĐƯỢC TỰ GỬI trong một lượt hỏi đáp: mọi chữ tới người dùng phải đi qua
+    # đúng một cửa — câu cuối của agent, mà plugin ghi đè bằng khối GỬI NGUYÊN
+    # VĂN (nhóm 34d khoá vế đó).
     _sent_list: list[tuple] = []
     _keep_im = (lark_api.im_send_text, lark_api.im_send_card)
     lark_api.im_send_text = lambda rid, text, id_type="union_id", **kw: (
         _sent_list.append((rid, text, id_type)) or "om_fake")
-    # Danh sách đi bằng THẺ từ 05/08/2026 (markdown không render trong tin text).
-    # Bóc `content` ra để mọi phép đo bên dưới vẫn nói về ĐÚNG chuỗi người dùng
-    # đọc, không phải về cái vỏ thẻ.
     lark_api.im_send_card = lambda rid, card, id_type="union_id", **kw: (
-        _sent_list.append(
-            (rid, card["elements"][0]["text"]["content"], id_type))
-        or "om_fake")
+        _sent_list.append((rid, card, id_type)) or "om_fake")
     _keep_lt = qa.list_text
     qa.list_text = lambda who, **kw: "DANH SACH CUA " + (who.get("name") or "?")
     try:
         _w1 = {"union_id": "on_A", "open_id": "ou_A", "name": "An"}
-
-        _r1 = _sl.send_list(_w1)
-        check("gửi đúng MỘT tin cho chính người hỏi",
-              len(_sent_list) == 1 and _sent_list[0][0] == "on_A"
-              and _sent_list[0][2] == "union_id")
-        check("nội dung gửi đi là danh sách THÔ, không kèm nhãn nội bộ",
-              _sent_list[0][1] == "DANH SACH CUA An"
-              and qa.INTERNAL_MARK not in _sent_list[0][1])
-        check("agent KHÔNG nhận được nội dung danh sách",
-              "DANH SACH CUA An" not in _r1)
-        check("agent chỉ nhận khối NỘI BỘ, không có khối để chép ra",
-              _r1.startswith(qa.INTERNAL_MARK) and qa.SEND_MARK not in _r1)
-
-        # Ràng buộc 5: vòng lặp của agent không được thành chục tin nhắn.
-        _sl.send_list(_w1)
-        check("gọi lại ngay -> KHÔNG gửi tin thứ hai", len(_sent_list) == 1)
-        check("mốc chống lặp được lưu BỀN trong DB, không chỉ trong RAM",
-              db.conn().execute(
-                  "SELECT 1 FROM outbound_dedup WHERE channel=? AND recipient=?",
-                  (_sl._DEDUP_CHANNEL, "on_A")).fetchone() is not None)
-
-        # Ràng buộc 2: người nhận suy từ `who`. Người khác hỏi -> tin đi chỗ khác.
-        _sl.send_list({"union_id": "on_B", "open_id": "ou_B", "name": "Binh"})
-        check("người khác hỏi -> gửi cho HỌ, nội dung của HỌ",
-              len(_sent_list) == 2 and _sent_list[1][0] == "on_B"
-              and _sent_list[1][1] == "DANH SACH CUA Binh")
-
-        # Ràng buộc 3: đường terminal không có id Lark -> không gửi đi đâu.
-        _n = len(_sent_list)
-        _rt = _sl.send_list(askers.admin_view())
-        check("đường terminal (không có id Lark) -> KHÔNG gửi, trả text tại chỗ",
-              len(_sent_list) == _n and qa.SEND_MARK in _rt)
-
-        # Ràng buộc 4: Lark hỏng -> vẫn phải có câu trả lời, không im lặng.
-        def _boom(*a, **k):
-            raise lark_api.LarkError(99999, "mang hong", "im_send")
-        # Cả HAI kênh phải hỏng mới được rơi về trả text cho agent: thẻ hỏng mà
-        # text còn sống thì người dùng vẫn phải nhận được danh sách.
-        lark_api.im_send_card = _boom
-        db.conn().execute("DELETE FROM outbound_dedup WHERE recipient='on_A'")
-        _n2 = len(_sent_list)
-        _sl.send_list(_w1)
-        check("thẻ hỏng -> LÙI về text, người dùng vẫn nhận được danh sách",
-              len(_sent_list) == _n2 + 1
-              and _sent_list[-1][1] == "DANH SACH CUA An")
-        lark_api.im_send_text = _boom
-        db.conn().execute("DELETE FROM outbound_dedup WHERE recipient='on_A'")
-        _rf = _sl.send_list(_w1)
-        check("Lark gửi hỏng -> rơi về trả text cho agent, KHÔNG im lặng",
-              qa.SEND_MARK in _rf and "DANH SACH CUA An" in _rf)
-        check("Lark gửi hỏng -> nhả reservation để được thử lại ngay",
-              db.conn().execute(
-                  "SELECT 1 FROM outbound_dedup WHERE channel=? AND recipient=?",
-                  (_sl._DEDUP_CHANNEL, "on_A")).fetchone() is None)
-
-        check("who=None -> không gửi, trả NO_ASKER",
-              _sl.send_list(None) == qa.NO_ASKER)
+        _r1 = qa.list_meetings(_w1)
+        check("hỏi danh sách -> KHÔNG có tin nhắn nào do V2 tự gửi",
+              _sent_list == [], str(_sent_list)[:120])
+        check("danh sách về tay agent qua khối GỬI NGUYÊN VĂN",
+              _r1.startswith(qa.SEND_MARK) and "DANH SACH CUA An" in _r1)
+        check("khối người dùng là danh sách THÔ, không lẫn nhãn nội bộ",
+              _r1.split(qa.END_MARK)[0].split("\n", 1)[1].strip()
+              == "DANH SACH CUA An")
+        check("người khác hỏi -> nội dung của HỌ",
+              "DANH SACH CUA Binh" in qa.list_meetings(
+                  {"union_id": "on_B", "open_id": "ou_B", "name": "Binh"}))
+        check("đường terminal (admin_view) vẫn có danh sách để in ra",
+              qa.SEND_MARK in qa.list_meetings(askers.admin_view()))
+        check("who=None -> NO_ASKER, không dựng danh sách của ai cả",
+              qa.list_meetings(None) == qa.NO_ASKER)
+        # Khoá đường cũ lại: còn module `sendlist` nghĩa là còn cửa để một tool
+        # tự gửi tin thứ hai.
+        try:
+            import importlib as _il
+            _il.import_module("v2.sendlist")
+            _gone = False
+        except ModuleNotFoundError:
+            _gone = True
+        check("đường tự gửi (v2/sendlist.py) đã gỡ hẳn, không còn cửa thứ hai",
+              _gone)
     finally:
         lark_api.im_send_text, lark_api.im_send_card = _keep_im
         qa.list_text = _keep_lt
@@ -3292,15 +4255,12 @@ def _main() -> int:
     _plug = importlib.util.module_from_spec(_spec)
     assert _spec and _spec.loader
     _spec.loader.exec_module(_plug)
+    # Không spawn tiến trình audit thật trong selftest. Thu event tại chỗ để vừa
+    # kiểm nội dung câu cuối, vừa không làm bẩn audit DB vận hành.
+    _audit_events34: list[tuple[dict, str]] = []
+    _plug._log_final_response = (
+        lambda state, final_text: _audit_events34.append((dict(state), final_text)))
 
-    check("plugin: câu dữ liệu phải gọi tool",
-          _plug._requires_tool("liệt kê cuộc họp 7 ngày qua"))
-    check("plugin: chào hỏi không ép gọi tool",
-          not _plug._requires_tool("cảm ơn bạn"))
-    check("plugin: tiền tố xã giao KHÔNG né được guard dữ liệu",
-          _plug._requires_tool("chào bạn, liệt kê cuộc họp của tôi"))
-    check("plugin: câu help ghép thêm hành động vẫn PHẢI gọi tool",
-          _plug._requires_tool("bot làm được gì và gửi transcript cuộc họp X"))
     check("plugin: tên tool giả chỉ giống hậu tố KHÔNG lọt allow-list",
           _plug._tool_suffix("evil_list_meetings") == "")
 
@@ -3314,6 +4274,50 @@ def _main() -> int:
     check("thẻ chào: vẫn có tên người in đậm và nguyên danh sách",
           "**An**" in _wc["elements"][0]["text"]["content"]
           and "Bạn có 1 cuộc họp:" in _wc["elements"][1]["text"]["content"])
+    import json as _json_notice
+    _notice_default = _json_notice.dumps(
+        cards.minute_notice_card(meta(title="Họp mới"), Recap(summary="Tóm tắt")),
+        ensure_ascii=False)
+    check("thẻ họp mới: bỏ dòng chân trang nguồn mặc định Meeting Note Lark",
+          "Nguồn mặc định" not in _notice_default
+          and "Meeting Note của Lark" not in _notice_default,
+          _notice_default[:240])
+    check("thẻ họp mới: chưa có file vẫn hỏi bản chuẩn Hapas",
+          "có muốn lấy" in _notice_default
+          and "ưu tiên xử lý" in _notice_default,
+          _notice_default[-240:])
+    # --- KHÔNG nút callback trên thẻ họp xong (bỏ 19/08/2026) --------------
+    # Nút cũ là đồ trang trí từ 13/08 tới 19/08. Đo trên MỌI log của Hermes
+    # (gateway/agent/stdio/errors): 0 dòng `card action` / `Routing card` /
+    # `/card` — Lark chưa từng đẩy `card.action.trigger` về app. Và kể cả đẩy về
+    # thì adapter Feishu ghim `event_chat_type="group"` cho card action, nên cú
+    # bấm trong chat 1-1 bị dán nhãn `group` và plugin bỏ đúng theo luật chỉ-DM.
+    # Hai thứ nó phụ thuộc (event Console + nội bộ adapter) đều NGOÀI repo và
+    # không test nào phủ được — hỏng thì im lặng. Đường gõ chữ đã chạy thật.
+    _notice_actions = [el for el in cards.minute_notice_card(
+        meta(title="Họp mới"), Recap(summary="Tóm tắt"))["elements"]
+        if el.get("tag") == "action"]
+    check("thẻ họp xong KHÔNG có nút nào (đường callback chưa từng chạy được)",
+          _notice_actions == [], str(_notice_actions))
+    check("...và lời mời nói rõ cách nhận: trả lời 'có'",
+          "trả lời **có**" in _notice_default.lower()
+          or "Trả lời **có**" in _notice_default, _notice_default[-240:])
+    # Thẻ enroll thì ĐƯỢC có nút, vì `open_url` không cần callback nào cả.
+    _enroll_btns = [a for el in cards.enroll_card("Nguoi Test", "https://x/auth")["elements"]
+                    if el.get("tag") == "action"
+                    for a in el.get("actions", [])]
+    check("thẻ enroll vẫn có nút, và là open_url (loại KHÔNG cần callback)",
+          len(_enroll_btns) == 1 and _enroll_btns[0].get("url"),
+          str(_enroll_btns))
+    _notice_hapas = _json_notice.dumps(
+        cards.minute_notice_card(meta(title="Họp đã xử lý"),
+                                 Recap(summary="Tóm tắt"), hapas_ready=True),
+        ensure_ascii=False)
+    check("thẻ họp mới: file Hapas sẵn sàng -> vẫn hỏi và nói gửi ngay",
+          "có muốn lấy" in _notice_hapas
+          and "đã sẵn sàng" in _notice_hapas
+          and "file Word ngay" in _notice_hapas,
+          _notice_hapas[-260:])
     # Cầu xử lý cú bấm nút GIỮ NGUYÊN dù hiện không thẻ nào sinh nút: thiếu nó
     # thì một nút thêm sau này rơi thẳng vào nhánh "Unknown command" của Hermes.
     import json as _json_btn
@@ -3369,13 +4373,43 @@ def _main() -> int:
     check("plugin: KHÔNG chèn vé vào user message/session history",
           _event.text == "liệt kê cuộc họp" and "secret-ticket" not in _event.text)
 
+    # Ca thật 14/08/2026: chat_memory gần nhất là Workforce 08-06, nhưng user
+    # hỏi cuộc Workforce "mới nhất". Agent lấy thẳng token cũ từ memory nên
+    # không hề so giờ họp với cuộc 08-13. Lượt recency phải giấu memory và gắn
+    # chỉ dẫn tra theo thời gian.
+    _plug._ask_v2 = lambda *a, **k: {
+        "decision": "allow", "asker_token": "secret-ticket",
+        "open_id": "ou_A", "memory": "STALE-MEMORY-TOKEN-08-06"}
+    _latest_event = SimpleNamespace(
+        source=_source, text="cuộc Workforce AI mới nhất có Hapas chưa",
+        channel_prompt=None)
+    try:
+        _latest_gate = _plug._on_pre_dispatch(event=_latest_event)
+    finally:
+        _plug._ask_v2 = _keep_ask
+    check("plugin: hỏi 'mới nhất' thì KHÔNG bơm token cũ từ chat_memory",
+          _latest_gate.get("action") == "allow"
+          and "STALE-MEMORY-TOKEN-08-06" not in
+              (_latest_event.channel_prompt or ""))
+    check("plugin: hỏi 'mới nhất' được gắn chỉ dẫn backend chọn theo giờ họp",
+          _plug._LATEST_POLICY in (_latest_event.channel_prompt or ""))
+
     _plug._on_pre_llm_call(platform="feishu", session_id="s-test",
-                           turn_id="t1", user_message="liệt kê cuộc họp")
+                           turn_id="t1", sender_id="ou_A",
+                           user_message="liệt kê cuộc họp")
+    _audit_events34.clear()
     _blocked = _plug._on_transform_llm_output(
         platform="feishu", session_id="s-test",
         response_text="Bạn có 11 cuộc họp theo trí nhớ cũ")
     check("plugin: không gọi tool -> chặn câu trả lời dựng từ memory",
           _blocked == _plug._NO_TOOL_REPLY)
+    check("plugin audit: ghi câu CUỐI sau lớp chặn, kèm đúng người + prompt",
+          len(_audit_events34) == 1
+          and _audit_events34[0][1] == _plug._NO_TOOL_REPLY
+          and _audit_events34[0][0].get("union_id") == "on_A"
+          and _audit_events34[0][0].get("name") == "An"
+          and _audit_events34[0][0].get("user_message") == "liệt kê cuộc họp",
+          str(_audit_events34))
 
     _plug._on_pre_llm_call(platform="feishu", session_id="s-test",
                            turn_id="t2", user_message="xem chi tiết cuộc họp X")
@@ -3390,6 +4424,76 @@ def _main() -> int:
           (_plug._on_pre_tool_call(
               session_id="s-test", tool_name="evil_list_meetings")
            or {}).get("action") == "block")
+
+    # --- Xin gửi bằng ĐỘNG TỪ cũng phải lọt cổng (19/08/2026) --------------
+    # Ca thật 08:50:42: "Gửi cho tôi chatbot nhân sự" bị chặn vì câu đó không có
+    # danh từ nào trong `_TRANSCRIPT_NOUNS`, rồi bot bắt gõ lại đúng khuôn
+    # "Gửi file Word bản dịch cuộc họp ...". Đúng cái mà chú thích trong plugin
+    # gọi là đẩy cái dở của backend ra thành việc của người dùng, và trái luật
+    # user chốt 10/08 (cách nói vô hạn, cổng phải mặc định CHO QUA).
+    def _send_allowed(msg: str, sid: str) -> bool:
+        _plug._on_pre_llm_call(platform="feishu", session_id=sid,
+                               turn_id="t-" + sid, user_message=msg)
+        res = _plug._on_pre_tool_call(
+            session_id=sid, tool_name="mcp__meetings__send_transcript_file",
+            args={"minute_token": "obsgSEND0000000001"}) or {}
+        return res.get("action") != "block"
+
+    check("xin gửi bằng động từ, không có danh từ nào -> VẪN cho qua",
+          _send_allowed("Gửi cho tôi chatbot nhân sự", "s-verb1"))
+    check("'tải về giúp mình cuộc họp đó' cũng cho qua",
+          _send_allowed("tải về giúp mình cuộc họp đó", "s-verb2"))
+    # KHÔNG lấy đại từ vào danh sách động từ: "cho mình cuộc 2" phải giữ luật CẢ
+    # HAI VẾ (có lời mời VÀ có câu đáp), không thì agent tự mời rồi tự đồng ý.
+    check("đại từ trần 'cho mình cuộc 2' vẫn CHẶN khi chưa hề có lời mời",
+          not _send_allowed("cho mình cuộc 2", "s-verb2b"))
+    check("xin bằng danh từ như cũ vẫn cho qua",
+          _send_allowed("gửi file word bản dịch cuộc họp X", "s-verb3"))
+    # Ý đồ của cổng KHÔNG đổi: agent tự tiện gửi khi người dùng chỉ HỎI thì chặn.
+    check("người dùng chỉ HỎI, agent tự gửi file -> vẫn CHẶN",
+          not _send_allowed("cuộc họp mới nhất của tôi là cuộc nào",
+                            "s-verb4"))
+    check("...và câu hỏi nội dung thường cũng KHÔNG mở cổng gửi",
+          not _send_allowed("ai nói gì về wiki trong cuộc đó", "s-verb5"))
+
+    _plug._on_pre_llm_call(
+        platform="feishu", session_id="s-latest", turn_id="t-latest",
+        user_message="cuộc họp Workforce AI mới nhất có bản Hapas chưa")
+    _latest_block = _plug._on_pre_tool_call(
+        session_id="s-latest", tool_name="mcp__meetings__get_meeting",
+        args={"query": "obsgOLD08"}) or {}
+    check("plugin: 'mới nhất' chặn get_meeting lấy thẳng token từ memory",
+          _latest_block.get("action") == "block"
+          and "latest_meeting" in _latest_block.get("message", ""))
+    _latest_search_block = _plug._on_pre_tool_call(
+        session_id="s-latest", tool_name="mcp__meetings__search_meetings",
+        args={"keyword": "họp"}) or {}
+    check("plugin: 'mới nhất' chặn search từ chung chung từng chọn nhầm 06/08",
+          _latest_search_block.get("action") == "block"
+          and "latest_meeting" in _latest_search_block.get("message", ""))
+    _plug._on_post_tool_call(
+        tool_name="mcp__meetings__latest_meeting", session_id="s-latest",
+        status="ok", result=(f"{qa.CONTEXT_MARK}\n08-13 mới hơn 08-06\n"
+                             f"{qa.CONTEXT_END}\n\n{qa.INTERNAL_MARK}\n"
+                             f"{qa.latest_marker('obsgNEW13')}"))
+    check("plugin: latest_meeting khóa được token do backend chọn",
+          _plug._turns["s-latest"].get("latest_token") == "obsgNEW13")
+    check("plugin: cho get_meeting khi dùng ĐÚNG token mới nhất đã khóa",
+          _plug._on_pre_tool_call(
+              session_id="s-latest",
+              tool_name="mcp__meetings__get_meeting",
+              args={"query": "obsgNEW13"}) is None)
+    _latest_wrong_send = _plug._on_pre_tool_call(
+        session_id="s-latest", tool_name="mcp__meetings__send_transcript_file",
+        args={"minute_token": "obsgOLD08"}) or {}
+    check("plugin: dù đã tra, gửi file token 06/08 khi latest là 13/08 vẫn bị chặn",
+          _latest_wrong_send.get("action") == "block"
+          and "obsgNEW13" in _latest_wrong_send.get("message", ""))
+    check("plugin: gửi file ĐÚNG token mới nhất thì được đi tiếp",
+          _plug._on_pre_tool_call(
+              session_id="s-latest",
+              tool_name="mcp__meetings__send_transcript_file",
+              args={"minute_token": "obsgNEW13"}) is None)
     _shape = _plug._on_pre_tool_call(
         session_id="s-test", tool_name="terminal") or {}
     check("plugin: block dùng ĐÚNG contract Hermes action/message",
@@ -3417,43 +4521,123 @@ def _main() -> int:
     check("plugin: kết quả tool không có marker V2 KHÔNG được tính là thành công",
           _plug._on_transform_llm_output(
               platform="feishu", session_id="s-plain",
-              response_text="LLM bịa tiếp") == _plug._NO_TOOL_REPLY)
+              response_text="Bạn có 4 cuộc họp") == _plug._NO_TOOL_REPLY)
     _plug._cleanup_turn(session_id="s-plain")
 
     # =================================================================
-    part("34j. Hồ sơ bot — hỏi về CHÍNH BOT không bị xử như câu hỏi dữ liệu")
+    part("34j. Cổng 'không bịa' đo CÂU TRẢ LỜI, không đoán từ câu hỏi")
     # =================================================================
-    # Trước 06/08/2026 "bạn tên gì" rơi vào nhánh mặc định "phải gọi tool
-    # meetings", không tool nào trả lời được, nên `transform_llm_output` thay
-    # câu trả lời bằng `_NO_TOOL_REPLY`. Hỏi bot về nó thì bot báo lỗi dữ liệu.
-    from v2 import profile as _profile
-    # Bộ câu dưới lấy từ 86 tin nhắn THẬT trong `gateway.log`, không phải nghĩ
-    # ra. Hai câu đầu là hai câu đã bị bot chặn bằng "chưa truy xuất dữ liệu"
-    # ngày 05-06/08/2026 — đúng thứ người dùng gọi là "trả lời cứng nhắc".
-    # Chú ý xưng hô: người dùng thật gõ "mày", không gõ "bạn".
-    for _q in ("ok mày là ai và luồng xử lý của mày là gì",
-               "ok list ra rồi mày làm được gì",
-               "alo",
-               "bạn là ai", "bạn tên gì", "bot làm được gì",
-               "bạn hoạt động thế nào", "giới thiệu về bạn"):
-        check(f"hỏi về bot / gọi thử KHÔNG cần tool: {_q!r}",
-              not _plug._requires_tool(_q))
-    # Mặt kia của cùng một luật, và là mặt NGUY HIỂM hơn: một chuỗi miễn trừ
-    # lọt vào câu hỏi dữ liệu là bỏ luôn ràng buộc phải gọi tool cho câu đó,
-    # tức mở lại đúng lỗ "trả lời từ trí nhớ" của sự cố 03/08/2026.
+    # Viết lại 10/08/2026. User: "người ta hỏi thì thiên biến vạn hoá sao mà
+    # cứng nhắc". Bản cũ đoán từ TIN NHẮN VÀO xem câu này có buộc phải gọi tool
+    # không, mặc định là CÓ, rồi trừ ra bằng ba danh sách chuỗi. Tập câu chào
+    # thì vô hạn nên mọi cách nói mới đều rơi vào nhánh "phải gọi tool" và nhận
+    # về câu chặn — đã vá ba lần bằng cách thêm chuỗi ("alo", `_SELF_PHRASES`,
+    # "alo em"), lần nào cũng có tin nhắn thật rơi vào đúng cái bẫy đó.
     #
-    # Bốn câu đầu cũng là tin nhắn thật, và đều có "ban"/"may" trong đó —
-    # chúng là phép thử nặng nhất cho luật chủ-ngữ-liền-đuôi-câu.
-    for _q in ("theo bạn thì phần lark minute ok hơn hay phần transcript ok hơn",
-               "ok mày đánh giá thế nào về nội dung cuộc họp này ?",
-               "vậy giải thích chi tiết đi",
-               "tóm tắt cuộc họp này",
-               "cho mình tên bản ghi cuộc họp hôm qua",
-               "cuộc họp này bàn là gì",
-               "dự án hoạt động ra sao",
-               "cái công cụ đó dùng thế nào trong cuộc họp"):
-        check(f"câu dữ liệu VẪN phải gọi tool: {_q[:52]!r}",
-              _plug._requires_tool(_q))
+    # Nay chỉ chặn khi câu trả lời KHẲNG ĐỊNH dữ liệu mà lượt đó không tra gì.
+    from v2 import profile as _profile
+
+    # Vế 1 — câu trò chuyện: KHÔNG khẳng định gì thì cho qua, gõ kiểu nào cũng
+    # vậy. Bốn câu đầu là tin nhắn thật trong `gateway.log`; bốn câu sau cố ý
+    # là những cách nói chưa từng có trong danh sách nào.
+    for _a in ("Mình nghe đây, bạn cần gì nào?",
+               f"Mình là {_profile.BOT_NAME}, lo biên bản họp giúp bạn.",
+               "Có mình đây, bạn hỏi gì cứ nhắn nhé.",
+               "Dạ em vẫn ở đây ạ.",
+               "Hehe cảm ơn bạn, bạn cần gì mình làm luôn.",
+               "Cái đó ngoài phần mình lo được, mình chỉ giúp về biên bản họp.",
+               "Ừ mình hiểu rồi, để mình xem giúp bạn nhé.",
+               "Chào bạn!"):
+        check(f"câu trò chuyện KHÔNG bị chặn: {_a[:40]!r}",
+              not _plug._claims_data(_a))
+    # Bot TỰ GIỚI THIỆU là một danh sách có đánh số, và không cần dữ liệu gì.
+    # Bản `_claims_data` đầu tiên chặn mọi chữ số + mọi danh sách nên chặn luôn
+    # câu này — tức lại đúng cái cứng nhắc đang sửa. Khoá lại để không tái phát.
+    check("bot tự giới thiệu ba việc mình làm KHÔNG bị chặn",
+          not _plug._claims_data(
+              "Mình làm được 3 việc:\n1. Trả lời câu hỏi về cuộc họp và biên "
+              "bản\n2. Tạo task từ cuộc họp\n3. Duyệt từ điển phiên âm"))
+    # Vế 2 — đúng những thứ đã lọt ra chat thật và bị user chê. Không tra gì mà
+    # nói ra được thì chỉ có thể là bịa.
+    for _a in ("Bạn có 8 cuộc họp trong tuần này.",
+               "Hệ thống tìm thấy 22 cuộc họp gắn với tài khoản của bạn",
+               "Xem tại https://o4pvcegwn6b.sg.larksuite.com/minutes/obsg9z3",
+               "Workforce AI Weekly họp hôm 06/08/2026 nhé",
+               "Cuộc gần nhất bắt đầu lúc 18:11",
+               "Cuộc đó hiện vẫn CHƯA CÓ BIÊN BẢN nhé",
+               "Bản ghi mtABC123456 đang ở trạng thái held"):
+        check(f"khẳng định dữ liệu -> chặn: {_a[:40]!r}",
+              _plug._claims_data(_a))
+    check("câu giới thiệu ngắn có nhắc 'biên bản' thì KHÔNG chặn",
+          not _plug._claims_data(
+              "Mình giúp bạn tra biên bản các cuộc họp bạn có dự nhé."))
+    # Vế 2b — luật ĐỘ DÀI đã bị bỏ 25/08/2026. Ca thật 09:57 ngày 25/08:
+    # Nguyễn Nam Khánh vừa enroll lúc 09:56, hỏi "Ngoài ra bạn làm được tất cả
+    # những gì" rồi "ý là bạn làm được những công việc gì" — câu hỏi về NĂNG
+    # LỰC BOT, không cần tra dữ liệu. Đoạn tự giới thiệu năng lực thì vừa dài
+    # vừa nhắc "cuộc họp/biên bản/file" nên dính luật cũ (>600 ký tự + từ
+    # nghiệp vụ), và cả hai lượt đều bị thay bằng `_NO_TOOL_REPLY`.
+    _CAPABILITY_BLURB = (
+        "Mình là trợ lý biên bản họp, nên phần lớn việc mình làm xoay quanh "
+        "các cuộc họp có bản ghi trên Lark. Mình có thể tra giúp bạn những "
+        "cuộc họp bạn đã dự, đọc lại nội dung đã trao đổi, tóm tắt những gì "
+        "đã chốt và những việc cần làm sau cuộc họp. Nếu bạn cần bản đầy đủ "
+        "thì mình gửi được file bản dịch chất lượng cao, hoặc bản có sẵn của "
+        "Lark khi đọc được. Ngoài ra mình tạo được task trên Lark từ nội dung "
+        "cuộc họp, và duyệt giúp bạn từ điển phiên âm để tên riêng của công ty "
+        "không bị ghi sai. Bạn cứ nói cuộc họp nào hoặc khoảng thời gian nào "
+        "là mình tra, còn nếu chưa rõ thì mình hỏi lại cho chắc. Nếu bạn muốn "
+        "mình chủ động gửi sau mỗi cuộc thì cũng được nhé.")
+    check("đoạn tự giới thiệu năng lực DÀI, có nhắc 'cuộc họp/biên bản/file', "
+          "KHÔNG dấu vết cụ thể -> KHÔNG chặn (ca 25/08)",
+          len(_CAPABILITY_BLURB) > 600
+          and not _plug._claims_data(_CAPABILITY_BLURB))
+    check("luật đo độ dài đã bị gỡ khỏi mã, không còn hằng số ngưỡng",
+          not hasattr(_plug, "_NO_DATA_MAX_CHARS"))
+    # Lỗ (3) trong docstring: bài dài kể chuyện cuộc họp mà không có số/ngày/
+    # link/nhãn máy thì nay LỌT. Khoá lại để không ai tưởng nó vẫn bị chặn.
+    check("lỗ đã-biết: bài dài kể nội dung mà không có dấu vết cụ thể thì lọt",
+          not _plug._claims_data(
+              "Về cuộc họp tuần rồi thì mọi người có bàn khá nhiều thứ. "
+              + "Nội dung xoay quanh biên bản và cách phối hợp giữa các bên. "
+              * 12))
+    # ...nhưng thêm ĐÚNG MỘT dấu vết cụ thể vào chính bài đó là chặn lại ngay.
+    check("...thêm một con số nghiệp vụ vào bài đó -> chặn trở lại",
+          _plug._claims_data(
+              "Về 3 cuộc họp tuần rồi thì mọi người có bàn khá nhiều thứ. "
+              + "Nội dung xoay quanh biên bản và cách phối hợp giữa các bên. "
+              * 12))
+    # Cú chặn phải log ở mức WARNING, không phải ERROR: `heartbeat.real_errors`
+    # đếm dòng ERROR trong gateway.log và bật WARN cho cả hệ, nên chặn đúng luật
+    # mà log ERROR = báo động giả mỗi lần cổng làm việc (ca 10:12 ngày 25/08).
+    _gate_src = Path(_plug.__file__).read_text(encoding="utf-8")
+    check("ba cú chặn của cổng log ở mức WARNING, không phải ERROR",
+          'logger.error("[v2-gate] CHẶN' not in _gate_src
+          and _gate_src.count('logger.warning("[v2-gate] CHẶN') == 3)
+
+    # Vế 3 — đo end-to-end qua đúng hook, vì hai vế trên chỉ đo hàm rời.
+    _plug._on_pre_llm_call(platform="feishu", session_id="s-chat",
+                           turn_id="tj1", user_message="alo mày")
+    check("gọi thử 'alo mày' -> agent được trả lời bằng lời của nó",
+          _plug._on_transform_llm_output(
+              platform="feishu", session_id="s-chat",
+              response_text="Mình đây, bạn cần gì cứ nói nhé.") is None)
+    _plug._cleanup_turn(session_id="s-chat")
+    _plug._on_pre_llm_call(platform="feishu", session_id="s-chat2",
+                           turn_id="tj2", user_message="tuần trước họp mấy cuộc")
+    check("hỏi dữ liệu mà không tra -> vẫn chặn như cũ",
+          _plug._on_transform_llm_output(
+              platform="feishu", session_id="s-chat2",
+              response_text="Tuần trước bạn có 3 cuộc họp")
+          == _plug._NO_TOOL_REPLY)
+    check("câu chặn nay ngắn gọn, không phải bài giảng",
+          len(_plug._NO_TOOL_REPLY) < 200 and "\n" not in _plug._NO_TOOL_REPLY)
+    _plug._cleanup_turn(session_id="s-chat2")
+    check("danh sách chuỗi đoán-từ-câu-hỏi đã gỡ hẳn",
+          not any(hasattr(_plug, x) for x in
+                  ("_requires_tool", "_SMALLTALK", "_SELF_PHRASES",
+                   "_HELP_PHRASES", "_ACTION_HINTS")))
+
     # `đ` không phải `d` + dấu nên NFKD không tách nó; bản cũ xoá sạch chữ đó
     # và MỌI hằng số viết bằng `d` đều hụt (xem `_D_MAP`). Ba câu dưới là ba
     # hằng số đã âm thầm vô hiệu — cái thứ hai chặn đúng lệnh mà chính plugin
@@ -3477,37 +4661,29 @@ def _main() -> int:
     check("hồ sơ nói rõ hai giới hạn người dùng va vào thật",
           "1-1" in _pblob and "có dự" in _profile.text())
 
-    # --- câu xác nhận: được viết mềm, KHÔNG được bịa số ------------------
-    check("câu xác nhận tự viết được đi tiếp",
-          _plug._safe_confirm("Danh sách của bạn ở ngay trên nhé, "
-                              "cần lọc lại thì bảo mình."))
-    check("có CHỮ SỐ -> chặn (agent không cầm danh sách nên số là bịa)",
-          not _plug._safe_confirm("Bạn có 8 cuộc họp ở trên nhé"))
-    check("liệt kê lại -> chặn",
-          not _plug._safe_confirm("Danh sách:\n• Cuộc A\n• Cuộc B"))
-    check("dài quá -> chặn", not _plug._safe_confirm("x" * 200))
-    check("rỗng -> chặn (không gửi tin trống)", not _plug._safe_confirm("   "))
-
+    # --- danh sách: ĐÚNG MỘT tin nhắn, và là chuỗi của tool ---------------
+    # Vế còn lại của sự cố 10/08/2026 (xem nhóm 34c). V2 không tự gửi nữa, nên
+    # cả câu trả lời nằm ở đây — và nó phải là chuỗi tool dựng, không phải bản
+    # agent viết lại (lỗi 04/08: "Bạn có 8 cuộc họp" -> "hệ thống tìm thấy 22
+    # cuộc họp gắn với tài khoản của bạn").
     _plug._on_pre_llm_call(platform="feishu", session_id="s-conf",
                            turn_id="t9", user_message="liệt kê cuộc họp")
     _plug._on_post_tool_call(
         session_id="s-conf", tool_name="mcp__meetings__list_meetings",
-        result=qa.agent_only("đã gửi danh sách thẳng cho người dùng"),
+        result=qa.two_channel("Bạn có **2 cuộc họp**:\n1. Cuộc A\n2. Cuộc B"),
         status="ok")
-    check("list_meetings + câu an toàn -> giữ lời của agent",
+    check("danh sách -> tin nhắn CHÍNH LÀ chuỗi tool dựng, bỏ bản agent viết",
           _plug._on_transform_llm_output(
               platform="feishu", session_id="s-conf",
-              response_text="Danh sách của bạn ở trên nhé.")
-          == "Danh sách của bạn ở trên nhé.")
-    check("list_meetings + câu có số -> rơi về câu cố định",
-          _plug._on_transform_llm_output(
-              platform="feishu", session_id="s-conf",
-              response_text="Mình tìm thấy 22 cuộc họp của bạn")
-          == _plug._DIRECT_CONFIRM["list_meetings"])
+              response_text="Mình tìm thấy 22 cuộc họp của bạn, xem ở trên nhé")
+          == "Bạn có **2 cuộc họp**:\n1. Cuộc A\n2. Cuộc B")
+    check("không còn nhánh 'câu xác nhận' -> không sinh được tin thứ hai",
+          not hasattr(_plug, "_DIRECT_CONFIRM")
+          and not hasattr(_plug, "_safe_confirm"))
     _plug._cleanup_turn(session_id="s-conf")
 
     # =================================================================
-    part("34k. Ký ức hội thoại — bền qua reset phiên, KHÔNG nới quyền")
+    part("34k. Ký ức hội thoại — reset chủ động xoá sạch, KHÔNG nới quyền")
     # =================================================================
     with db.tx() as c:
         c.execute("DELETE FROM chat_memory")
@@ -3586,12 +4762,51 @@ def _main() -> int:
           and "Workforce Buổi 4" in (_allow.get("memory") or ""))
     check("...và vé phiên vẫn được cấp như cũ", bool(_allow.get("asker_token")))
 
+    # `/reset` phải xoá cả neo SQLite. Nếu chỉ Hermes quên lịch sử còn khối này
+    # sống, lượt sau gate lại bơm Workforce cũ vào prompt và reset chỉ là giả.
+    db.remember_meeting("on_RESET", "mtOLD", "Workforce cũ")
+    check("db.forget_meetings chỉ xoá ký ức đúng người",
+          db.forget_meetings("on_RESET") == 1
+          and db.recent_meetings("on_RESET") == []
+          and bool(db.recent_meetings("on_MEM")))
+    _reset_calls: list[str] = []
+    _keep_forget = _plug._forget_v2_memory
+    _keep_reset_ask = _plug._ask_v2
+    _plug._forget_v2_memory = lambda uid: (_reset_calls.append(uid) or True)
+    _plug._ask_v2 = lambda *a, **k: {
+        "decision": "allow", "asker_token": "tk-reset", "open_id": "ou_MEM"}
+    _plug._asked["sess-reset-old"] = time.time()
+    _plug._offered["sess-reset-old"] = time.time()
+    _reset_source = SimpleNamespace(
+        platform=SimpleNamespace(value="feishu"), user_id_alt="on_MEM",
+        user_id="ou_MEM", user_name="Nguoi Nho", chat_type="dm",
+        chat_id="oc_MEM")
+    _reset_event = SimpleNamespace(source=_reset_source, text="/lammoi",
+                                   channel_prompt=None)
+    try:
+        _reset_decision = _plug._on_pre_dispatch(event=_reset_event)
+        _plug._on_session_reset(old_session_id="sess-reset-old",
+                                new_session_id="sess-reset-new")
+    finally:
+        _plug._forget_v2_memory = _keep_forget
+        _plug._ask_v2 = _keep_reset_ask
+    check("`/lammoi` đổi thành `/reset`, xoá đúng ký ức V2 và trạng thái cũ",
+          _reset_calls == ["on_MEM"]
+          and _reset_decision == {"action": "rewrite", "text": "/reset"}
+          and not _plug._asked_recently("sess-reset-old")
+          and not _plug._offered_recently("sess-reset-old"),
+          str(_reset_calls))
+    _fcfg = (Path(__file__).resolve().parent.parent / "hermes" /
+             "feishu-config.yaml").read_text(encoding="utf-8")
+    check("có lệnh `/reset` và alias Việt `/lammoi` để làm mới đoạn chat",
+          "lammoi:" in _fcfg and "target: /reset" in _fcfg)
+
     # Plugin nối hồ sơ + ký ức vào channel_prompt, KHÔNG vào user message —
     # cùng lý lẽ với vé: Hermes lưu user message vào session DB.
     _keep_ask2 = _plug._ask_v2
     _plug._ask_v2 = lambda *a, **k: {
         "decision": "allow", "asker_token": "tk", "open_id": "ou_MEM",
-        "profile": "[HỒ SƠ CỦA BẠN]\nTên: Thư Ký.",
+        "profile": f"[HỒ SƠ CỦA BẠN]\nTên: {_profile.BOT_NAME}.",
         "memory": "[NGƯỜI NÀY VỪA HỎI VỀ NHỮNG CUỘC HỌP SAU]\n  • \"Workforce\""}
     _ev2 = SimpleNamespace(source=_source, text="gửi nguyên văn cuộc đó",
                            channel_prompt=None)
@@ -3600,7 +4815,7 @@ def _main() -> int:
     finally:
         _plug._ask_v2 = _keep_ask2
     check("plugin: hồ sơ + ký ức vào channel_prompt tạm thời",
-          "Thư Ký" in (_ev2.channel_prompt or "")
+          _profile.BOT_NAME in (_ev2.channel_prompt or "")
           and "Workforce" in (_ev2.channel_prompt or ""))
     check("plugin: KHÔNG nhét hồ sơ/ký ức vào tin nhắn người dùng",
           _ev2.text == "gửi nguyên văn cuộc đó")
@@ -3643,7 +4858,7 @@ def _main() -> int:
 
     _keep = (lark_api.minutes_list, orchestrator.enqueue_minute,
              orchestrator._note_verified_viewer, config.ENROLL_BACKFILL_DAYS,
-             tokenstore.get_access_token)
+             tokenstore.get_access_token, lark_api.im_send_card)
     _enqueued: list[str] = []
     try:
         config.ENROLL_BACKFILL_DAYS = 90
@@ -3652,6 +4867,7 @@ def _main() -> int:
         # phá enroll). Không stub thì phép kiểm im lặng đo nhầm nhánh lỗi.
         tokenstore.get_access_token = lambda *a, **k: "tok-gia"
         lark_api.minutes_list = _fake_minutes_list
+        lark_api.im_send_card = lambda *a, **k: {"message_id": "om_fake"}
         orchestrator.enqueue_minute = (
             lambda oid, mt, it, **kw: (_enqueued.append(mt), True)[1])
         orchestrator._note_verified_viewer = lambda mt, *a, **k: meta(
@@ -3662,7 +4878,7 @@ def _main() -> int:
     finally:
         (lark_api.minutes_list, orchestrator.enqueue_minute,
          orchestrator._note_verified_viewer, config.ENROLL_BACKFILL_DAYS,
-         tokenstore.get_access_token) = _keep
+         tokenstore.get_access_token, lark_api.im_send_card) = _keep
 
     check("nới ENROLL_BACKFILL_DAYS -> quét lùi đúng 90 ngày",
           _scanned.get("days") == 90, str(_scanned))
@@ -3714,6 +4930,65 @@ def _main() -> int:
            "askers"} <= set(_stats), str(_stats))
     check("heartbeat đếm đúng người đã enroll", _stats["users"] >= 1)
 
+    # --- Token: CHỈ đếm người còn active ------------------------------------
+    # Ca thật 06/09/2026: anh Phạm Hoàng Phúc bị `expired` từ 27/08, dòng đó nằm
+    # lại với mốc cũ, và `min_token_days` đọc MỌI dòng nên báo `token=-4.8d`
+    # suốt 6 ngày liền — trong khi cả 40 người còn lại đều ở mức 7,0 ngày. Sau
+    # ngần ấy ngày WARN, không ai còn nhìn con số đó nữa: đúng cái bẫy mà
+    # docstring đầu `heartbeat.py` cảnh báo.
+    add_user("ou_HET", "on_HET", "Da het han", status="expired")
+    with db.tx() as c:
+        c.execute("UPDATE tokens SET refresh_exp=? WHERE union_id='on_HET'",
+                  (int(time.time() * 1000) - 5 * 86_400_000,))
+        c.execute("UPDATE tokens SET refresh_exp=? WHERE status='active'",
+                  (int(time.time() * 1000) + 7 * 86_400_000,))
+    _days = _hb.min_token_days()
+    check("dòng token đã hết hạn KHÔNG kéo chỉ số xuống âm",
+          _days is not None and _days > 0, f"min_token_days={_days}")
+    check("...và vẫn đọc đúng người active sắp hết hạn nhất",
+          _days is not None and 6.0 <= _days <= 7.1, f"{_days}")
+
+    # --- Tuổi vòng quét: MỐC trong DB, và ca đua một giây trên log ----------
+    # Ca thật 19/08/2026 07:19: heartbeat báo `scan_cu=1440.0m` (24 giờ) trong khi
+    # cả đêm trước đó chỉ 0,2–4,3m và scanner chưa hề dừng. Gốc: log chỉ có
+    # `[HH:MM:SS]`, KHÔNG có ngày; scanner ghi thêm dòng `[07:19:01]` trong lúc
+    # heartbeat đã chụp `now = 07:19:00.9`, nhánh "coi như hôm qua" trừ đi trọn
+    # một ngày. Báo động giả kiểu này đắt: người vận hành học cách bỏ qua cảnh báo.
+    _hb_now = datetime.now()
+    alerts._mark_set(alerts._SCAN_OK,
+                     str(int((_hb_now.timestamp() - 90) * 1000)))
+    check("heartbeat đọc tuổi quét từ MỐC (không đoán từ log)",
+          _hb.scan_age_from_mark(_hb_now) == 1.5,
+          str(_hb.scan_age_from_mark(_hb_now)))
+    check("...và scan_age_min ưu tiên mốc đó",
+          _hb.scan_age_min(_hb_now) == 1.5, str(_hb.scan_age_min(_hb_now)))
+    # Mốc hỏng/thiếu -> rơi về log, và đường log KHÔNG được biến lệch giây thành
+    # 24 giờ nữa.
+    with db.tx() as _c:
+        _c.execute("DELETE FROM alert_state WHERE key=?", (alerts._SCAN_OK,))
+    check("mốc thiếu -> scan_age_from_mark trả None (rồi rơi về log)",
+          _hb.scan_age_from_mark(_hb_now) is None)
+    _hb_dir = Path(tempfile.mkdtemp(prefix="v2hb-"))
+    _keep_ll = _hb.latest_log
+    try:
+        _future = (_hb_now + _td(seconds=1)).strftime("%H:%M:%S")
+        _lg = _hb_dir / "v2-2026-08-19.log"
+        _lg.write_text(f"[{_future}] scan xong, 0 job mới" + chr(10),
+                       encoding="utf-8")
+        _hb.latest_log = lambda pat: str(_lg)
+        check("dòng log lệch 1 giây về TƯƠNG LAI -> tuổi 0, KHÔNG phải 1440m",
+              _hb.scan_age_min(_hb_now) == 0.0, str(_hb.scan_age_min(_hb_now)))
+        # Phần cuối log của ngày HÔM QUA thì vẫn phải nhận ra là cũ thật.
+        _yday = (_hb_now + _td(hours=2)).strftime("%H:%M:%S")
+        _lg.write_text(f"[{_yday}] scan xong, 0 job mới" + chr(10),
+                       encoding="utf-8")
+        _old_age = _hb.scan_age_min(_hb_now)
+        check("log của hôm qua (lệch 2 giờ về trước) vẫn tính là ~22 giờ",
+              _old_age is not None and 1300 < _old_age < 1330, str(_old_age))
+    finally:
+        _hb.latest_log = _keep_ll
+        __import__("shutil").rmtree(_hb_dir, ignore_errors=True)
+
     # Heartbeat cố ý KHÔNG import `v2.*` (nó phải chạy được cả khi V2 hỏng),
     # nên nó chép lại hai thứ nhỏ: danh sách mã lỗi im lặng và cách tách mã.
     # Chép là mời trôi dạt — phép kiểm này là dây buộc giữa hai bên.
@@ -3725,23 +5000,39 @@ def _main() -> int:
           _hb._ERR_CODE_RE.match(_err_sample).group(1)
           == jobstore.error_code(_err_sample))
 
-    # Ca thật 06/08/2026: 4 job `failed` trên máy đều là `empty_transcript`,
-    # tức sẽ failed VĨNH VIỄN. Đếm cả chúng nghĩa là heartbeat WARN mãi mãi, và
-    # một cảnh báo không bao giờ tắt là cảnh báo người ta học cách bỏ qua.
+    # Empty transcript ngắn thường chỉ là bản ghi im lặng. Nhưng ca thật
+    # 12/08/2026 có audio 1517s/2485s ra 0 chữ: đó là lỗi cần điều tra, không
+    # được nuốt chung với clip 3s/37s.
     wipe_jobs()
     jobstore.create(meta(minute_token="mtSILENT", title="Ban ghi im lang"),
                     status="delivered")
     jobstore.set_status("mtSILENT", "failed",
-                        error=f"[{jobstore.ERR_EMPTY_TRANSCRIPT}] 0 chữ")
+                        error=f"[{jobstore.ERR_SILENT_RECORDING}] "
+                              "clip ngắn không có lời nói")
+    jobstore.create(meta(minute_token="mtLONGEMPTY", title="Whisper nuot"),
+                    status="delivered")
+    jobstore.set_status("mtLONGEMPTY", "failed",
+                        error=f"[{jobstore.ERR_EMPTY_TRANSCRIPT}] 0 chữ "
+                              "(1517s audio, engine x)")
     jobstore.create(meta(minute_token="mtREAL", title="Hong that"),
                     status="delivered")
     jobstore.set_status("mtREAL", "failed",
                         error="[media_denied] không tải được bản ghi")
     _s2 = _hb.db_stats()
-    check("bản ghi im lặng KHÔNG tính là 'hỏng cần sửa'",
-          _s2["failed_act"] == 1, str(_s2.get("queue")))
+    check("chỉ bản ghi ngắn im lặng được bỏ; audio dài vẫn là lỗi cần sửa",
+          _s2["failed_act"] == 2, str(_s2.get("queue")))
     check("...nhưng vẫn hiện trong hình dạng hàng đợi (không giấu đi)",
-          _s2["queue"].get("failed") == 2)
+          _s2["queue"].get("failed") == 3)
+    wipe_jobs()
+    jobstore.create(meta(minute_token="mtJUSTQUEUED", title="Vua toi"))
+    jobstore.create(meta(minute_token="mtOLDDONE", title="Xong lau"),
+                    status="delivered")
+    jobstore.set_status("mtOLDDONE", "delivered",
+                        transcribed_at=int(time.time() * 1000) - 24 * 3_600_000)
+    _fresh_queue_stats = _hb.db_stats()
+    check("job vừa tới không bị báo tắc theo lần dịch cũ từ hôm trước",
+          _fresh_queue_stats["idle"] < 1.0,
+          str(_fresh_queue_stats.get("idle")))
     # Dòng log phải dựng được cả khi MỌI chỉ số đều None: máy vừa khởi động,
     # chưa có log, chưa có DB — đúng lúc cần heartbeat nhất.
     _empty = {k: None for k in
@@ -3764,12 +5055,11 @@ def _main() -> int:
         return base
 
     check("mọi thứ bình thường -> không báo gì", _hb.problems(_hbd()) == [])
-    # Ca thật 06/08/2026: đang nạp bù một loạt buổi đào tạo 2-3 tiếng audio.
-    # Mỗi vòng lặp dịch xong một cuộc rồi mới quét lại, nên khoảng cách giữa
-    # hai lần quét dài ra 20-30 phút. Bản đầu báo động liên tục suốt đợt đó.
-    check("scan cũ MÀ còn job trong hàng đợi -> im (vòng run đang làm việc)",
-          _hb.problems(_hbd(scan=35.0, backlog=3)) == [])
-    check("...hàng đợi rỗng mà vẫn không quét -> BÁO (lúc đó mới là kẹt thật)",
+    # Từ 13/08 scanner chạy riêng. Ca live có 28 job nên scan cũ 122 phút nhưng
+    # heartbeat vẫn báo OK; cuộc mới không vào DB và không tự gửi thẻ Lark.
+    check("scan cũ dù hàng đợi bận -> VẪN BÁO (scanner chạy riêng)",
+          _hb.problems(_hbd(scan=35.0, backlog=3)) == ["scan_cu=35.0m"])
+    check("hàng đợi rỗng mà vẫn không quét -> cũng BÁO",
           _hb.problems(_hbd(scan=35.0, backlog=0)) == ["scan_cu=35.0m"])
     check("còn job nhưng vừa dịch xong -> im, dù đang chạy chậm",
           _hb.problems(_hbd(backlog=5, idle=40.0)) == [])
@@ -3790,7 +5080,7 @@ def _main() -> int:
     check("plugin: post_tool status=blocked dù có marker cũng KHÔNG tính thành công",
           _plug._on_transform_llm_output(
               platform="feishu", session_id="s-blocked",
-              response_text="LLM bịa tiếp") == _plug._NO_TOOL_REPLY)
+              response_text="Bạn có 4 cuộc họp") == _plug._NO_TOOL_REPLY)
     _plug._cleanup_turn(session_id="s-blocked")
 
     # =================================================================
@@ -3809,6 +5099,44 @@ def _main() -> int:
               _second_blocked)
     finally:
         _lock1.close()
+
+    # Scanner nền phải tiếp tục chạy khi `process_queue` đang giữ main thread
+    # hàng giờ. Kiểm phần tick riêng, không mở mạng và không tạo thread vô hạn.
+    _scan_keep = (config.PAUSED, orchestrator.scan_once,
+                  orchestrator._backfill_base,
+                  whisper_supervisor.ensure_running,
+                  config.reload_switches, orchestrator._scan_cycle)
+    _scan_calls: list[str] = []
+    try:
+        config.PAUSED = False
+        orchestrator.scan_once = lambda: (_scan_calls.append("scan") or 3)
+        orchestrator._backfill_base = lambda: _scan_calls.append("base")
+        whisper_supervisor.ensure_running = lambda: (
+            _scan_calls.append("whisper") or "alive")
+        check("scanner tick: vẫn quét + ghi Base độc lập với queue worker",
+              orchestrator._scan_cycle() == 3
+              and _scan_calls == ["whisper", "scan", "base"],
+              str(_scan_calls))
+
+        # Giả lập `Event.wait`: lượt đầu tới hạn ngay, lượt hai dừng watcher.
+        class _OneTickStop:
+            calls = 0
+
+            def wait(self, _timeout):
+                self.calls += 1
+                return self.calls > 1
+
+        _scan_calls.clear()
+        config.reload_switches = lambda: False
+        orchestrator._scan_cycle = lambda: (_scan_calls.append("watch") or 1)
+        orchestrator._scan_watch(_OneTickStop())
+        check("scanner watcher: đến nhịp vẫn gọi scan khi worker có thể bận",
+              _scan_calls == ["watch"], str(_scan_calls))
+    finally:
+        (config.PAUSED, orchestrator.scan_once,
+         orchestrator._backfill_base,
+         whisper_supervisor.ensure_running,
+         config.reload_switches, orchestrator._scan_cycle) = _scan_keep
 
     # =================================================================
     part("34f. Whisper supervisor — tự cứu nhưng không được bật trùng")
@@ -4044,6 +5372,38 @@ def _main() -> int:
         qa.lark_api.base_records_all = _keep_rows
     check("record Base waiting_auth/failed KHÔNG bị coi là biên bản hoàn tất",
           not _completed, str(_completed))
+
+    # --- `v2 ask` phải thấy cuộc MỚI NHẤT, không phải cụm cũ nhất ------------
+    # Đo 18/08/2026 khi đang kiểm chính ca "Chat bot Nhân sự": `qa.context` gọi
+    # `records(limit=50)`, mà `limit` cắt phía Base TRẢ VỀ TRƯỚC, tức phía cũ.
+    # Với 255 record thật, `v2 ask` trả lời bằng cụm cũ nhất và gọi một cuộc
+    # 30/07 là "gần nhất" — người vận hành đọc thành "bot mất cuộc họp của tôi",
+    # đúng loại kết luận sai đã tốn cả buổi tối hôm nay. ACL có test riêng; ở đây
+    # thay `_only_visible` bằng hàm đồng nhất để khoá riêng THỨ TỰ và chỗ CẮT.
+    _keep_ctx = (qa.bitable.enabled, qa.lark_api.base_records_all,
+                 qa._only_visible, qa._pending_block)
+    qa.bitable.enabled = lambda: True
+    qa._only_visible = lambda rows, who: (list(rows), 0)
+    qa._pending_block = lambda who: ("", [])
+    # Base trả CŨ NHẤT TRƯỚC (F_WHEN là datetime epoch ms, xem bitable._meta_fields)
+    qa.lark_api.base_records_all = lambda *a, **k: [
+        {qa.bitable.F_TOKEN: f"obsgCTX{i:016d}",
+         qa.bitable.F_TITLE: f"CUOC-{i:03d}",
+         qa.bitable.F_WHEN: 1_780_000_000_000 + i * 86_400_000}
+        for i in range(120)]
+    try:
+        _ctx = qa.context({"open_id": "ou_C", "union_id": "on_C", "name": "C"},
+                          limit=10)
+    finally:
+        (qa.bitable.enabled, qa.lark_api.base_records_all,
+         qa._only_visible, qa._pending_block) = _keep_ctx
+    check("v2 ask lấy cuộc MỚI NHẤT vào ngữ cảnh", "CUOC-119" in _ctx,
+          _ctx[:200])
+    check("...và KHÔNG lấy cụm cũ nhất (đúng lỗi cắt sai đầu)",
+          "CUOC-000" not in _ctx, _ctx[:200])
+    check("...cắt đúng `limit` cuộc sau khi đã sắp mới-trước",
+          _ctx.count("CUOC-") == 10 and "CUOC-110" in _ctx,
+          f"đếm được {_ctx.count('CUOC-')}")
     _pend_b, _ = qa.pending_split(
         {"open_id": "ou_B", "union_id": "on_B", "name": "Binh"})
     check("job waiting_auth có record Base vẫn hiện ở khối CHƯA có biên bản",
@@ -4243,15 +5603,29 @@ def _main() -> int:
                  participants_source="calendar[verified]:Hop 34i")
     _m34i.attendees = [Attendee(open_id="ou_34i", union_id="on_34i")]
     jobstore.create(_m34i, status="held")
+    _m34i_new = meta(minute_token="obsg34INEWEST000000001",
+                     title="Workforce AI newest",
+                     owner_open_id="ou_34i",
+                     participants_source="calendar[verified]:Workforce AI")
+    _m34i_new.attendees = [Attendee(open_id="ou_34i", union_id="on_34i")]
+    jobstore.create(_m34i_new, status="held")
     _rec34i = {qa.bitable.F_TITLE: "Hop 34i", qa.bitable.F_TOKEN: _m34i.minute_token,
                qa.bitable.F_WHEN: "2026-08-05 09:00:00",
                qa.bitable.F_SUMMARY: "Noi dung 34i", qa.bitable.F_LINK: ""}
+    _rec34i_new = {
+        qa.bitable.F_TITLE: "Workforce AI newest",
+        qa.bitable.F_TOKEN: _m34i_new.minute_token,
+        qa.bitable.F_WHEN: "2026-08-13 18:05:00",
+        # Cố ý KHÔNG có chữ "họp": bug live tự search "họp" làm rơi đúng cuộc
+        # mới này rồi chọn record `work` 06/08.
+        qa.bitable.F_SUMMARY: "Noi dung AI moi", qa.bitable.F_LINK: ""}
     _keep_en34i, _keep_rows34i = qa.bitable.enabled, qa.lark_api.base_records_all
     qa.bitable.enabled = lambda: True
-    qa.lark_api.base_records_all = lambda *a, **k: [_rec34i]
+    qa.lark_api.base_records_all = lambda *a, **k: [_rec34i, _rec34i_new]
     try:
         _gm = qa.get_meeting(_who34i, "Hop 34i")
         _sm = qa.search_meetings(_who34i, "34i")
+        _lm = qa.latest_meeting(_who34i, "họp")
     finally:
         qa.bitable.enabled = _keep_en34i
         qa.lark_api.base_records_all = _keep_rows34i
@@ -4263,6 +5637,14 @@ def _main() -> int:
               qa.CONTEXT_END in _out.split(_int)[0])
         check(f"{_nm}: sổ sách (minute_token) vẫn ở kênh nội bộ",
               _m34i.minute_token in _out.split(_int)[-1])
+
+    check("latest_meeting: từ chung chung 'họp' không lọc rơi cuộc mới tiếng Anh",
+          "Workforce AI newest" in _lm
+          and qa.latest_marker(_m34i_new.minute_token) in _lm,
+          _lm[:240])
+    check("latest_meeting: token khóa nằm ở kênh nội bộ, không lộ cho user",
+          qa.latest_marker(_m34i_new.minute_token) not in _lm.split(_int)[0]
+          and qa.latest_marker(_m34i_new.minute_token) in _lm.split(_int)[-1])
 
     # Đúng chỗ plugin quyết định: khối DỮ LIỆU không được coi là câu trả lời.
     def _user_block34i(result: str) -> str:
@@ -4282,8 +5664,6 @@ def _main() -> int:
           _user_block34i(_sent34i) == "Đã gửi file biên bản X.")
     check("...và lời dặn agent không lọt vào phần người dùng",
           "đừng gọi lại tool" not in _user_block34i(_sent34i))
-    check("agent_only (sendlist) không có khối GỬI lẫn khối DỮ LIỆU",
-          _send not in qa.agent_only("x") and _ctx not in qa.agent_only("x"))
 
     # Plugin phải nhận ra kênh DỮ LIỆU bằng đúng chuỗi V2 phát ra.
     _plug34i = (Path(__file__).resolve().parent.parent / "hermes"
@@ -4333,8 +5713,9 @@ def _main() -> int:
     # `*nghiêng*` một dấu sao cũng không render trong lark_md — chỉ **đậm**.
     import re as _re34i
     _ital34i = _re34i.compile(r"(?<!\*)\*(?!\*)[^*\n]{1,80}\*(?!\*)")
-    _md_all = "\n".join([_md_out, _md_card, qa._FOOT_ASK, qa._FOOT_ALL,
-                         qa._FOOT_MIXED])
+    _md_all = "\n".join([_md_out, _md_card, qa._FOOT_ASK, qa._FOOT_COUNT,
+                         qa._FOOT_MORE] + list(qa.SRC_LABEL.values())
+                        + list(qa.SRC_HINT.values()))
     _bad_ital = _ital34i.search(_md_all)
     check("KHÔNG dùng '*nghiêng*' một dấu sao trong text người dùng đọc",
           _bad_ital is None, _bad_ital.group(0) if _bad_ital else "")
@@ -4355,23 +5736,33 @@ def _main() -> int:
     check("lỗi cũ KHÔNG có mã vẫn đọc được nguyên câu (đừng nuốt)",
           jobstore.error_code("loi cu") == ""
           and jobstore.error_text("loi cu") == "loi cu")
-    check("EmptyTranscript được gắn đúng mã ở nơi ném ra",
-          f"{{jobstore.ERR_EMPTY_TRANSCRIPT}}" in
-          (Path(__file__).resolve().parent / "pipeline.py").read_text(
-              encoding="utf-8"))
+    _pipeline_source34i = (
+        Path(__file__).resolve().parent / "pipeline.py").read_text(
+            encoding="utf-8")
+    check("pipeline gắn mã riêng cho silent recording và Whisper rỗng",
+          "jobstore.ERR_EMPTY_TRANSCRIPT" in _pipeline_source34i
+          and "jobstore.ERR_SILENT_RECORDING" in _pipeline_source34i)
     from v2 import alerts as _al34i
-    check("alerts: empty_transcript nằm trong danh sách KHÔNG DM",
-          jobstore.ERR_EMPTY_TRANSCRIPT in _al34i.SILENT_FAIL_CODES)
+    check("alerts: chỉ silent_recording thuộc nhóm KHÔNG DM",
+          jobstore.ERR_SILENT_RECORDING in _al34i.SILENT_FAIL_CODES
+          and jobstore.ERR_EMPTY_TRANSCRIPT not in _al34i.SILENT_FAIL_CODES)
     wipe_jobs()
     _f34i = meta(minute_token="obsg34IFAIL000000001", title="Hop im lang")
     jobstore.create(_f34i)
     jobstore.set_status(_f34i.minute_token, "failed",
-                        error="[empty_transcript] whisper khong ra chu nao")
+                        error="[silent_recording] clip ngan khong co loi noi")
     _pend34i: list = []
     _al34i._check_failed_jobs(_pend34i)
     check("job im lặng KHÔNG sinh cảnh báo DM nào", not _pend34i, str(_pend34i))
     check("...và cũng KHÔNG ghi mốc chống spam (bỏ mã đi là báo lại được)",
           _al34i._mark_get(f"job_failed:{_f34i.minute_token}") is None)
+    jobstore.set_status(_f34i.minute_token, "failed",
+                        error="[empty_transcript] whisper khong ra chu nao "
+                              "(1517s audio, engine x)")
+    _pend34i = []
+    _al34i._check_failed_jobs(_pend34i)
+    check("audio dài ra 0 chữ VẪN sinh cảnh báo", len(_pend34i) == 1,
+          str(_pend34i))
     jobstore.set_status(_f34i.minute_token, "failed",
                         error="khong ai duoc phep tai ban ghi nay")
     _pend34i = []
@@ -4412,7 +5803,7 @@ def _main() -> int:
     wipe_jobs()
 
     # =================================================================
-    part("34n. Bản chép sẵn của Lark — trả lời NGAY, rồi mời bản chuẩn")
+    part("34n. Luôn hỏi bản chuẩn Hapas — chỉ xử lý sau khi user đồng ý")
     # =================================================================
     # Ca thật 06/08/2026 18:11 (user gửi ảnh chụp): người dùng mở Lark Minutes
     # thấy ĐỦ CHỮ, hỏi bot thì bot đáp "CHƯA CÓ BIÊN BẢN — đang phiên âm" rồi từ
@@ -4494,23 +5885,26 @@ def _main() -> int:
         check("phanh có tác dụng thật: `get` không gọi thêm lời nào",
               _lt.get(_row2) == "" and len(_lt_calls) == _n)
 
-        # (c) qa: cuộc CHƯA phiên âm xong vẫn trả lời được, và có lời MỜI.
+        # (c) qa: cuộc CHƯA có Hapas vẫn trả lời bằng Lark, rồi hỏi có muốn bản
+        # chuẩn không; chỉ khi user đồng ý sendfile mới nâng ưu tiên + tự gửi.
         _whoLTA = {"union_id": "on_LTA", "open_id": "ou_LTA", "name": "A"}
         _whoOut = {"union_id": "on_NGOAI", "open_id": "ou_NGOAI", "name": "X"}
         _outLT = qa.get_transcript(_whoLTA, "mtLARK1")
         check("cuộc đang phiên âm: trả NỘI DUNG của Lark, không nói 'chưa có'",
-              "NGAN SACH" in _outLT and "chưa có nguyên văn" not in _outLT,
+              "NGAN SACH" in _outLT and "chưa có bản dịch" not in _outLT,
               _outLT[:200])
-        check("...gắn nhãn đúng nguồn, không giả vờ là bản nguyên văn chuẩn",
-              "bản chép sẵn của Lark" in _outLT)
+        # TÊN GỌI theo NGUỒN (user chốt 10/08/2026): người dùng phải phân biệt
+        # được bản của Lark với bản server Hapas, vì hai bản khác nhau về chất
+        # lượng. Khoá cả hai chiều: đúng nhãn nguồn, và KHÔNG nhận vơ là bản kia.
+        check("...gắn nhãn đúng nguồn (bản dịch từ Lark), không nhận vơ",
+              qa.BAN_LARK in _outLT and qa.BAN_HAPAS not in _outLT.split(
+                  qa.OFFER_MARK)[0])
         check("...đi kênh DỮ LIỆU để agent trả lời, KHÔNG phải 'chép y hệt'",
               _outLT.startswith(qa.CONTEXT_MARK) and qa.SEND_MARK not in _outLT)
-        check("...và có lời MỜI lấy bản chuẩn kèm ước tính thời gian",
-              qa.OFFER_MARK in _outLT and "phút" in _outLT.split(
-                  qa.INTERNAL_MARK)[-1], _outLT[-400:])
-        check("lời mời nằm ở kênh NỘI BỘ, người dùng không đọc thấy mã máy",
-              qa.INTERNAL_MARK in _outLT
-              and qa.OFFER_MARK in _outLT.split(qa.INTERNAL_MARK)[-1])
+        check("chưa có file Hapas -> vẫn mời, kèm ETA thật và điều kiện đồng ý",
+              qa.OFFER_MARK in _outLT and "phút" in _outLT
+              and "nếu họ đồng ý" in _outLT,
+              _outLT[-400:])
 
         # (d) CỬA QUYỀN không đổi. Bản Lark là một nguồn nội dung MỚI, nên nếu
         # nó đi vòng qua `_may_see` thì §20 sập — người ngoài đọc được cuộc họp
@@ -4518,7 +5912,9 @@ def _main() -> int:
         _outNo = qa.get_transcript(_whoOut, "mtLARK1")
         check("người KHÔNG dự vẫn bị chặn, không lọt một chữ nào của bản Lark",
               "NGAN SACH" not in _outNo
-              and "không có trong danh sách người dự" in _outNo, _outNo[:160])
+              and "trong các cuộc họp bạn có quyền xem" in _outNo
+              and "Workforce" not in _outNo and "quản trị" not in _outNo,
+              _outNo[:200])
         check("who=None vẫn từ chối như cũ",
               qa.get_transcript(None, "mtLARK1") == qa.NO_ASKER)
 
@@ -4530,22 +5926,26 @@ def _main() -> int:
         qa.lark_api.base_records_all = lambda *a, **k: []
         _outGM = qa.get_meeting(_whoLTA, "Hop chua phien am")
         check("get_meeting cuộc chưa lên Base: cũng trả nội dung Lark",
-              "NGAN SACH" in _outGM and qa.OFFER_MARK in _outGM, _outGM[:200])
+              "NGAN SACH" in _outGM and qa.OFFER_MARK in _outGM,
+              _outGM[:200])
         check("get_meeting: người ngoài vẫn không thấy gì",
               "NGAN SACH" not in qa.get_meeting(_whoOut, "Hop chua phien am"))
         # Cuộc KHÔNG đọc được bản nào thì vẫn phải nói thật, không được im.
         _outNone = qa.get_meeting(_whoLTA, "Khong ai doc duoc")
         qa.bitable.enabled, qa.lark_api.base_records_all = _keepEnLT, _keepRowsLT
-        check("không đọc được bản nào -> nói thẳng, và KHÔNG mời bản chuẩn",
+        check("không đọc được bản nào -> nói thẳng, vẫn hỏi có xử lý Hapas không",
               "chưa đọc được bản chép nào" in _outNone
-              and qa.OFFER_MARK not in _outNone, _outNone[:200])
+              and qa.OFFER_MARK in _outNone, _outNone[:200])
 
-        # (e2) ĐÃ CÓ whisper thì TUYỆT ĐỐI không được phục vụ bản Lark.
-        # Lỗi tự tạo ra khi thêm đường này (bắt được 09/08/2026 lúc kiểm lại):
-        # job `held` CÓ nguyên văn nhưng ghi record hỏng thì vẫn nằm trong khối
-        # "chưa có biên bản", nên `get_meeting` đi thẳng xuống `from_lark` và
-        # đưa bản KÉM HƠN — rồi còn mời "phiên âm lại, mất khoảng 10 phút"
-        # trong khi file đã nằm sẵn trên đĩa. Bot hứa một việc nó không cần làm.
+        # (e2) ĐÃ CÓ bản Hapas thì VẪN phục vụ bản Lark, nhưng lời mời phải đổi
+        # sang "đã sẵn sàng, nhận luôn không".
+        #
+        # ĐẢO lại luật 09/08 theo anh Thiện 10/08/2026: "cứ để bản Lark rồi mời
+        # người ta theo nhu cầu ấy, hỏi là có bản dịch trên server Hapas đã sẵn
+        # sàng có muốn nhận luôn không". Cái SAI hồi 09/08 không phải thứ tự
+        # phục vụ mà là ÂM THẦM đưa bản kém: lời mời khi đó còn hứa "phiên âm
+        # lại, mất khoảng 10 phút" trong khi file đã nằm sẵn trên đĩa. Phần đó
+        # vẫn phải chặn, và hai phép kiểm dưới khoá đúng nó.
         _mDONE = meta(minute_token="mtLARK3", title="Da co whisper roi",
                       owner_open_id="ou_LTOWN", attendees=_attLT,
                       participants_source="calendar[verified]:x")
@@ -4554,21 +5954,22 @@ def _main() -> int:
             "mtLARK3", [(0.0, "cau whisper chinh xac hon")]))
         _rowDONE = dict(jobstore.get("mtLARK3"))
         _lt.path_of("mtLARK3").write_text("BAN LARK KEM HON", encoding="utf-8")
-        check("đã có nguyên văn whisper -> from_lark TỪ CHỐI phục vụ bản Lark",
-              qa.from_lark(_rowDONE, "Da co whisper roi") == "")
-        _keepEnLT2, _keepRowsLT2 = qa.bitable.enabled, qa.lark_api.base_records_all
-        qa.bitable.enabled = lambda: True
-        qa.lark_api.base_records_all = lambda *a, **k: []
-        _outDONE = qa.get_meeting(_whoLTA, "Da co whisper roi")
-        qa.bitable.enabled, qa.lark_api.base_records_all = _keepEnLT2, _keepRowsLT2
-        check("...get_meeting chỉ sang nguyên văn, KHÔNG đưa bản Lark",
-              "BAN LARK KEM HON" not in _outDONE
-              and "get_transcript" in _outDONE, _outDONE[:200])
-        check("...và KHÔNG mời phiên âm lại thứ đã phiên âm xong",
-              qa.OFFER_MARK not in _outDONE
-              and "chờ phiên âm" not in _outDONE.replace("đừng bảo họ chờ "
-                                                         "phiên âm", ""),
-              _outDONE[:200])
+        _servedDONE = qa.from_lark(_rowDONE, "Da co whisper roi")
+        check("đã có bản Hapas -> VẪN đưa bản Lark cho người ta đọc ngay",
+              "BAN LARK KEM HON" in _servedDONE, _servedDONE[:200])
+        check("...và mời NHẬN LUÔN vì bản chuẩn đã sẵn sàng",
+              qa.OFFER_MARK in _servedDONE and "ĐÃ SẴN SÀNG" in _servedDONE
+              and "nhận luôn" in _servedDONE, _servedDONE[-400:])
+        # Đây mới là lỗi thật của bản 09/08, và nó vẫn phải chết: hứa "mất N
+        # phút" cho một file đã nằm sẵn trên đĩa.
+        check("...TUYỆT ĐỐI không hứa chờ phiên âm thứ đã phiên âm xong",
+              "mất " not in _servedDONE and "phiên âm lại" not in _servedDONE,
+              _servedDONE[-400:])
+        _readyNote = qa._lark_note("mtLARK3", "x", hapas_ready=True)
+        _waitNote = qa._lark_note("mtLARK1", "x", hapas_ready=False)
+        check("chưa có bản Hapas -> vẫn hỏi, chỉ xử lý khi user đồng ý",
+              qa.OFFER_MARK in _waitNote and "nếu họ đồng ý" in _waitNote
+              and "nhận luôn" not in _waitNote and _waitNote != _readyNote)
         _lt.path_of("mtLARK3").unlink(missing_ok=True)
 
         # (f) Danh sách: cuộc đã tải được bản Lark phải được NÓI RA, không thì
@@ -4631,6 +6032,9 @@ def _main() -> int:
     check("dấu MỜI: chuỗi của qa.py và của plugin khớp NGUYÊN VĂN",
           qa.OFFER_MARK == _plug._OFFER_MARK,
           f"{qa.OFFER_MARK!r} vs {_plug._OFFER_MARK!r}")
+    check("dấu KHÓA CUỘC MỚI NHẤT khớp giữa backend và plugin",
+          qa.LATEST_MARK_PREFIX == _plug._LATEST_MARK_PREFIX,
+          f"{qa.LATEST_MARK_PREFIX!r} vs {_plug._LATEST_MARK_PREFIX!r}")
 
     _plug._offered.clear()
     _plug._asked.clear()
@@ -4661,6 +6065,45 @@ def _main() -> int:
     check("đã mời nhưng câu KHÔNG phải đồng ý -> vẫn chặn",
           (_gate_send("sess-of", "thế cuộc hôm qua thì sao") or {})
           .get("action") == "block")
+
+    # --- Đáp lại lời mời bằng cách CHỈ VÀO một cuộc (10/08/2026) -----------
+    # Chân trang danh sách nay mời bằng lời ("cần bản dịch chuẩn của cuộc nào
+    # thì cứ nói với mình nhé"), nên người ta đáp cũng bằng lời. Trước bản này
+    # những câu đó không gọi tên bản ghi nên bị chặn — bot mời rồi bot chặn
+    # chính câu trả lời cho lời mời của mình.
+    for _q in ("cho mình cuộc 2", "cái 2", "số 3 nhé", "cuộc 04/08", "2"):
+        check(f"đã mời + chỉ vào một cuộc -> CHO gửi: {_q!r}",
+              _gate_send("sess-of", _q) is None)
+    # Vế thứ hai của luật vẫn phải còn: KHÔNG có lời mời thì chỉ trỏ không mở
+    # được cửa nào — nếu không, agent tự nhắc số rồi tự coi là được yêu cầu.
+    for _q in ("cho mình cuộc 2", "cái 2", "2"):
+        check(f"CHƯA mời mà chỉ vào một cuộc -> vẫn chặn: {_q!r}",
+              (_gate_send("sess-chua-moi", _q) or {}).get("action") == "block")
+    check("câu dài không còn là 'chỉ trỏ' -> không lọt",
+          not _plug._picks_item(_plug._plain(
+              "cuộc 2 tuần trước có bàn gì về ngân sách quý 4 không bạn")))
+    _keep_lt_of = qa.list_text
+    qa.list_text = lambda who, **kw: "DANH SACH\n" + qa._FOOT_ASK
+    try:
+        _lm = qa.list_meetings({"union_id": "on_A", "open_id": "ou_A",
+                                "name": "An"})
+    finally:
+        qa.list_text = _keep_lt_of
+    check("danh sách PHẢI phát dấu MỜI, không thì cổng trên vô nghĩa",
+          qa.OFFER_MARK in _lm)
+    check("...và dấu mời nằm ở kênh NỘI BỘ, không lọt ra chat",
+          qa.OFFER_MARK not in _lm.split(qa.END_MARK)[0]
+          and "DANH SACH" in _lm.split(qa.END_MARK)[0])
+    check("...kèm lời dặn KHÔNG đoán khi câu đáp không rõ cuộc nào",
+          "HỎI LẠI" in _lm)
+    qa.list_text = lambda who, **kw: "DANH SACH CHI CO LARK\n" + qa._FOOT_ASK
+    try:
+        _lm_no_hapas = qa.list_meetings(
+            {"union_id": "on_A", "open_id": "ou_A", "name": "An"})
+    finally:
+        qa.list_text = _keep_lt_of
+    check("danh sách chỉ có Lark -> vẫn phát dấu mời Hapas",
+          qa.OFFER_MARK in _lm_no_hapas, _lm_no_hapas)
     # Cái bẫy: "có" đứng đầu một câu HỎI. Không có phép kiểm độ dài + phạm vi
     # nghiệp vụ thì bot gửi file khi người ta chỉ đang hỏi lịch họp.
     check("'có cuộc họp nào hôm nay' là câu HỎI, không phải lời đồng ý",
@@ -4675,11 +6118,31 @@ def _main() -> int:
           (_gate_send("sess-of", "có") or {}).get("action") == "block")
 
     # Lời mời phải sống QUA LƯỢT: bot mời ở lượt N, người dùng đáp ở lượt N+1.
-    # `post_llm_call` chạy giữa hai lượt đó.
+    # Hermes 14/08 còn phát hook có tên gây hiểu nhầm `on_session_end` sau MỖI
+    # run_conversation. Bản 1.10 đăng ký hook đó vào `_cleanup_session`, nên
+    # selftest trực tiếp dưới đây xanh nhưng runtime vẫn quên lời mời. Kiểm cả
+    # BẢNG ĐĂNG KÝ HOOK, không chỉ kiểm từng hàm riêng.
     _plug._mark_offered("sess-live")
     _plug._cleanup_turn(session_id="sess-live")
     check("hết một lượt KHÔNG xoá lời mời (không thì câu 'có' vô nghĩa)",
           _plug._offered_recently("sess-live"))
+
+    class _HookCapture:
+        def __init__(self):
+            self.hooks = {}
+
+        def register_hook(self, name, fn):
+            self.hooks[name] = fn
+
+    _hook_capture = _HookCapture()
+    _plug.register(_hook_capture)
+    check("plugin: on_session_end của Hermes chỉ dọn LƯỢT, không dọn lời mời",
+          _hook_capture.hooks.get("on_session_end") is _plug._cleanup_turn)
+    _hook_capture.hooks["on_session_end"](
+        session_id="sess-live", completed=True, interrupted=False)
+    check("luồng thật: qua post_llm + on_session_end rồi câu 'có' vẫn CHO gửi",
+          _plug._offered_recently("sess-live")
+          and _gate_send("sess-live", "có") is None)
     _plug._cleanup_session(session_id="sess-live")
     check("hết PHIÊN thì mới xoá, không để lời mời sống mãi",
           not _plug._offered_recently("sess-live"))
@@ -4692,11 +6155,20 @@ def _main() -> int:
     # sách, không phải từ để đưa vào câu văn xuôi.
     check("policy có dặn KHÔNG nhại lại nhãn trạng thái viết hoa",
           "NHẠI LẠI NGÔN NGỮ MÁY" in _plug._POLICY)
-    check("policy có dạy luồng: trả lời bằng bản Lark -> mời bản chuẩn",
-          "bản chép sẵn của Lark" in _plug._POLICY
-          and "send_transcript_file" in _plug._POLICY)
+    check("policy có dạy: mọi cuộc đều hỏi bản chuẩn Hapas",
+          "bản dịch từ Lark" in _plug._POLICY
+          and "bản dịch từ server của Hapas" in _plug._POLICY
+          and "ĐÃ SẴN SÀNG" in _plug._POLICY
+          and "LUÔN hỏi" in _plug._POLICY
+          and "chỉ khi họ đồng ý" in _plug._POLICY)
     check("policy đổi version để phiên cũ nhận chính sách mới",
-          _plug.POLICY_VERSION.endswith("2026-08-07.1"), _plug.POLICY_VERSION)
+          _plug.POLICY_VERSION.endswith("2026-08-19.1"), _plug.POLICY_VERSION)
+    # Ca thật 19/08: bot đáp "chưa thể phân tích trực tiếp từ bản Hapas". Sau khi
+    # tool đã có đường, policy phải nói thẳng rằng câu đó nay là câu trả lời SAI.
+    check("policy dạy: họ chỉ định nguồn thì đọc đúng nguồn đó",
+          'source="hapas"' in _plug._POLICY
+          and "HỌ CHỈ ĐỊNH NGUỒN" in _plug._POLICY
+          and "MỘT NGUỒN MỘT LƯỢT" in _plug._POLICY)
 
     # --- Ước tính phải TỚI được người dùng qua sendfile -------------------
     wipe_jobs()
@@ -4705,6 +6177,9 @@ def _main() -> int:
                 attendees=[Attendee(open_id="ou_S", union_id="on_S")],
                 participants_source="calendar[verified]:x")
     jobstore.create(_mSF, status="held")
+    # `send_transcript` từ chối người chưa enroll (28/08 — xem `sendfile` 2b).
+    # Nhóm này kiểm câu ƯỚC TÍNH, không kiểm enroll, nên cấp danh tính thật.
+    add_user("ou_S", "on_S", "S")
     _whoS = {"union_id": "on_S", "open_id": "ou_S", "name": "S"}
     _sf = sendfile.send_transcript(_whoS, "mtETASF")
     check("xin bản chuẩn khi chưa có -> hứa TỰ GỬI, kèm con số ước tính",

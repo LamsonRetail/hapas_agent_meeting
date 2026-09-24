@@ -1,0 +1,90 @@
+# Khai báo agent với LSR Agent Platform (LamsonRetail) — dạng EXTERNAL.
+#
+# ĐÃ ĐĂNG KÝ 20/08/2026 (xem docs/LSR_PLATFORM.md §5). File này không được code
+# nào đọc — nó là hồ sơ, không phải cấu hình. Sửa ở đây KHÔNG đổi gì trên
+# platform; muốn đổi bản ghi thật thì xem §7.
+#
+# External nghĩa là: platform quan sát + điều phối, KHÔNG host và KHÔNG đụng
+# runtime (PLAN.md §10c(1) của họ: "platform không kill process được"). V2 vẫn
+# chạy trên máy này, vẫn app Lark riêng, vẫn OAuth enroll riêng.
+#
+# Khuôn lấy từ scripts/lsr_adopt.py của platform, sửa lại cho đúng sự thật ở ba
+# chỗ (sdk / model / bot.app) — khuôn gốc mặc định mọi agent đều là Claude Agent
+# SDK, bot này thì không.
+
+apiVersion: lsr/v1
+
+agent:
+  id: AG-MEETINGNOTE          # owner chốt 20/08/2026. Vẫn phải xử lý chuyện trùng
+                              # nghề với AG-MINH-ANH / AG-DATA-SUPPORT (cả hai đã
+                              # khai "biên bản họp") — xem docs/LSR_PLATFORM.md §4
+  name: Mino Lê - Meeting Note Assistant
+                              # Owner đổi 20/08/2026, sau khi đã enroll. Bản ghi
+                              # trên platform VẪN đang là "MeetingxLark": cột
+                              # `name` chỉ ghi được lúc INSERT, không endpoint
+                              # nào sửa. Xem docs/LSR_PLATFORM.md §7.
+  version: 2.0.0-dev          # khớp v2/__init__.py __version__
+  owner: thamnt@hapas.vn
+  squad: PLATFORM             # không thuộc đội nào: phục vụ bất kỳ ai được mời
+                              # họp. Theo tiền lệ AG-LSR-BRAIN — "agent nền tảng,
+                              # phục vụ mọi squad". Gán vào một đội cụ thể là
+                              # khai sai. Bước golive sau này cần team_id, lúc đó
+                              # tính tiếp.
+  is_squad_agent: false
+  connect_mode: bot
+  description: >
+    Họp Lark kết thúc thì tự phát hiện, tải bản ghi, phiên âm bằng Whisper chạy
+    tại chỗ, sinh biên bản, rồi gửi cho những người được mời đã enroll OAuth.
+    Không cần ai yêu cầu. Kèm bot hỏi đáp về nội dung họp trong Lark.
+
+deployment:
+  mode: external              # team tự vận hành; platform không host, không kill
+  repo_url: https://github.com/tientham2005/MeetingxLark.git
+  host_note: >
+    Chạy trên một máy Windows tại chỗ (không VPS). Bốn phần cùng máy: v2/ trong
+    repo, Whisper server ngoài repo, Hermes ngoài repo, hộp thư OAuth trên
+    Vercel. Bản đồ đầy đủ ở README.md mục "Ở ĐÂU CÓ GÌ".
+
+lark:
+  connect_mode: bot
+  bot:
+    app: custom               # app Lark RIÊNG của MeetingxLark, có trước platform.
+                              # Định danh app nằm trong v2/.env trên máy owner,
+                              # KHÔNG nằm ở /opt/lsr-platform/.env của platform.
+                              # => thao tác "cắt Lark" khi deactivate KHÔNG với
+                              # tới app này; muốn cắt phải là admin tenant Lark.
+    chat_ids: []              # không hoạt động theo nhóm: biên bản gửi 1-1 cho
+                              # người được mời đã enroll (luật ACL đã chốt)
+
+runtime:
+  sdk: custom-python          # KHÔNG phải claude-agent-sdk. Não recap là Hermes
+                              # chạy tại chỗ, V2 gọi nó qua wire format OpenAI
+                              # ở http://127.0.0.1:8642/v1 (v2/summarize.py).
+  auth: subscription          # đúng nghĩa: Hermes chạy provider openai-codex,
+                              # đăng nhập bằng subscription ChatGPT của owner
+                              # (auth.json trong thư mục Hermes). Không có khoá
+                              # nhà cung cấp nào trong luồng này.
+  model: hermes               # bí danh nội bộ; provider thật là openai-codex
+
+skills:
+  - {name: meetings, type: mcp}          # mcp-meetings.bat — dữ liệu họp cho bot
+  - {name: v2-enroll-gate, type: plugin} # cửa vào: chặn người chưa enroll OAuth
+  - {name: whisper, type: local}         # phiên âm tại chỗ, không gửi audio ra ngoài
+
+telemetry:
+  enabled: true               # v2/telemetry.py. CẢNH BÁO: code mặc định TẮT
+                              # (V2_TELEMETRY=0). Chỉ nộp file này SAU khi đã bật
+                              # thật và smoke test thông, nếu không là khai sai.
+  collector: https://collector.34-126-154-135.sslip.io
+  content_policy: metadata-only
+                              # mặc định chỉ gửi trạng thái + số liệu. Nội dung
+                              # biên bản KHÔNG rời máy này (V2_TELEMETRY_CONTENT=0).
+
+tests:
+  suite: ""                   # chưa có bộ test dạng platform. Repo có
+                              # `python -m v2 selftest` + `doctor` nhưng chúng
+                              # kiểm hệ thống tại chỗ, không phải bộ test có nhãn
+                              # mà platform chấm. Điền khi làm golive.
+
+schedule: []                  # V2 tự chạy vòng lặp riêng (run-v2-auto.bat),
+                              # không nhờ platform lên lịch.

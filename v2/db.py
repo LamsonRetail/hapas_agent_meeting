@@ -152,27 +152,21 @@ CREATE TABLE IF NOT EXISTS alert_state (
     updated_at INTEGER
 );
 
--- Chống gửi lặp cho các tin trực tiếp không gắn với một meeting/delivery cụ thể
--- (hiện là list_meetings). Bền qua restart MCP/gateway; fingerprint là SHA-256,
--- không lưu thêm nội dung cuộc họp vào bảng điều khiển.
-CREATE TABLE IF NOT EXISTS outbound_dedup (
-    channel     TEXT NOT NULL,
-    recipient   TEXT NOT NULL,
-    fingerprint TEXT NOT NULL,
-    reserved_at INTEGER NOT NULL,
-    PRIMARY KEY (channel, recipient)
-);
-
 -- "Vé phiên" của người đang hỏi bot (v2/askers.py). Vì sao phải có bảng thay vì
 -- truyền thẳng union_id: MCP server là MỘT tiến trình dùng chung, lời gọi tool
 -- không mang danh tính, nên vé đi đường vòng qua tin nhắn (plugin Hermes chèn) và
 -- V2 phải tra lại được vé đó. Ngẫu nhiên + hết hạn = người khác không mượn được.
+-- `room_chat_id`: vé cấp cho câu hỏi TRONG NHÓM thì buộc luôn vào chat_id của
+-- nhóm đó, và `qa._may_see` sẽ chỉ mở những cuộc mà chính nhóm ấy được mời.
+-- Buộc vào VÉ chứ không truyền như tham số: agent không thể bỏ qua một trường
+-- nó không cầm, còn tham số thì nó quên là quyền nới ra im lặng. Rỗng = chat 1-1.
 CREATE TABLE IF NOT EXISTS qa_sessions (
-    token      TEXT PRIMARY KEY,
-    union_id   TEXT,
-    open_id    TEXT,
-    name       TEXT,
-    expires_at INTEGER
+    token        TEXT PRIMARY KEY,
+    union_id     TEXT,
+    open_id      TEXT,
+    name         TEXT,
+    expires_at   INTEGER,
+    room_chat_id TEXT
 );
 
 -- Ghi từng lần gửi để truy 'ai nhận gì, lúc nào'.
@@ -308,6 +302,14 @@ def _migrate() -> None:
                 c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
                 print(f"[db] thêm cột jobs.{col}")
 
+        # 28/08/2026: vé phiên mang thêm phạm vi PHÒNG (hỏi đáp trong nhóm).
+        # DB đã tồn tại thì `CREATE TABLE IF NOT EXISTS` không thêm cột.
+        have_qa = {r["name"] for r in
+                   c.execute("PRAGMA table_info(qa_sessions)")}
+        if "room_chat_id" not in have_qa:
+            c.execute("ALTER TABLE qa_sessions ADD COLUMN room_chat_id TEXT")
+            print("[db] thêm cột qa_sessions.room_chat_id")
+
         # 05/08/2026: thiếu người có token tải recording không phải job hỏng.
         # Park sáu job cũ (và mọi bản cùng hình dạng) để không retry nóng/DM mời
         # OAuth. Khi một người liên quan TỰ nhắn bot + OAuth, jobstore mới đánh
@@ -338,42 +340,11 @@ def tx() -> Iterator[sqlite3.Connection]:
         c.execute("COMMIT")
 
 
-# ------------------------------------------ chống gửi lặp bền qua process restart
-
-
-def try_reserve_outbound(channel: str, recipient: str, fingerprint: str,
-                         within_seconds: int) -> bool:
-    """Đặt chỗ gửi nguyên tử. False nếu cùng nội dung vừa được đặt chỗ/gửi.
-
-    Đặt chỗ trước network call để hai MCP process không cùng vượt qua phép kiểm.
-    Caller phải gọi ``release_outbound`` khi gửi hỏng để lần sau được thử lại ngay.
-    """
-    now = _now_ms()
-    cutoff = now - max(0, int(within_seconds)) * 1000
-    with tx() as c:
-        row = c.execute(
-            "SELECT fingerprint, reserved_at FROM outbound_dedup "
-            "WHERE channel=? AND recipient=?", (channel, recipient),
-        ).fetchone()
-        if (row and row["fingerprint"] == fingerprint
-                and int(row["reserved_at"] or 0) >= cutoff):
-            return False
-        c.execute(
-            "INSERT INTO outbound_dedup(channel, recipient, fingerprint, reserved_at) "
-            "VALUES (?,?,?,?) ON CONFLICT(channel,recipient) DO UPDATE SET "
-            "fingerprint=excluded.fingerprint, reserved_at=excluded.reserved_at",
-            (channel, recipient, fingerprint, now),
-        )
-        return True
-
-
-def release_outbound(channel: str, recipient: str, fingerprint: str) -> None:
-    """Bỏ đúng reservation vừa tạo khi network call hỏng; không xoá lượt mới hơn."""
-    with tx() as c:
-        c.execute(
-            "DELETE FROM outbound_dedup WHERE channel=? AND recipient=? "
-            "AND fingerprint=?", (channel, recipient, fingerprint),
-        )
+# Bảng `outbound_dedup` + `try_reserve_outbound`/`release_outbound` đã bỏ
+# 10/08/2026 cùng với `sendlist`: chúng chống việc MỘT lượt hỏi sinh ra nhiều
+# tin nhắn giống nhau, mà nay không tool nào tự gửi tin nữa — câu trả lời đi
+# đúng một đường, qua câu cuối của agent. Bảng cũ còn nằm lại trong state.db
+# của máy đang chạy thì cứ để đó, không code nào đọc nữa.
 
 
 # --------------------------------------------------- chống trùng minute

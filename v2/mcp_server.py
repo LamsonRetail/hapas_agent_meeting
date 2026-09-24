@@ -16,8 +16,9 @@ Cấu hình phía Hermes — `~/.hermes/config.yaml`:
         cwd: "E:/meetingxlark"      # nếu Hermes hỗ trợ; nếu không, dùng đường
                                     # dẫn tuyệt đối tới python trong venv của V2
 
-Sáu tool. ĐỌC: list_meetings, get_meeting, search_meetings, get_transcript.
-GHI (có tác dụng ra ngoài): create_task, send_transcript_file.
+Mười tool. ĐỌC cuộc họp: list_meetings, latest_meeting, get_meeting,
+search_meetings, get_transcript. GHI cuộc họp (có tác dụng ra ngoài):
+create_task, send_transcript_file. Ba tool còn lại quản lý glossary cho admin.
 
 Hai tool GHI, mỗi cái một file riêng ngoài `qa.py`, và mọi ràng buộc cưỡng chế
 bằng CODE — KHÔNG dựa vào mô tả tool, vì nội dung họp chảy vào prompt và có thể
@@ -48,7 +49,7 @@ from typing import Any, Callable
 from . import qa
 
 PROTOCOL_VERSION = "2025-06-18"
-SERVER_INFO = {"name": "meetingxlark-v2", "version": "1.0.0"}
+SERVER_INFO = {"name": "meetingxlark-v2", "version": "1.1.0"}
 
 # Cảnh báo gửi KÈM mỗi kết quả tool. Nội dung họp là lời người ta nói, chảy thẳng
 # vào prompt của agent — phải nói rõ với agent rằng đó là dữ liệu, không phải
@@ -78,49 +79,96 @@ def _who(a: dict[str, Any]):
     return askers.resolve(str(a.get("asker_token") or ""))
 
 
-def _tool_list_meetings(a: dict[str, Any]) -> str:
-    """Danh sách GỬI THẲNG cho người hỏi, agent không cầm nội dung.
+def _log_mcp_call(tool_name: str, a: dict[str, Any], meeting_title: str = "", response_summary: str = "") -> None:
+    try:
+        who = _who(a)
+        if who:
+            prompt = str(a.get("query") or a.get("keyword") or a.get("minute_token") or a.get("summary") or "")
+            from . import audit
+            audit.log_qa_event(
+                name=who.get("name") or "",
+                union_id=who.get("union_id") or "",
+                prompt=prompt,
+                tool_called=tool_name,
+                meeting_title=meeting_title,
+                # Không suy trạng thái từ việc tool được gọi. `held` là trạng
+                # thái job thật, không phải từ đồng nghĩa với "tool chạy xong".
+                meeting_status="",
+                response=response_summary
+            )
+    except Exception:
+        pass
 
-    Đi qua `sendlist` chứ không `qa.list_meetings` (04/08/2026): xem đầu
-    `sendlist.py` để biết vì sao — ba lượt siết prompt đều không ngăn được agent
-    viết lại con số. Đường terminal và ca Lark hỏng vẫn rơi về `list_meetings`,
-    `sendlist` lo việc đó.
+
+def _tool_list_meetings(a: dict[str, Any]) -> str:
+    """Danh sách trả về theo kênh GỬI NGUYÊN VĂN — MỘT tin nhắn, không hai.
+
+    Bỏ đường `sendlist.send_list` (10/08/2026, user chốt sau ảnh chụp chat của
+    anh Thiện). Đường đó gửi thẳng danh sách vào khung chat rồi để agent nói
+    thêm một câu "danh sách ở trên nhé", nên mỗi câu hỏi nhận về HAI tin: một
+    thẻ dài và một câu thừa lặp lại chính nó. Người dùng đọc thành bot trả lời
+    song song.
+
+    Vì sao trả về được cho agent mà không sợ nó viết lại con số — cái lo đã
+    dựng nên `sendlist` ngày 04/08: từ 09/08/2026 plugin Hermes
+    (`_on_transform_llm_output`) LẤY thẳng khối GỬI NGUYÊN VĂN của tool làm câu
+    trả lời cuối và VỨT bản LLM vừa viết. Lúc `sendlist` ra đời chưa có lớp đó,
+    nên "chép y hệt" mới chỉ là lời đề nghị trong prompt. Nay nó là code, và là
+    code nằm ở đúng chỗ cuối cùng trước khi tin nhắn rời máy.
     """
-    from . import sendlist
-    return sendlist.send_list(_who(a),
-                              status=str(a.get("status") or "all"),
-                              since=str(a.get("since") or ""),
-                              until=str(a.get("until") or ""),
-                              limit=int(a.get("limit") or 50))
+    res = qa.list_meetings(_who(a),
+                            status=str(a.get("status") or "all"),
+                            since=str(a.get("since") or ""),
+                            until=str(a.get("until") or ""),
+                            limit=int(a.get("limit") or 50))
+    _log_mcp_call("list_meetings", a, response_summary=res[:500])
+    return res
 
 
 def _tool_get_meeting(a: dict[str, Any]) -> str:
-    return qa.get_meeting(_who(a), str(a.get("query") or ""))
+    res = qa.get_meeting(_who(a), str(a.get("query") or ""))
+    _log_mcp_call("get_meeting", a, response_summary=res[:500])
+    return res
 
 
 def _tool_search_meetings(a: dict[str, Any]) -> str:
-    return qa.search_meetings(_who(a), str(a.get("keyword") or ""),
-                              limit=int(a.get("limit") or 10))
+    res = qa.search_meetings(_who(a), str(a.get("keyword") or ""),
+                               limit=int(a.get("limit") or 10))
+    _log_mcp_call("search_meetings", a, response_summary=res[:500])
+    return res
+
+
+def _tool_latest_meeting(a: dict[str, Any]) -> str:
+    res = qa.latest_meeting(_who(a), str(a.get("keyword") or ""))
+    _log_mcp_call("latest_meeting", a, response_summary=res[:500])
+    return res
 
 
 def _tool_get_transcript(a: dict[str, Any]) -> str:
-    return qa.get_transcript(_who(a), str(a.get("query") or ""),
-                             part=int(a.get("part") or 1))
+    res = qa.get_transcript(_who(a), str(a.get("query") or ""),
+                              part=int(a.get("part") or 1),
+                              source=str(a.get("source") or ""))
+    _log_mcp_call("get_transcript", a, response_summary=res[:500])
+    return res
 
 
 def _tool_send_transcript(a: dict[str, Any]) -> str:
     """Đường GHI thứ hai. Ràng buộc ở `sendfile.py`, không ở mô tả tool."""
     from . import sendfile
-    return sendfile.send_transcript(_who(a), str(a.get("minute_token") or ""))
+    res = sendfile.send_transcript(_who(a), str(a.get("minute_token") or ""))
+    _log_mcp_call("send_transcript_file", a, response_summary=res[:500])
+    return res
 
 
 def _tool_create_task(a: dict[str, Any]) -> str:
     """Đường GHI duy nhất. Ràng buộc nằm ở `tasks.py`, không ở mô tả tool."""
     from . import tasks
-    return tasks.create_from_meeting(
+    res = tasks.create_from_meeting(
         _who(a), str(a.get("minute_token") or ""),
         str(a.get("summary") or ""),
         due=str(a.get("due") or ""), note=str(a.get("note") or ""))
+    _log_mcp_call("create_task", a, response_summary=res[:500])
+    return res
 
 
 def _terms_arg(a: dict[str, Any]) -> list[str]:
@@ -157,12 +205,17 @@ TOOLS: list[dict[str, Any]] = [
             "cuộc họp nào', 'tuần này họp gì'. Trạng thái nói về việc PHÁT biên "
             "bản: 'đã phát' = đã tới tay người dự, 'phát hỏng' = không ai nhận "
             "được, 'không có recap' = có gửi nhưng tóm tắt rỗng.\n"
-            "QUAN TRỌNG: tool này TỰ GỬI danh sách vào khung chat của người "
-            "dùng — bạn KHÔNG nhận được nội dung danh sách và không cần nó. "
-            "Sau khi gọi, chỉ trả lời đúng MỘT CÂU NGẮN kiểu \"Danh sách của "
-            "bạn ở trên nhé\". Đừng liệt kê lại, đừng đếm, đừng nhắc tên cuộc "
-            "họp nào — bạn không có dữ liệu đó. Cần minute_token thì gọi "
-            "`search_meetings` hoặc `get_meeting`."),
+            "QUAN TRỌNG: kết quả là khối GỬI NGUYÊN VĂN — tin nhắn ĐÃ soạn "
+            "xong. Chép Y HỆT làm câu trả lời: không viết lại, không đếm lại, "
+            "không đổi thứ tự, không thêm câu dẫn nào trước hay sau. Người dùng "
+            "chỉ được nhận ĐÚNG MỘT tin nhắn cho câu hỏi này.\n"
+            "CHỈ dùng khi người ta muốn XEM danh sách. Câu hỏi \"cuộc nào mới "
+            "nhất/gần nhất\" phải dùng `latest_meeting`; các câu VỀ danh sách "
+            "khác — \"còn cuộc nào nữa không\", \"tuần trước họp mấy buổi\", "
+            "\"có cuộc nào về X không\" — thì gọi `search_meetings` rồi TRẢ "
+            "LỜI ĐÚNG CÂU ĐÓ bằng lời của bạn. Gọi "
+            "tool này là dội lại cả bảng danh sách, người ta hỏi một câu chứ "
+            "không xin lại bảng."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -185,8 +238,10 @@ TOOLS: list[dict[str, Any]] = [
         "name": "get_meeting",
         "description": (
             "Chi tiết một cuộc họp: tóm tắt, quyết định, việc cần làm, số người "
-            "nhận, link xem nguyên văn. Dùng sau khi list/search đã xác định "
-            "được cuộc họp nào."),
+            "nhận, link bản dịch từ Lark. Dùng sau khi list/search đã xác định "
+            "được cuộc họp nào. Nếu người dùng hỏi cuộc 'mới nhất'/'gần nhất', "
+            "KHÔNG dùng tool này trước: bắt buộc gọi `latest_meeting`, là tool "
+            "duy nhất chọn một cuộc theo giờ họp ở backend."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -199,10 +254,40 @@ TOOLS: list[dict[str, Any]] = [
         "_fn": _tool_get_meeting,
     },
     {
+        "name": "latest_meeting",
+        "description": (
+            "Lấy ĐÚNG MỘT cuộc họp mới nhất theo THỜI GIAN DIỄN RA sau khi "
+            "backend lọc quyền. Đây là tool BẮT BUỘC cho mọi câu có 'mới nhất', "
+            "'gần nhất', 'latest' — nhất là khi người dùng xin file Hapas của "
+            "cuộc mới nhất. Không thay bằng search_meetings với từ chung chung "
+            "như 'họp'/'meeting': cách đó đã gửi nhầm cuộc cũ. Bỏ `keyword` để "
+            "lấy cuộc mới nhất nói chung; chỉ truyền chủ đề mà CHÍNH người dùng "
+            "nêu rõ, ví dụ 'Workforce AI'. Kết quả có minute_token đã được "
+            "backend khóa; mọi tool chi tiết/gửi file tiếp theo phải dùng đúng "
+            "token đó."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+                "keyword": {"type": "string",
+                            "description": "chủ đề user nêu rõ; bỏ trống cho "
+                                           "cuộc mới nhất nói chung"},
+            },
+            "required": ["asker_token"],
+        },
+        "_fn": _tool_latest_meeting,
+    },
+    {
         "name": "search_meetings",
         "description": (
             "Tìm từ khoá trong tên họp, tóm tắt, quyết định và việc cần làm. "
-            "Dùng khi được hỏi về một CHỦ ĐỀ mà không biết cuộc họp nào."),
+            "Dùng khi được hỏi về một CHỦ ĐỀ mà không biết cuộc họp nào, VÀ "
+            "cho câu hỏi VỀ danh sách mà người ta chờ một câu trả lời chứ không "
+            "chờ cả bảng (\"còn cuộc nào nữa không\", \"tuần trước họp mấy "
+            "buổi\"). KHÔNG dùng cho 'mới nhất/gần nhất'; dùng `latest_meeting` "
+            "để backend chọn đúng một cuộc và khóa token. Kết quả là "
+            "DỮ LIỆU để bạn "
+            "đọc rồi trả lời, không phải tin nhắn để chép ra."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -217,12 +302,27 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_transcript",
         "description": (
-            "NGUYÊN VĂN do whisper phiên âm của một cuộc họp — lời nói, không "
-            "phải bản tóm tắt. Dùng khi người dùng hỏi về một CHI TIẾT trong "
+            "BẢN DỊCH của một cuộc họp — lời nói từng câu, không phải bản tóm "
+            "tắt. Có thể dùng bản dịch/Meeting Note từ Lark để trả lời ngay, "
+            "nhưng sau mỗi cuộc phải hỏi người dùng có muốn lấy bản dịch chuẩn "
+            "từ server Hapas không. Nếu chưa có file, chỉ khi họ đồng ý mới gọi "
+            "send_transcript_file để ưu tiên xử lý và tự gửi khi xong. Nếu file "
+            "đã sẵn sàng thì hỏi có muốn nhận ngay không. "
+            "Nếu Lark không đọc được mà file Hapas có thật, tool dùng Hapas. "
+            "Người dùng nói rõ muốn phân tích/đọc theo BẢN CHUẨN HAPAS ('phân "
+            "tích qua bản dịch từ server Hapas', 'theo bản chuẩn', 'đọc bản "
+            "Hapas') thì gọi kèm `source=\"hapas\"` — đừng trả bản Lark rồi "
+            "bảo là không làm được. Chưa có file Hapas thì tool nói rõ tình "
+            "trạng; lúc đó mới mời họ cho xử lý bản chuẩn.\n"
+            "MỘT NGUỒN MỘT LƯỢT: đã đọc theo `source` nào thì đi hết các phần "
+            "của nguồn ĐÓ, đừng kéo thêm nguồn kia trong cùng lượt — hai bản "
+            "gộp lại là ~64.000 ký tự và câu trả lời sẽ loãng.\n"
+            "Kết quả luôn ghi rõ nguồn — nói đúng nguồn đó với người dùng. "
+            "Dùng khi người dùng hỏi về một CHI TIẾT trong "
             "cuộc họp: 'ai nói gì về X', 'câu chính xác là gì', 'có nhắc tới "
             "Y không', hoặc khi tóm tắt trong get_meeting không đủ để trả lời.\n"
-            "KHÔNG dùng tool này khi người dùng xin CẢ BẢN nguyên văn — "
-            "'cho tôi script', 'cho tôi transcript', 'gửi nguyên văn cuộc họp', "
+            "KHÔNG dùng tool này khi người dùng xin CẢ BẢN — "
+            "'cho tôi script', 'cho tôi transcript', 'gửi bản dịch cuộc họp', "
             "'cho tôi biên bản'. Những câu đó dùng `send_transcript_file`: "
             "người dùng muốn CẦM bản ghi, không muốn đọc mấy chục dòng chữ "
             "trong khung chat.\n"
@@ -243,6 +343,12 @@ TOOLS: list[dict[str, Any]] = [
                                          "phần tên cuộc họp"},
                 "part": {"type": "integer",
                          "description": "phần thứ mấy, mặc định 1"},
+                "source": {"type": "string", "enum": ["lark", "hapas"],
+                           "description": "nguồn bản chép. Bỏ trống = mặc định "
+                                          "bản Lark (rơi xuống Hapas nếu Lark "
+                                          "không đọc được). 'hapas' = người "
+                                          "dùng chỉ định bản chuẩn từ server "
+                                          "Hapas, tool sẽ KHÔNG trả bản Lark."},
             },
             "required": ["asker_token", "query"],
         },
@@ -251,13 +357,14 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "send_transcript_file",
         "description": (
-            "Gửi FILE Word (.docx) biên bản nguyên văn vào khung chat của người "
+            "Gửi FILE Word (.docx) BẢN DỊCH TỪ SERVER CỦA HAPAS vào khung chat "
+            "của người "
             "đang hỏi, KÈM một tóm tắt ngắn để họ không phải mở file mới biết "
             "cuộc họp nói gì.\n"
-            "Đây là tool MẶC ĐỊNH khi người dùng xin CẢ BẢN nguyên văn của một "
-            "cuộc họp — 'cho tôi script', 'cho tôi transcript', 'cho tôi biên "
-            "bản', 'gửi nguyên văn', 'bản ghi cuộc họp X', xin FILE / bản tải "
-            "về / bản Word.\n"
+            "Đây là tool MẶC ĐỊNH khi người dùng xin CẢ BẢN dịch của một cuộc "
+            "họp — 'gửi bản dịch', 'gửi bản dịch 2', 'cho tôi script', 'cho "
+            "tôi transcript', 'cho tôi biên bản', 'gửi nguyên văn', 'bản ghi "
+            "cuộc họp X', xin FILE / bản tải về / bản Word.\n"
             "Khác `get_transcript`: tool kia trả CHỮ để bạn đọc rồi trả lời một "
             "câu hỏi CHI TIẾT ('ai nói gì về X'); tool này gửi file cho người "
             "dùng cầm. Xin cả bản thì dùng tool này, đừng dán mấy chục dòng "
@@ -265,8 +372,8 @@ TOOLS: list[dict[str, Any]] = [
             "Gọi một lần cho MỖI CUỘC HỌP người dùng xin: họ xin 3 cuộc thì gọi "
             "3 lần với 3 `minute_token` khác nhau. Điều bị cấm là gọi LẠI cho "
             "CÙNG một cuộc — kết quả trả về đã có sẵn khối chép-y-nguyên gồm câu "
-            "báo đã gửi và tóm tắt; chép đúng khối đó, ĐỪNG chép thêm nguyên văn "
-            "transcript, và đừng gọi lại vì tưởng chưa gửi.\n"
+            "báo đã gửi và tóm tắt; chép đúng khối đó, ĐỪNG chép thêm nội dung "
+            "bản dịch, và đừng gọi lại vì tưởng chưa gửi.\n"
             "File luôn gửi cho CHÍNH người đang hỏi — không gửi cho người khác "
             "được; ai muốn vậy thì tự chuyển tiếp trong Lark."),
         "inputSchema": {

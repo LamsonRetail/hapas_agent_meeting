@@ -1,5 +1,5 @@
 name: v2-enroll-gate
-version: 1.3.0
+version: 1.16.0
 description: >
   Cửa vào cho bot biên bản họp (meetingxlark V2). Người chưa cấp quyền OAuth thì
   bot gửi link để họ tự bấm Đồng ý, và tin nhắn KHÔNG đi tới agent (không tốn
@@ -8,6 +8,49 @@ description: >
   Từ 1.2.0: bơm thêm HỒ SƠ bot và KÝ ỨC hội thoại do V2 cấp qua cùng lời gọi
   gate, để bot trả lời được câu hỏi về chính nó và hiểu được câu nói tắt
   ("cuộc đó") sau khi phiên Hermes đã reset.
+  Từ 1.4.0: (a) bỏ nhánh "câu xác nhận sau list_meetings" — danh sách nay về
+  thẳng câu trả lời của agent (khối GỬI NGUYÊN VĂN), nên một câu hỏi chỉ sinh
+  MỘT tin nhắn; (b) cổng "không được trả lời từ trí nhớ" đo CÂU TRẢ LỜI
+  (`_claims_data`) thay vì đoán loại câu hỏi bằng danh sách chuỗi, nên chào hỏi
+  và tán gẫu kiểu gì cũng được đáp lại bình thường.
+  Từ 1.4.1: gọi tên hai bản chép theo NGUỒN — "bản dịch từ Lark" và "bản dịch
+  từ server của Hapas" (chất lượng hơn); cổng write-tool nhận thêm câu lệnh
+  "gửi bản dịch", lệnh cũ "gửi nguyên văn" vẫn chạy.
+  Từ 1.5.0: chân trang danh sách mời bằng lời thay vì dạy cú pháp lệnh, nên
+  cổng write-tool nhận thêm câu đáp NGẮN chỉ vào một cuộc ("cho mình cuộc 2",
+  "cái 2") khi bot vừa mời — trước đó bot mời rồi chặn chính câu trả lời cho
+  lời mời của mình.
+  Từ 1.6.0: dạy agent BA TRƯỜNG HỢP theo nguồn bản dịch (server Hapas / Lark /
+  chưa có) và cấm dùng chữ "biên bản" để nói hệ thống xử lý xong hay chưa.
+  Từ 1.7.0: bot phục vụ bản Lark trước rồi mời "bản server Hapas đã sẵn sàng,
+  nhận luôn không", nên câu đáp bằng động từ của lời mời ("cho mình luôn",
+  "nhận nhé", "lấy giúp mình") cũng mở được cổng gửi file.
+  Từ 1.8.0: audit ghi đúng câu cuối sau lớp lọc an toàn, truyền payload qua
+  stdin thay vì command line và gắn đúng định danh người hỏi.
+  Từ 1.9.0: Lark là nguồn trả lời mặc định; chỉ mời file Hapas khi file thật đã
+  tồn tại. `/reset` xoá cả neo cuộc họp bền vững để không kéo lại Workforce cũ.
+  Từ 1.10.0: sau mỗi cuộc đều hỏi có muốn lấy bản dịch chuẩn từ Hapas không;
+  bản chưa có chỉ được ưu tiên xử lý và tự gửi sau khi chính người dùng đồng ý.
+  Bỏ dòng chân trang "Nguồn mặc định: Meeting Note của Lark" trên thẻ họp xong.
+  Từ 1.11.0: câu hỏi "mới nhất" buộc search theo thời gian trước khi dùng chi
+  tiết, không được lấy token cũ từ chat_memory. Sửa vòng đời lời mời Hapas:
+  `on_session_end` của Hermes chạy sau mỗi lượt nên chỉ được dọn trạng thái lượt,
+  không được xoá cờ chờ câu đồng ý của người dùng.
+  Từ 1.12.0: thêm `latest_meeting` để backend chọn đúng một cuộc theo giờ diễn
+  ra. Gate khóa minute_token đó cho mọi tool chi tiết/gửi file trong cùng lượt;
+  search từ chung chung như "họp" không còn có thể gửi nhầm cuộc cũ.
+  Từ 1.15.0: `_claims_data` bỏ luật đo ĐỘ DÀI (>600 ký tự + từ nghiệp vụ =
+  khẳng định dữ liệu). Luật đó chặn nhầm chính đoạn bot tự giới thiệu năng lực
+  — ca thật 09:57 ngày 25/08, người dùng mới hỏi "bạn làm được những việc gì"
+  và bị đáp "mình phải tra dữ liệu mới dám trả lời" hai lượt liền. Nay chỉ chặn
+  khi có DẤU VẾT CỤ THỂ (ngày giờ, số + danh từ nghiệp vụ, link, nhãn máy).
+  Ba cú chặn của cổng cũng hạ từ ERROR xuống WARNING: heartbeat đếm dòng ERROR
+  trong gateway.log, nên chặn đúng luật mà log ERROR là báo động giả.
+  Từ 1.16.0: plugin THÔI tự bỏ tin trong nhóm — luật giờ nằm một chỗ ở V2
+  (`gate._refuse_group` + `V2_GROUP_QA_CHATS`), lớp duy nhất có test. Plugin gửi
+  kèm `chat_id` để V2 biết nhóm nào được phép hỏi và buộc phạm vi vào vé phiên:
+  trong nhóm X bot CHỈ trả lời về cuộc mà chính nhóm X được mời trên lịch.
+  Thiếu `chat_id` thì V2 fail-closed. Danh sách trắng rỗng = y như cũ.
 author: meetingxlark V2
 kind: standalone
 hooks:

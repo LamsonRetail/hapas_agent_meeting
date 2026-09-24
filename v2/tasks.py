@@ -98,7 +98,7 @@ def create_from_meeting(who: dict[str, Any] | None, minute_token: str,
         token = tokenstore.get_access_token(open_id)
     except tokenstore.TokenError as exc:
         return (f"Không tạo được: quyền của bạn với hệ thống đã hết hạn ({exc}). "
-                f"Nhắn quản trị hệ thống để lấy link cấp quyền lại.")
+                f"Hãy cấp quyền lại cho bot rồi thử lại.")
 
     try:
         meta = jobstore.meta_from_json(row["meta_json"])

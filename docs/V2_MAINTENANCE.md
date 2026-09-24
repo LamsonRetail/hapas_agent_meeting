@@ -1330,10 +1330,14 @@ và `v2 run` thì phải bấm tay — họp xong mà không ai bấm là không
 | `install-autostart-v2.bat` | đăng ký/gỡ tự chạy. `/go` = gỡ, `/trangthai` = xem |
 | `start-v2.bat` | giữ nguyên cho người bấm tay (dry-run, có `pause`) |
 
-Log: `v2\data\logs\v2-<ngày>.log`. Ưu tiên Scheduled Task `/SC ONLOGON`; không có
-quyền admin thì rơi về Startup folder `V2_Orchestrator.vbs` (giống Hermes) —
-**không có restart-on-failure**, muốn có thì chạy installer trong terminal
-Administrator.
+Log: `v2\data\logs\v2-<ngày>.log`. Từ 13/08/2026,
+`tools/register-v2-orchestrator.ps1` đăng ký Scheduled Task
+`V2_Orchestrator` bằng chính user hiện tại (không cần elevation trên máy đã đo),
+với restart-on-failure 999 lần / 2 phút và Task Scheduler trực tiếp sở hữu
+`cmd /c run-v2-auto.bat`. `restart-v2.ps1` cũng bắt buộc đi qua task này; không
+được đổi lại sang `Start-Process`, vì child của shell/job tạm đã bị Windows dọn
+cùng parent bốn lần ngày 12/08. Startup `V2_Orchestrator.vbs` cũ được đổi đuôi
+`.disabled` sau khi task đăng ký thành công để hai launcher không đua nhau.
 
 ⚠️ **Máy phải đăng nhập Windows.** Sleep / log out = cả ba phần (whisper, Hermes,
 V2) dừng. Đây là máy cá nhân, không phải server.
@@ -4141,3 +4145,159 @@ cryptography) và báo `No module named v2` — câu báo lỗi không hé lộ 
 nào trong hai. `v2.bat` tự `cd`, ghi thẳng đường dẫn Python, đặt UTF-8.
 
 selftest: +21 → **PASS 385**.
+
+## 42. Meeting Agent: nguồn mặc định, từ chối kín và reset chat (13/08/2026)
+
+Ba quy tắc vận hành phải đi cùng nhau:
+
+1. Không tìm thấy/không có quyền: chỉ trả `Mình chưa tìm thấy cuộc “…” trong các
+   cuộc họp bạn có quyền xem.` Không thêm tên cuộc gần giống, ký ức cũ,
+   `Workforce` hoặc hướng dẫn nhắn quản trị.
+2. Có thể đọc Meeting Note của Lark để trả lời ngay, nhưng sau mọi cuộc phải hỏi
+   người dùng có muốn lấy bản dịch chuẩn từ Hapas không. File chưa có chỉ được
+   nâng ưu tiên xử lý + tự gửi sau khi chính họ đồng ý; file có rồi thì mời nhận
+   ngay. Không được nói bản chưa có là “đã sẵn sàng”.
+3. Phân loại hiển thị phải đi từ bảng `jobs` qua `qa.source_of()`, không suy từ
+   Base, memory hoặc câu hỏi. Một cuộc chỉ thuộc một nguồn; một lượt chỉ gửi một
+   câu trả lời.
+
+Lệnh làm mới của user là `/reset`, `/new` hoặc `/lammoi`. Plugin tạo session mới
+và gọi:
+
+```powershell
+python -m v2 chat-reset --union-id <union_id>
+```
+
+Lệnh này chỉ xóa `chat_memory` của đúng người. Không xóa token OAuth, ACL, job,
+delivery hoặc dữ liệu biên bản. Không chạy lệnh trên với union ID thật chỉ để test;
+self-test dùng DB tạm.
+
+Sau khi đổi `v2/qa.py`, MCP policy hoặc plugin, phải chạy `python -m v2 selftest`.
+Kết quả sau quyết định lời mời Hapas mới nhất: **PASS 747 / FAIL 0**. Bản live đã nạp
+plugin 1.9.0 và hai khóa config liên quan, rồi restart Hermes gateway lúc 21:18;
+V2 restart lần cuối lúc 21:24 với đúng một orchestrator có watchdog.
+
+### 42.1 Scanner không được chờ hết hàng đợi
+
+Ca live 13/08: 28 job dài giữ `process_queue()` hơn 2 giờ, heartbeat lên
+`scan=122m` nhưng báo OK vì luật cũ coi “còn backlog” là lý do hợp lệ. Quét thử
+khô phát hiện 6 cuộc Lark chưa vào DB, nên luồng `_notify_minute` không có cơ hội
+tự gửi cuộc mới nhất.
+
+Nay `v2-scan-watch` chạy scanner định kỳ trên daemon thread, độc lập với worker;
+`_scan_lock` ngăn hai lượt quét chồng. Heartbeat phải báo `scan_cu` sau 20 phút
+dù queue đang bận. Không chữa bằng cách chạy `backfill --yes`: backfill cố ý
+`notify=False`, chỉ nạp dữ liệu và sẽ không gửi thẻ cuộc mới. Sau bản vá scanner,
+cuộc mới đi qua `enqueue_minute(..., priority=1, notify=True)` như thiết kế.
+
+Self-test sau phần scanner và lời mời Hapas mới nhất: **PASS 747 / FAIL 0**.
+
+### 42.2 Áp live và nạp bù an toàn
+
+Trước khi sửa DB đã chạy `python -m v2 backup`, tạo
+`state-2026-08-13-211703.db`. `backfill --days 14 --priority 0 --yes` đối chiếu
+95 minute trên Lark với 89 job trong DB và nạp đúng 6 job thiếu. Backfill luôn
+`notify=False`, vì vậy 5 cuộc cũ không bị phát lại.
+
+Cuộc mới nhất `08-13 | Workforce AI Weekly Meeting` đã được nâng riêng lên
+priority 1. Preflight xác minh nguồn attendee là `calendar[verified]`, có 8 người
+vừa tham dự vừa enroll, Meeting Note Lark đọc được và file Hapas chưa tồn tại.
+Sau xác nhận riêng, thẻ nguồn Lark đã gửi **8/8**, lỗi 0; 15 người chưa enroll
+không nhận. UUID chống trùng được dựng theo từng người. Scanner sau đó vẫn quét
+đều 5 phút/lần dù worker còn bận, heartbeat trả mã 0.
+
+`restart-v2.ps1` có thêm `-ForceBusy` cho lần restart đã được duyệt. Khi không có
+switch, script hỏi xác nhận **trước** khi dừng Scheduled Task; hủy ở prompt không
+còn để watchdog bị dừng ngoài ý muốn.
+
+### 42.3 Quyết định mới nhất: mọi cuộc đều hỏi Hapas
+
+Yêu cầu lúc 22:21 ngày 13/08 thay thế §11f.6 và luật “chỉ mời khi file tồn tại” ở
+đầu §42. Thẻ tự động, danh sách và câu trả lời chi tiết đều phải kết thúc bằng câu
+hỏi có muốn lấy **bản dịch chuẩn từ Hapas** không. Bỏ dòng chân trang “Nguồn mặc
+định: Meeting Note của Lark”.
+
+Trạng thái DB vẫn quyết định cách nói và cách làm:
+
+- file Hapas thật tồn tại: nói đã sẵn sàng, người dùng đồng ý thì gửi ngay;
+- chưa có file: hỏi nhu cầu; chỉ khi đồng ý mới gọi `send_transcript_file`, nâng
+  job lên priority 2, ghi người chờ và tự gửi khi xong;
+- không đồng ý: không xử lý thêm, không tự gửi transcript.
+
+Thẻ `Họp xong` có nút mang `{"v2":"transcript","token":"..."}`; plugin đổi cú
+bấm thành yêu cầu `gửi transcript <token>`, rồi cổng write-tool và ACL kiểm lại như
+tin gõ tay. Chính sách/plugin 1.10.0 dùng `POLICY_VERSION ...13.2` để phiên cũ nhận
+luật mới. Self-test: **PASS 747 / FAIL 0**.
+
+Đã áp live lúc 22:22–22:23: config có backup
+`config.pre-hapas-offer-20260813-222207.yaml`, Hermes gateway chạy plugin 1.10.0,
+V2 có đúng một process dưới Scheduled Task. Lượt scan đầu sau restart thành công
+lúc 22:23:00 và heartbeat trả mã 0. Không tự phát lại thẻ cũ trong lúc triển khai.
+
+### 42.4 Hai regression: “mới nhất” lấy cuộc cũ và “có” bị chặn (14/08/2026)
+
+Audit session `20260814_094631_b7e8c5db` cho thấy hai lỗi tách biệt:
+
+- câu `Workforce AI mới nhất` gọi thẳng `get_meeting` bằng token của `08-06`
+  lấy từ `chat_memory`; không có lượt search nào trước đó. Memory sắp theo lúc
+  được nhắc, không theo giờ họp, nên chữ “mới nhất” trong mô tả memory đã làm
+  model hiểu sai;
+- kết quả search ở lượt `13/8` có thật `OFFER_MARK`, agent cũng gọi đúng
+  `send_transcript_file` cho token `08-13`, nhưng gate chặn. Hermes
+  `turn_finalizer.py` phát `on_session_end` cuối mọi `run_conversation`; plugin
+  lại nối hook này vào `_cleanup_session`, nên `_offered/_asked` chết ngay sau
+  lượt mời. Self-test cũ chỉ gọi `_cleanup_turn` trực tiếp nên xanh giả.
+
+Plugin 1.11 sửa bằng ba lớp:
+
+1. Khi user hỏi `mới nhất/gần nhất`, không bơm `chat_memory` vào prompt của lượt
+   đó và gắn chỉ dẫn search theo thời gian.
+2. `pre_tool_call` chặn `get_meeting` cho tới khi `search_meetings` đã thành công
+   trong chính lượt; sau search thì cho lấy chi tiết kết quả đầu tiên.
+3. `on_session_end` chỉ gọi `_cleanup_turn`. `_cleanup_session` chỉ còn ở ranh
+   giới thật `on_session_finalize/on_session_reset`, nên câu `có` trong lượt kế
+   tiếp vẫn mở được cổng gửi file.
+
+Self-test thêm phép kiểm đúng bảng đăng ký hook và đúng chuỗi hội thoại thật;
+kết quả **753 PASS / 0 FAIL**. Code compile được và diff-check sạch.
+
+Đã áp live lúc 10:13–10:14 ngày 14/08 sau khi người dùng duyệt. Config được backup
+thành `config.pre-v2-enroll-gate-1.11.0-20260814-101334.yaml`; plugin cũ được giữ
+ở `backups/v2-enroll-gate-20260814-101334/` trong `%LOCALAPPDATA%\hermes`.
+Hai hash plugin live khớp repo, config đã deep-merge policy mới, gateway dừng sạch
+rồi kết nối lại Feishu + API 8642. `hermes mcp test meetings` thấy đủ **9 tools**,
+Doctor chạy được và không có lỗi chặn. Không gửi tin nhắn thử ra Lark.
+
+### 42.5 Search-first vẫn chưa đủ: gửi nhầm `work` 06/08 (14/08/2026)
+
+Audit lượt 13:34 cho câu `Mình cần biên bản cuộc họp mới nhất của mình từ server
+Hapas` ghi đúng chuỗi lỗi:
+
+1. `search_meetings("")` trả `Cần từ khoá để tìm`;
+2. agent tự search từ chung `họp`; do search lọc title/summary/action theo từ khóa,
+   `08-13 | Workforce AI Weekly Meeting` bị loại còn `work` 06/08 đứng đầu;
+3. gate 1.11 chỉ biết “search đã chạy”, không biết record nào là latest, nên cho
+   `send_transcript_file(obsg9wu4kd38m5o73z1mx6yu)` đi và gửi file sai thật.
+
+Bản 1.12 không giao phép chọn latest cho model nữa. Tool `latest_meeting` lọc ACL,
+gộp Base + pending, sắp theo giờ diễn ra và trả đúng một record; từ chung
+`họp`/`meeting` được coi như không lọc. Kết quả có marker nội bộ
+`[V2-LATEST: <token>]`. Plugin lưu token marker và cưỡng chế mọi tool chi tiết,
+task hoặc gửi file trong lượt phải dùng đúng token; token khác bị block. Với yêu
+cầu latest, list/search/get/send đều không được chạy trước `latest_meeting`.
+
+Self-test thêm đúng dữ liệu bẫy (record 06/08 có chữ `họp`, record 13/08 tiêu đề
+tiếng Anh không có chữ đó), phép kiểm marker không lộ, và phép thử gửi token cũ
+bị chặn/token mới được qua. Kết quả **761 PASS / 0 FAIL**; MCP discover **10
+tools**. DB live xác nhận `08-13` 18:05 có file Hapas thật và mới hơn hai record
+06/08.
+
+Đã áp live 13:53–13:54 sau khi user duyệt. Backup config:
+`config.pre-v2-enroll-gate-1.12.0-20260814-135334.yaml`; backup plugin:
+`backups/v2-enroll-gate-20260814-135334/`. Plugin live 1.12.0 và policy config
+đã deep-merge; gateway dừng sạch rồi lên PID 33820, `gateway_state=running`,
+Feishu và API đều `connected`. MCP discover đủ 10 tools; self-test sau áp
+**761 PASS / 0 FAIL**. Doctor chạy được, chỉ còn cảnh báo backup cùng ổ `D:`.
+Không gửi tin thử ra Lark.
+Kiểm chỉ-đọc với đầy đủ định danh/ACL live của user xác nhận cả keyword rỗng và
+`họp` đều chọn `08-13`, không chọn token `work` 06/08.

@@ -130,12 +130,10 @@ def _send(text: str) -> bool:
 # cho ai hỏi tới cuộc họp đó (`qa.row_pending`) — chỉ là không đánh thức người
 # vận hành giữa ngày.
 #
-# Vì sao `empty_transcript` nằm đây (user chốt 05/08/2026, sau khi nhận 3 DM
-# liền trong một phút): bản ghi không có tiếng nói thì KHÔNG có việc gì để làm.
-# Không phải lỗi hạ tầng — whisper chết thì `_check_whisper` mới là mục báo, và
-# nó báo bằng một tin duy nhất thay vì một tin cho mỗi cuộc họp. Cảnh báo nào
-# cũng nổ thì người ta tắt thông báo của bot, rồi lúc hỏng thật cũng không đọc.
-SILENT_FAIL_CODES = frozenset({jobstore.ERR_EMPTY_TRANSCRIPT})
+# Pipeline gắn mã riêng sau khi xác nhận recording không có lời nói hữu ích.
+# Job mới đi thẳng `discarded`; danh sách này còn để không DM dữ liệu cũ/lúc
+# chuyển trạng thái dở. `empty_transcript` vẫn phải báo: có thể Whisper nuốt.
+SILENT_FAIL_CODES = frozenset({jobstore.ERR_SILENT_RECORDING})
 
 
 def _text_failed(row: dict) -> str:
@@ -168,7 +166,7 @@ def _check_failed_jobs(out: list[tuple[str, str, Any]]) -> None:
 
     for row in failed:
         key = f"job_failed:{row['minute_token']}"
-        if jobstore.error_code(row.get("error")) in SILENT_FAIL_CODES:
+        if jobstore.is_silent_failure(row.get("error")):
             # In ra log thì vẫn in — dấu vết phải còn để chẩn về sau. Chỉ không
             # DM. Và KHÔNG ghi mốc chống spam: mốc là để nhớ "đã báo rồi", mà ở
             # đây có báo đâu; ghi vào là sau này bỏ mã khỏi danh sách im lặng
@@ -349,6 +347,26 @@ def note_run_alive() -> None:
     này ở chỗ khác là che mất đúng cái nó sinh ra để phát hiện.
     """
     _mark_set(_RUN_BEAT, str(_now_ms()))
+
+
+_SCAN_OK = "scan_ok"
+
+
+def note_scan_ok() -> None:
+    """Scanner vừa quét XONG một vòng. Mốc epoch ms, đọc được từ ngoài.
+
+    Thêm 19/08/2026 vì `tools/heartbeat.py` phải đi ĐOÁN tuổi vòng quét bằng cách
+    regex `[HH:MM:SS] scan xong` trong log — không có NGÀY. Hệ quả đo được sáng
+    19/08: scanner ghi thêm một dòng `[07:19:01]` trong lúc heartbeat đã chụp
+    `now = 07:19:00.9`, dòng đó thành "ở tương lai 1 giây", nhánh `if t > now:
+    t -= 1 ngày` biến nó thành 1439,98 phút, và cả hệ báo `scan_cu=1440.0m` —
+    một cú đua một giây thành "scanner chết 24 giờ". Cả đêm trước đó chỉ 0,2–4,3m.
+
+    Mốc này có timestamp đầy đủ nên không còn chỗ nào phải đoán ngày. Heartbeat
+    KHÔNG import `v2.*` (phải chạy được cả khi V2 hỏng) nên nó đọc thẳng bảng
+    `alert_state`; giữ tên khoá ổn định là hợp đồng giữa hai bên.
+    """
+    _mark_set(_SCAN_OK, str(_now_ms()))
 
 
 def _check_run_stale(out: list[tuple[str, str, Any]]) -> None:

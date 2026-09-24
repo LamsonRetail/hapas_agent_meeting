@@ -18,6 +18,7 @@ set TASK=V2_Orchestrator
 set TASK_ALERTS=V2_Alerts
 set TARGET_ALERTS=%~dp0run-v2-alerts.bat
 set TARGET=%~dp0run-v2-auto.bat
+set REGISTER=%~dp0tools\register-v2-orchestrator.ps1
 set VBS=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\V2_Orchestrator.vbs
 
 if /i "%1"=="/go" goto uninstall
@@ -30,10 +31,12 @@ echo   Luu y: may PHAI dang nhap Windows thi V2 moi chay (day la may ca
 echo   nhan, khong phai server). Sleep / log out = ca ba phan dung.
 echo.
 
-REM --- Thu Scheduled Task truoc --------------------------------
-schtasks /Create /TN "%TASK%" /TR "\"%TARGET%\"" /SC ONLOGON /RL LIMITED /F >nul 2>&1
+REM --- Thu Scheduled Task co watchdog truoc --------------------
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%REGISTER%" >nul 2>&1
 if %errorlevel%==0 (
-    echo  [+] Da tao Scheduled Task "%TASK%" ^(chay khi dang nhap^).
+    echo  [+] Da tao Scheduled Task "%TASK%" ^(on-logon + restart-on-failure^).
+    REM Khong de task va Startup item cung tranh nhau khoi dong sau lan login.
+    if exist "%VBS%" del /q "%VBS%"
     call :alerts_task
     goto also_check
 )

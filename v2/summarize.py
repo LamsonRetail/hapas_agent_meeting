@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 
 import httpx
 
@@ -65,6 +66,43 @@ _INSTRUCT = (
 )
 
 
+# Token của các lời gọi LLM, gom THEO LUỒNG. Xem `_note_usage` / `take_usage`.
+_usage_local = threading.local()
+
+
+def _note_usage(raw: object) -> None:
+    """Ghi token của MỘT lời gọi vào rổ của luồng hiện tại. Không bao giờ ném.
+
+    Vì sao theo luồng chứ không phải một biến chung: `_post` có HAI đường gọi
+    chạy song song được — `_process_queue` ở vòng chính, và
+    `_notify_minute -> recap_from_text` mà `ws_listener` gọi từ thread riêng
+    (orchestrator.py:189). Một rổ dùng chung sẽ gán token của cuộc này sang
+    cuộc kia; sai lặng lẽ đúng kiểu khó lần nhất. Rổ theo luồng thì token của
+    thread ws đơn giản là không được tính vào đâu — thiếu số, không sai số.
+    """
+    try:
+        if not isinstance(raw, dict):
+            return
+        acc = getattr(_usage_local, "acc", None)
+        if acc is None:
+            acc = _usage_local.acc = []
+        acc.append({"input_tokens": int(raw.get("prompt_tokens") or 0),
+                    "output_tokens": int(raw.get("completion_tokens") or 0)})
+    except Exception:                       # noqa: BLE001 — đo đạc không được
+        pass                                # phép làm hỏng việc sinh biên bản
+
+
+def take_usage() -> list[dict]:
+    """Lấy RỒI XOÁ token đã gom của luồng này. Gọi ở ranh giới một cuộc họp.
+
+    Caller (`_process_queue`) gọi hai lần cho mỗi cuộc: một lần ở đầu để dọn
+    rác của bước trước, một lần ở cuối để lấy đúng phần của cuộc đó.
+    """
+    acc = getattr(_usage_local, "acc", None) or []
+    _usage_local.acc = []
+    return list(acc)
+
+
 def _post(body: dict) -> str:
     """Một lời gọi chat/completions. Ném để caller quyết retry."""
     r = httpx.post(
@@ -74,7 +112,12 @@ def _post(body: dict) -> str:
         json=body, timeout=float(config.LLM_TIMEOUT),
     )
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    data = r.json()
+    # Gom token TRƯỚC khi bóc `choices`: phản hồi thiếu `choices` vẫn là lời gọi
+    # đã tính tiền, và nhánh đó ném KeyError cho caller retry — bỏ ở đây là
+    # đúng những lượt tốn kém nhất lại không được đếm.
+    _note_usage(data.get("usage"))
+    return data["choices"][0]["message"]["content"].strip()
 
 
 def _call_llm(transcript_text: str, title: str) -> str | None:
@@ -254,16 +297,42 @@ def is_placeholder(recap: Recap | None) -> bool:
                 or recap.action_items)
 
 
+def _reject_empty(recap: Recap, source_len: int) -> Recap:
+    """Câu trả lời RỖNG của LLM là HỎNG, không phải là 'không có gì để tóm tắt'.
+
+    Ca thật 26/08/2026 (ba cuộc, 12 người nhận thẻ trống): Codex trả HTTP 400
+    `model not supported when using Codex with a ChatGPT account` rải rác trong
+    ~50 phút. Nhưng ở một số lượt nó trả về *thành công* với nội dung rỗng —
+    `_parse` dựng ra `Recap(summary="")`, pipeline coi là xong, job set `held`,
+    ghi Base, và thẻ "Họp xong" đi ra không có tóm tắt. `recap_fails` = 0 suốt,
+    tức KHÔNG lớp nào biết là nó vừa hỏng.
+
+    Lớp bảo vệ cũ (31/07/2026) chỉ bắt `RecapUnavailable` — tức chỉ bắt lỗi
+    MẠNG. Nó bỏ lọt đúng cái nguy hiểm hơn: một câu trả lời hợp lệ mà rỗng.
+    Nay quy về cùng một loại lỗi, nên job giữ `queued`, KHÔNG tiêu quota thử
+    lại, và vòng sau chỉ làm lại phần recap (transcript đã nằm trên đĩa).
+
+    Chỉ ném khi NGUỒN có chữ. Nguồn rỗng thì rỗng là đúng, và `recap_from_text`
+    đã chặn ca đó từ trước bằng một placeholder nói rõ lý do.
+    """
+    if source_len and is_placeholder(recap):
+        raise RecapUnavailable(
+            f"LLM trả về nội dung rỗng cho {source_len} ký tự đầu vào "
+            f"(mã thành công nhưng không có tóm tắt/quyết định/việc cần làm)")
+    return recap
+
+
 def summarize(transcript: Transcript, meta: MeetingMeta) -> Recap:
     """Sinh recap cấu trúc từ transcript. Provider-neutral.
 
-    Ném `RecapUnavailable` nếu gọi LLM thất bại (caller hoãn rồi thử lại).
+    Ném `RecapUnavailable` nếu gọi LLM thất bại HOẶC trả về rỗng (caller hoãn
+    rồi thử lại — xem `_reject_empty`).
     Thiếu `LLM_API_KEY` thì KHÔNG ném: đó là cấu hình, thử lại không đổi gì.
     """
     raw = _call_llm(transcript.text, meta.title)
     if raw is None:
         return placeholder("chưa đặt LLM_API_KEY trong v2/.env")
-    return _parse(raw)
+    return _reject_empty(_parse(raw), len((transcript.text or "").strip()))
 
 
 def recap_from_text(text: str, title: str) -> Recap:
@@ -284,4 +353,12 @@ def recap_from_text(text: str, title: str) -> Recap:
         return placeholder(f"LLM tạm thời không tóm tắt được ({exc})")
     if raw is None:
         return placeholder("chưa đặt LLM_API_KEY trong v2/.env")
-    return _parse(raw)
+    try:
+        return _reject_empty(_parse(raw), len(text))
+    except RecapUnavailable as exc:
+        # Hàm này KHÔNG BAO GIỜ được ném (thẻ báo họp xong phải gửi được kể cả
+        # khi LLM hỏng). Nhưng recap rỗng thì phải thành CÂU GIỮ CHỖ NÓI RÕ LÝ
+        # DO, không phải một ô trống: `is_placeholder` nhận ra câu giữ chỗ, nên
+        # `_backfill_recaps` sẽ tự làm lại khi LLM sống lại. Thẻ trống ngày
+        # 26/08 im lặng đúng vì nó KHÔNG mang dấu vết nào của một lần hỏng.
+        return placeholder(f"LLM tạm thời không tóm tắt được ({exc})")

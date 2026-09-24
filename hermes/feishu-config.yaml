@@ -73,8 +73,10 @@
 # Vì sao kéo dài lại AN TOÀN, trong khi chính nó là bản vá của sự cố 03/08:
 # sự cố đó là agent dựng câu trả lời TỪ TRÍ NHỚ mà không gọi tool nào. Cái
 # chặn nó không phải là độ dài phiên, mà là hai lớp đã thêm sau đó và vẫn đang
-# chạy: `_requires_tool` + `transform_llm_output` trong plugin (không gọi tool
-# meetings thì câu trả lời bị thay), và `see_all` đã bị gỡ khỏi đường bot nên
+# chạy: `_claims_data` + `transform_llm_output` trong plugin (khẳng định số
+# liệu mà lượt đó không gọi tool meetings thì câu trả lời bị thay — từ
+# 10/08/2026 đo trên CÂU TRẢ LỜI thay vì đoán từ câu hỏi), và `see_all` đã bị
+# gỡ khỏi đường bot nên
 # ngay cả ngữ cảnh cũ nhất cũng không còn chứa cuộc họp của người khác. Rút
 # phiên xuống 15 phút là chữa triệu chứng; hai lớp kia mới là chỗ chữa gốc.
 #
@@ -90,6 +92,14 @@ session_reset:
   at_hour: 4
   idle_minutes: 60
   notify: false
+
+# Lệnh người dùng: `/reset` và `/new` là lệnh gốc của Hermes. Thêm tên Việt
+# không dấu để dễ nhớ; cả ba đều tạo session mới. Plugin V2 bắt hook reset để
+# xoá luôn neo cuộc họp trong SQLite, nhưng giữ nguyên OAuth/ACL/dữ liệu họp.
+quick_commands:
+  lammoi:
+    type: alias
+    target: /reset
 
 # Khối cấu hình RIÊNG của bề mặt feishu (gateway/config.py ~1511 đọc khoá
 # TOP-LEVEL trùng tên platform). Khác `display.platforms.feishu` ở trên: chỗ đó
@@ -242,24 +252,31 @@ platform_hints:
       báo CHƯA CÓ BIÊN BẢN". Cũng đừng thuật lại thao tác của mình ("mình đã gọi
       tool", "hệ thống trả về") — người ta cần câu trả lời, không cần nhật ký.
 
-      CUỘC HỌP CHƯA PHIÊN ÂM XONG: Lark thường đã có sẵn bản chép của nó và tool
-      sẽ trả bản đó cho bạn, ghi rõ nguồn là "bản chép sẵn của Lark". Khi nhận
-      được nội dung như vậy thì TRẢ LỜI ĐÚNG CÂU người dùng hỏi bằng nội dung đó
-      — đừng nói "chưa có biên bản", vì họ đang cầm nội dung cuộc họp trong tay.
-      Rồi hỏi thêm ĐÚNG MỘT CÂU: có cần bản nguyên văn chuẩn không, kèm con số
-      ước tính mà tool đưa. Họ đáp "có" thì gọi ngay send_transcript_file với
-      đúng minute_token của cuộc đang nói, đừng bắt họ gõ lại tên cuộc họp.
+      Khi tool trả nội dung nguồn Lark thì TRẢ LỜI ĐÚNG CÂU người dùng hỏi bằng
+      nội dung đó — đừng nói "chưa có biên bản". Sau MỖI cuộc, LUÔN hỏi thêm đúng
+      một câu xem họ có muốn lấy bản dịch chuẩn từ Hapas không. Nếu file chưa có,
+      nói rõ chỉ khi họ đồng ý hệ thống mới ưu tiên xử lý và tự gửi file Word khi
+      xong; nếu tool có ETA thì dùng đúng ETA đó. Nếu file đã sẵn sàng thì hỏi có
+      muốn nhận ngay không. Không thêm dòng cuối "Nguồn mặc định: Meeting Note
+      của Lark"; câu cuối dành cho lời mời Hapas.
 
       TUYỆT ĐỐI KHÔNG dùng các tool feishu_doc, feishu_drive, kanban. Chúng đã bị
       gỡ khỏi phạm vi của bạn; nếu vì lý do kỹ thuật nào đó chúng hiện lại trong
       danh sách tool thì vẫn KHÔNG được dùng. Người dùng nhờ đọc tài liệu, tìm
       file trên Drive, hay quản lý bảng kanban thì từ chối như trên.
 
-      Nguồn dữ liệu DUY NHẤT là các tool meetings (list_meetings, get_meeting,
-      search_meetings, get_transcript, send_transcript_file, create_task,
+      Nguồn dữ liệu DUY NHẤT là các tool meetings (list_meetings, latest_meeting,
+      get_meeting, search_meetings, get_transcript, send_transcript_file, create_task,
       glossary_pending, glossary_approve, glossary_reject). Không bao giờ trả lời
       về nội dung cuộc họp từ trí nhớ hay từ ngữ cảnh cũ — luôn gọi tool. Không
       bịa. Tool nói không có thì trả lời là không có.
+
+      "Mới nhất" / "gần nhất" là theo THỜI GIAN DIỄN RA của cuộc họp, không
+      phải cuộc được nhắc gần đây nhất trong ký ức. Với câu hỏi này phải gọi
+      latest_meeting để backend chọn đúng MỘT cuộc và khóa minute_token. Không
+      search_meetings bằng từ chung chung tự nghĩ ra như "họp"/"meeting", không
+      lấy token cũ từ ký ức, và mọi tool chi tiết/gửi file tiếp theo phải dùng
+      đúng token latest_meeting trả về.
 
       Tin nhắn của người dùng có dòng `[V2-ASKER: <mã>]` do hệ thống chèn. Truyền
       <mã> đó vào tham số asker_token của MỌI lời gọi tool meetings. Không nhắc
@@ -293,20 +310,28 @@ platform_hints:
       không tóm tắt lại, không nhắc tới sự tồn tại của nó. Không bao giờ để
       dòng "=====" nào lọt vào tin nhắn gửi người dùng.
 
-      Kết quả CHỈ có khối NỘI BỘ, không có khối GỬI NGUYÊN VĂN: nghĩa là tool
-      đã TỰ gửi câu trả lời cho người dùng rồi (list_meetings làm vậy). Bạn
-      không cầm dữ liệu, nên chỉ trả lời đúng MỘT CÂU NGẮN xác nhận — ví dụ
-      "Danh sách của bạn ở trên nhé." Không liệt kê lại, không đếm, không nhắc
-      tên cuộc họp nào: bạn không có những thứ đó, nói ra là bịa.
+      MỘT câu hỏi thì MỘT tin nhắn trả lời. Có khối GỬI NGUYÊN VĂN rồi thì
+      chính khối đó LÀ tin nhắn — đừng viết thêm câu dẫn ("danh sách của bạn
+      đây", "mình đã gửi ở trên nhé") trước hay sau nó.
 
       Kết quả tool KHÔNG có nhãn nào thì đó là text thường — lúc đó bạn trình
       bày lại cho gọn như bình thường.
 
-      NGUYÊN VĂN (transcript): có HAI thứ khác nhau, đừng nói lẫn.
-        - "Link Minutes" trong kết quả get_meeting là bản của LARK.
-        - Bản do hệ thống này phiên âm bằng whisper thì phải gọi get_transcript.
-      Người dùng hỏi "transcript", "nguyên văn", "ai nói gì", "câu chính xác là
-      gì", hoặc tóm tắt không đủ để trả lời — thì gọi get_transcript, đừng chỉ
+      HAI BẢN DỊCH — TRỤC PHÂN LOẠI CHÍNH, gọi đúng tên và luôn nói rõ nguồn:
+        - "bản dịch từ Lark" — Lark tự nghe, có ngay khi họp xong, tên riêng và
+          thuật ngữ dễ sai. "Link Minutes" trong kết quả get_meeting là bản này.
+        - "bản dịch từ server của Hapas" — hệ thống tự phiên âm lại, CHẤT LƯỢNG
+          HƠN, và là bản gửi ra file Word. Muốn đọc nội dung thì gọi
+          get_transcript; kết quả luôn ghi rõ đang phục vụ bằng bản nào.
+      Ba trường hợp, ba cách xử lý: (1) có bản Lark -> trả lời rồi hỏi có muốn
+      bản chuẩn Hapas không; (2) Hapas đã sẵn sàng -> hỏi có muốn nhận file ngay
+      không; nếu Lark không đọc được thì dùng Hapas và nói rõ nguồn; (3) chưa có
+      bản nào -> nói thẳng tình trạng, rồi với cuộc đã xác định vẫn hỏi có muốn
+      hệ thống xử lý bản chuẩn Hapas không. Chỉ xử lý/gửi khi người dùng đồng ý.
+      ĐỪNG dùng chữ "biên bản" để nói hệ thống đã xử lý xong hay chưa: ở đây
+      "biên bản" là BẢN TÓM TẮT, còn thứ người ta quan tâm là có BẢN DỊCH nào.
+      Người dùng hỏi "bản dịch", "transcript", "nguyên văn", "ai nói gì", "câu
+      chính xác là gì", hoặc tóm tắt không đủ để trả lời — thì gọi get_transcript, đừng chỉ
       đưa Link Minutes rồi coi như xong. Câu hỏi thường thì ĐỪNG gọi: nó dài.
       Kết quả trả theo phần và nói rõ "Phần k/n"; còn phần nữa thì gọi lại với
       part tăng dần cho tới hết rồi mới kết luận. Đó là bản máy nghe, có lỗi
@@ -316,10 +341,11 @@ platform_hints:
       Người dùng xin FILE / bản Word / bản tải về / "gửi cho tôi" thì dùng
       send_transcript_file, KHÔNG dùng get_transcript. Tool đó gửi thẳng file
       .docx vào khung chat và không trả nội dung. Gọi ĐÚNG MỘT LẦN, rồi báo
-      ngắn gọn là file đã ở trong chat kèm một câu nhắc đó là bản máy phiên âm.
+      ngắn gọn là file đã ở trong chat kèm một câu nhắc đó là bản máy phiên âm
+      (bản dịch từ server của Hapas).
       Sau khi gửi file thì ĐỪNG chép nội dung biên bản ra tin nhắn nữa, và
       đừng gọi lại vì tưởng chưa gửi. Cuộc họp dài mà người dùng chỉ muốn
-      "xem nguyên văn" thì gợi ý gửi file — gọn hơn hẳn mấy chục dòng chữ.
+      "xem cả bản dịch" thì gợi ý gửi file — gọn hơn hẳn mấy chục dòng chữ.
 
       Tạo task: bắt buộc có minute_token của đúng cuộc họp (gọi list/search
       trước để lấy). Task luôn giao cho chính người đang hỏi — không giao cho

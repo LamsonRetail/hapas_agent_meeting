@@ -54,7 +54,7 @@ NO_MEETING = (
 
 
 def _no_meeting_with_hints(who: dict[str, Any] | None,
-                           qwords: set[str], limit: int = 5) -> str:
+                           query: str, qwords: set[str], limit: int = 5) -> str:
     """`NO_MEETING` kèm danh sách cuộc GẦN ĐÚNG mà chính người hỏi được xem.
 
     Vì sao phải kèm dữ liệu chứ không chỉ viết lại câu chữ (bài học 04/08/2026):
@@ -80,11 +80,14 @@ def _no_meeting_with_hints(who: dict[str, Any] | None,
         if hit:
             scored.append((hit, title, row["minute_token"]))
     if not scored:
-        return NO_MEETING
+        return qa.not_visible(query)
     scored.sort(key=lambda x: -x[0])
     lines = [f"- {t} — minute_token: {tok}" for _, t, tok in scored[:limit]]
-    return (NO_MEETING + "\n\nGẦN ĐÚNG NHẤT (gọi lại tool này với một trong các "
-            "`minute_token` dưới đây, ĐỪNG bỏ cuộc):\n" + "\n".join(lines))
+    return qa.not_visible(
+        query,
+        "GẦN ĐÚNG NHẤT (gọi lại tool này với một trong các `minute_token` dưới "
+        "đây, ĐỪNG bỏ cuộc):\n" + "\n".join(lines),
+    )
 
 
 def _norm(s: str) -> str:
@@ -117,12 +120,12 @@ def _resolve_token(who: dict[str, Any] | None, query: str) -> tuple[str, str]:
     """
     query = (query or "").strip()
     if not query:
-        return "", NO_MEETING
+        return "", qa.not_visible("")
     if jobstore.get(query):
         return query, ""                  # đã là token
     q = _norm(query)
     if not q:
-        return "", NO_MEETING
+        return "", qa.not_visible(query)
     qwords = set(q.split())
     exact: list[dict[str, Any]] = []
     part: list[dict[str, Any]] = []
@@ -147,7 +150,7 @@ def _resolve_token(who: dict[str, Any] | None, query: str) -> tuple[str, str]:
             words.append(row)
     cands = exact or part or words
     if not cands:
-        return "", _no_meeting_with_hints(who, qwords)
+        return "", _no_meeting_with_hints(who, query, qwords)
     if len(cands) == 1:
         return cands[0]["minute_token"], ""
     # Trùng nhiều cuộc (hệ thống có hai cuộc cùng tên 'test luồng tự động' là
@@ -158,7 +161,7 @@ def _resolve_token(who: dict[str, Any] | None, query: str) -> tuple[str, str]:
     if len(vis) == 1:
         return vis[0]["minute_token"], ""
     if not vis:
-        return "", NO_MEETING
+        return "", qa.not_visible(query)
     import time as _t
 
     def _when_of(r: dict[str, Any]) -> str:
@@ -246,13 +249,34 @@ def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
         return err
     row = jobstore.get(minute_token)
     if not row:
-        return NO_MEETING
+        return qa.not_visible(minute_token)
 
     # (2) được xem — ĐÚNG bộ lọc của qa, không phải luật thứ hai
     if not qa._may_see(minute_token, who, qa.viewers_index()):
-        return ("Cuộc họp này CÓ trong hệ thống nhưng bạn không có trong danh "
-                "sách người dự, nên mình không gửi biên bản được. Nếu bạn có dự "
-                "thì nhắn quản trị hệ thống — có thể việc tra người dự bị sót.")
+        return qa.not_visible(str(row.get("title") or minute_token))
+
+    # (2b) CHƯA ENROLL thì KHÔNG cầm được nguyên văn (28/08/2026).
+    #
+    # Từ hôm nay người trong nhóm thuộc danh sách trắng hỏi được mà không cần
+    # enroll — quyền đến từ việc ở trong phòng (xem `gate.check`). Nhưng ĐỌC
+    # trong phòng và CẦM cả file .docx là hai mức khác nhau: file là toàn văn,
+    # và nó rơi vào chat RIÊNG của người đó, ra khỏi phạm vi phòng vốn là cơ sở
+    # cấp quyền cho họ.
+    #
+    # Vì sao phải chốt Ở ĐÂY chứ không dựa vào ràng buộc kỹ thuật như `tasks`:
+    # `tasks` cần token của chính người đó nên tự chặn, còn đường này bot upload
+    # và gửi bằng danh tính APP — không có gì tự chặn cả. Thiếu chốt này thì
+    # người chưa từng cấp quyền vẫn nhận được nguyên văn, tức ngược luật
+    # 02/08/2026 ("chỉ gửi cho người đã enroll").
+    union_id = (who.get("union_id") or "").strip()
+    if union_id:
+        r = db.conn().execute(
+            "SELECT status FROM tokens WHERE union_id=?", (union_id,)
+        ).fetchone()
+        if not r or r["status"] != "active":
+            return ("Bạn hỏi được về cuộc họp của nhóm này, nhưng để nhận FILE "
+                    "bản dịch đầy đủ thì cần cấp quyền cho mình một lần — nhắn "
+                    "riêng cho mình, mình gửi link ngay.")
 
     # Ký ức hội thoại: ghi NGAY SAU cửa quyền (2), trước mọi nhánh lỗi gửi. Xin
     # bản nguyên văn là tín hiệu "đang nói về cuộc này" mạnh nhất người dùng
@@ -274,8 +298,7 @@ def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
     if _recent_send(minute_token, rid):
         return (f"Đã gửi file biên bản cuộc họp này cho bạn trong "
                 f"{RESEND_COOLDOWN_MIN} phút vừa rồi — kiểm tra lại trong khung "
-                f"chat. KHÔNG gọi lại tool này; nếu người dùng vẫn không thấy "
-                f"thì bảo họ nhắn quản trị hệ thống.")
+                f"chat. KHÔNG gọi lại tool này.")
 
     # (4) phải có chữ. Nạp transcript từ đĩa: `jobs.transcript_path` là nguồn
     # sự thật, file .docx chỉ là bản xuất và có thể chưa từng được tạo (cuộc họp
@@ -303,8 +326,9 @@ def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
         # Đặt priority TRƯỚC khi ước tính là cố ý: `eta.estimate` xếp hàng theo
         # đúng thứ tự `process_queue` sẽ chạy, nên phải nhìn thấy job này đã ở
         # mức cực cao — không thì nó tính nhầm là job đứng sau cả hàng backlog.
-        return ("Cuộc họp này chưa có bản nguyên văn. Mình đã cho chạy TRƯỚC "
-                "TIÊN và sẽ TỰ GỬI cho bạn ngay khi xong — không cần hỏi lại."
+        return ("Cuộc họp này chưa có bản dịch từ server của Hapas. Mình đã "
+                "cho chạy TRƯỚC TIÊN và sẽ TỰ GỬI cho bạn ngay khi xong — "
+                "không cần hỏi lại."
                 + (f" Ước tính {khi_nao} nữa." if khi_nao else "")
                 + " Nói lại đúng ý đó cho người dùng bằng lời của bạn, có kèm "
                   "con số ước tính nếu có. Đừng bịa là đã gửi.")
@@ -314,13 +338,11 @@ def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
         with open(tpath, encoding="utf-8") as f:
             t = Transcript.from_json(json.load(f))
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        return (f"Có ghi đường dẫn nguyên văn nhưng đọc KHÔNG được ({exc}). "
-                f"Đây là lỗi hệ thống, không phải cuộc họp thiếu dữ liệu — báo "
-                f"người dùng nhắn quản trị hệ thống.")
+        return ("Mình chưa đọc được file Hapas của cuộc họp này nên chưa thể "
+                "gửi. Bạn hãy xem lại Meeting Note của Lark.")
     if not (t.text or "").strip():
-        return ("Cuộc họp này có file nguyên văn nhưng KHÔNG có chữ nào — "
-                "bản ghi im lặng, hoặc whisper hỏng lúc chạy. Không có gì để "
-                "gửi; báo người dùng nhắn quản trị hệ thống.")
+        return ("Bản Hapas của cuộc họp này chưa có nội dung để gửi. Bạn hãy "
+                "xem lại Meeting Note của Lark.")
 
     meta = jobstore.meta_from_json(row["meta_json"])
     doc = pipeline.write_doc(t, meta)
@@ -345,11 +367,12 @@ def send_transcript(who: dict[str, Any] | None, minute_token: str) -> str:
     except (json.JSONDecodeError, TypeError, AttributeError):
         summary = ""
 
-    user_text = f"Đã gửi file biên bản **{meta.title}** vào khung chat này."
+    user_text = (f"Đã gửi file **bản dịch từ server của Hapas** cho "
+                 f"**{meta.title}** vào khung chat này.")
     if summary:
         user_text += f"\n\n**Tóm tắt nội dung:** {summary}"
-    user_text += ("\n\n(Đây là bản máy phiên âm nên có thể nghe nhầm tên riêng "
-                  "và thuật ngữ.)")
+    user_text += ("\n\n(Máy phiên âm nên vẫn có thể nghe nhầm tên riêng và "
+                  "thuật ngữ, nhưng chất lượng hơn bản dịch từ Lark.)")
 
     return qa.two_channel(
         user_text,

@@ -31,7 +31,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from . import db, lark_api, oauth
+from . import config, db, lark_api, oauth
 
 # Nhắc lại link sau bao lâu. KHÔNG dùng TTL nonce (nay 24h — xem config): dùng
 # chung thì người mất link phải chờ hết 24h mới được cái mới. Link cũ vẫn sống
@@ -92,7 +92,8 @@ def _memory_block(union_id: str) -> str:
                      f"{at:%H:%M}")
     return "\n".join([
         "[NGƯỜI NÀY VỪA NHẮC TỚI / VỪA NHẬN THẺ VỀ NHỮNG CUỘC HỌP SAU]",
-        "(mới nhất trước — gồm cả cuộc mà hệ thống vừa đẩy thẻ 'Họp xong')",
+        "(được nhắc gần đây nhất trước — KHÔNG phải cuộc diễn ra mới nhất; gồm "
+        "cả cuộc mà hệ thống vừa đẩy thẻ 'Họp xong')",
         *lines,
         "Dùng danh sách trên CHỈ để hiểu câu nói tắt — \"cuộc đó\", \"cuộc vừa "
         "rồi\", \"phân tích đi\", \"bản ngày 29/07\" — rồi gọi tool với đúng "
@@ -103,6 +104,9 @@ def _memory_block(union_id: str) -> str:
         "Người dùng nói tắt mà KHÔNG nêu tên cuộc nào thì mặc định là MỤC ĐẦU "
         "TIÊN của danh sách. Chỉ chọn mục khác khi chính họ nêu tên/ngày khớp "
         "mục đó. Không chắc giữa hai cuộc thì hỏi lại MỘT câu ngắn, đừng đoán.",
+        "Riêng khi người dùng nói 'mới nhất' hoặc 'gần nhất', KHÔNG chọn từ "
+        "danh sách này: đó là câu hỏi về thời gian diễn ra. Phải gọi "
+        "latest_meeting để backend chọn đúng một cuộc và khóa minute_token.",
         "KHÔNG được dùng nó làm nội dung trả lời: ở đây chỉ có tên cuộc họp, "
         "không có tóm tắt hay nguyên văn. Mọi câu hỏi về NỘI DUNG vẫn phải gọi "
         "tool meetings trong chính lượt này.",
@@ -126,8 +130,56 @@ def _enrolled(union_id: str) -> dict | None:
 _P2P = {"dm", "p2p"}
 
 
-def _refuse_group(chat_type: str) -> dict[str, Any] | None:
-    """Chặn mọi phòng KHÔNG phải 1-1. None = được đi tiếp.
+def _refuse_unless_mentioned(mentions: str, ct: str) -> dict[str, Any] | None:
+    """Trong nhóm, tin phải gọi ĐÍCH DANH bot. None = được đi tiếp.
+
+    Ca thật 06/09/2026, nhóm `Digital Transformation Chat`: anh Thiện nhắn
+    `@All ae hnay k đi họp tháng à, sao có mỗi vài người vậy ?` và **bot trả
+    lời** — giữa một câu hỏi rõ ràng dành cho người, không dành cho nó.
+
+    Gốc nằm ở adapter của Hermes (`_mentions_self`, ngoài repo):
+
+        # @_all is Feishu's @everyone placeholder.
+        if "@_all" in raw_content:
+            return True
+
+    Tức `@All` được tính là "có gọi bot", nên `require_mention: true` không chặn
+    gì cả. Log cho thấy 4 tin `[Mentioned: @all]` đã lọt vào từ 03/09.
+
+    KHÔNG sửa adapter: file đó ngoài repo, không test nào phủ, và bản cập nhật
+    Hermes sẽ ghi đè. Sửa ở đây — lớp có test, và là chỗ duy nhất quyết định
+    ai được vào.
+
+    So `open_id` với `open_id`, không so tên: tên hiển thị đổi được, và `@All`
+    thì mang tên của người khác chứ không mang tên bot.
+
+    FAIL-CLOSED. Không lấy được id bot, hoặc plugin đời cũ không gửi `mentions`,
+    thì ĐÓNG. Khác hẳn cách xử `chat_type` rỗng (mở + cảnh báo): ở đó đóng là
+    bot câm với TẤT CẢ mọi người; ở đây đóng chỉ làm bot im trong NHÓM — mà
+    nhóm vốn là tính năng opt-in, im còn hơn nói xen vào chuyện người ta.
+    """
+    ids = {x.strip() for x in (mentions or "").replace(",", " ").split()
+           if x.strip()}
+    if not ids:
+        print(f"[gate] tin trong {ct} không kèm mention nào (hoặc plugin đời "
+              f"cũ chưa gửi) — không trả lời")
+        return {"decision": "wait",
+                "reason": "trong nhóm thì phải @ đúng tên bot mới trả lời"}
+    me = lark_api.bot_open_id()
+    if not me:
+        print("[gate] KHÔNG hỏi được open_id của bot — đóng cửa nhóm cho chắc")
+        return {"decision": "wait", "reason": "chưa xác định được danh tính bot"}
+    if me in ids:
+        return None
+    print(f"[gate] tin trong {ct} có mention nhưng KHÔNG gọi bot "
+          f"(@All hoặc gọi người khác) — không trả lời")
+    return {"decision": "wait",
+            "reason": "tin này không gọi bot (ví dụ @All) nên bot không xen vào"}
+
+
+def _refuse_group(chat_type: str, chat_id: str = "",
+                  mentions: str = "") -> dict[str, Any] | None:
+    """Chặn phòng KHÔNG phải 1-1, TRỪ nhóm trong danh sách trắng. None = đi tiếp.
 
     Vì sao phải chặn, và vì sao lý do KHÔNG phải cái tôi tưởng lúc đầu
     (02/08/2026): bộ lọc `qa._may_see` cấp quyền cho **người HỎI**, không cấp
@@ -160,19 +212,37 @@ def _refuse_group(chat_type: str) -> dict[str, Any] | None:
         return None
     if ct in _P2P:
         return None
+    # NHÓM TRONG DANH SÁCH TRẮNG (27/08/2026) — xem `config.GROUP_QA_CHATS`.
+    #
+    # Mở ở đây KHÔNG phải là bỏ luật cũ, vì phạm vi trả lời bị siết ở TẦNG DỮ
+    # LIỆU: `qa` chỉ đưa ra cuộc có chính `chat_id` này trong `invited_chats`.
+    # Khớp bằng chat_id CHÍNH XÁC, không đoán theo tên nhóm: tên trùng nhau đầy
+    # (đo 27/08: có hai nhóm cùng tên `DIGITAL TRANSFORMATION`, khác thành viên).
+    #
+    # Thiếu `chat_id` mà vẫn là group -> ĐÓNG. Không có id thì không biết được
+    # phép xem cuộc nào, và "không biết" ở đây phải là từ chối, không phải mở.
+    cid = (chat_id or "").strip()
+    if cid and cid in config.GROUP_QA_CHATS:
+        return _refuse_unless_mentioned(mentions, ct)
     return {"decision": "wait",
             "reason": f"chỉ trả lời trong chat 1-1, không trả lời trong "
                       f"{ct} (biên bản chỉ hiện cho người có dự)"}
 
 
 def check(union_id: str, user_id: str = "", name: str = "",
-          *, send: bool = True, chat_type: str = "") -> dict[str, Any]:
-    """Quyết định cho vào hay không. `send=False` để thử mà không nhắn ai."""
+          *, send: bool = True, chat_type: str = "",
+          chat_id: str = "", mentions: str = "") -> dict[str, Any]:
+    """Quyết định cho vào hay không. `send=False` để thử mà không nhắn ai.
+
+    `chat_id` chỉ có nghĩa với phòng nhóm: nó quyết định nhóm này có trong
+    danh sách trắng không, và về sau `qa` dùng chính nó để giới hạn cuộc họp
+    được phép trả lời. Chat 1-1 không dùng tới.
+    """
     # TRƯỚC mọi thứ khác, kể cả trước khi tra `tokens`: trong phòng nhiều người
     # thì ngay cả câu "bạn chưa cấp quyền, bấm link này" cũng không nên phát ra
     # giữa phòng, và ta cũng không muốn cấp vé phiên cho một ngữ cảnh mà câu trả
     # lời sẽ bị người khác đọc.
-    if (no := _refuse_group(chat_type)) is not None:
+    if (no := _refuse_group(chat_type, chat_id, mentions)) is not None:
         return no
 
     if not union_id:
@@ -180,6 +250,30 @@ def check(union_id: str, user_id: str = "", name: str = "",
         return {"decision": "wait", "reason": "thiếu union_id"}
 
     who = _enrolled(union_id)
+
+    # NHÓM TRONG DANH SÁCH TRẮNG: chưa enroll VẪN hỏi được (user chốt
+    # 28/08/2026). Quyền ở đây đến từ việc Ở TRONG PHÒNG, không từ token cá
+    # nhân — và trả lời được là vì dữ liệu đã nằm sẵn trong DB, lấy bằng token
+    # của CHỦ BẢN GHI lúc phiên âm, chứ không cần token của người hỏi.
+    #
+    # Chỉ mở đúng đường ĐỌC. Hai đường ghi tự chặn bằng chính ràng buộc kỹ
+    # thuật của chúng, không cần luật thêm:
+    #   * `tasks` cần `get_access_token(open_id)` — không có token thì không tạo
+    #     được, và task cũng phải đứng tên người thật;
+    #   * `sendfile` thì KHÔNG tự chặn (bot upload bằng danh tính app), nên nó
+    #     có chốt riêng — xem `sendfile.send_transcript`.
+    #
+    # KHÔNG mở cho chat 1-1: ở đó không có phòng nào định nghĩa phạm vi, nên bỏ
+    # lớp enroll là mở toang mọi cuộc người đó từng dự cho một danh tính chưa
+    # xác thực gì.
+    if not who and not _refuse_group(chat_type, chat_id, mentions):
+        ct = (chat_type or "").strip().lower()
+        if ct and ct not in _P2P:
+            print(f"[gate] {union_id} chưa enroll nhưng hỏi trong nhóm "
+                  f"{chat_id} (danh sách trắng) — cho ĐỌC, không gửi file")
+            who = {"open_id": user_id or "", "name": name or union_id,
+                   "enrolled": False}
+
     if not who:
         # Người này chưa có trong `tokens` — nhưng RẤT CÓ THỂ họ vừa bấm "Đồng ý"
         # xong và đang nhắn lại ngay (04/08/2026, lỗi người mới nào cũng dính):
@@ -190,18 +284,11 @@ def check(union_id: str, user_id: str = "", name: str = "",
         # không có nonce nào còn sống, nên chỉ tốn một lời gọi Vercel đúng lúc
         # có người đang enroll dở — không đụng vào hạn mức Blob của vòng `run`.
         try:
-            # ĐỔI LẠI notify=True (user chốt 05/08/2026). Bản trước để False
-            # nhằm tránh "bot trả lời hai lần", nhưng nó gây một lỗi nặng hơn:
-            # đường này vẫn hoàn tất OAuth và ACK queue, chỉ bỏ qua welcome — và
-            # KHÔNG có ai gửi bù. Người vừa cấp quyền mà lỡ nhắn trước khi vòng
-            # nền kịp poll thì mất hẳn danh sách 7 ngày, tức mất đúng cái luồng
-            # chính của sản phẩm.
-            #
-            # Hai tin lúc đó KHÁC nội dung (danh sách chào mừng + câu trả lời cho
-            # câu họ vừa hỏi), không phải trả lời trùng như sự cố 05/08. Và vòng
-            # nền giờ poll nhanh khi có người enroll dở, nên gần như luôn gửi
-            # xong danh sách TRƯỚC khi họ kịp nhắn — va chạm này hiếm khi xảy ra.
-            oauth.poll_pending()
+            # Gate đang giữ CHÍNH tin nhắn sẽ đi tiếp vào agent. Nếu poll ở đây
+            # cũng gửi welcome thì cùng một tin người dùng sinh hai câu trả lời
+            # chạy song song. Hoàn tất OAuth + ACK ngay, nhưng để câu trả lời của
+            # lượt hiện tại là đầu ra duy nhất; vòng nền mới là nơi gửi welcome.
+            oauth.poll_pending(notify=False)
         except Exception as exc:              # noqa: BLE001 — cửa vào không được chết
             print(f"[gate] kéo hộp thư hỏng (bỏ qua): {exc}")
         who = _enrolled(union_id)
@@ -214,7 +301,13 @@ def check(union_id: str, user_id: str = "", name: str = "",
         tok = ""
         try:
             from . import askers
-            tok = askers.issue(union_id, who["open_id"], who["name"] or name)
+            # Vé mang theo PHÒNG. Câu hỏi trong nhóm chỉ mở được cuộc mà chính
+            # nhóm đó được mời (`qa._may_see`), và vì phạm vi buộc vào VÉ nên
+            # agent không có cách nào bỏ qua nó.
+            tok = askers.issue(union_id, who["open_id"], who["name"] or name,
+                               room_chat_id=(chat_id or "").strip()
+                               if (chat_type or "").strip().lower() not in _P2P
+                               else "")
         except Exception as exc:              # noqa: BLE001 — xem trên
             print(f"[gate] không cấp được vé phiên cho {union_id}: {exc}")
         # Hồ sơ + ký ức đi kèm quyết định `allow` (06/08/2026). Vì sao V2 cấp

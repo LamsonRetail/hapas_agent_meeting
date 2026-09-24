@@ -1,11 +1,631 @@
-# MeetingxLark — bối cảnh hiện tại và bàn giao phiên 05/08/2026
+# MeetingxLark — bối cảnh hiện tại và bàn giao
 
-> Cập nhật lần cuối: **05/08/2026, Asia/Saigon**  
+> Cập nhật lần cuối: **28/08/2026, Asia/Saigon**
 > Repo: `D:\MeetingxLark`  
 > Đối tượng đọc: Codex/chat mới hoặc người tiếp quản vận hành.  
 > **Đọc file này trước khi sửa hoặc chẩn đoán.** Khi mâu thuẫn với tài liệu cũ,
-> trạng thái và quyết định trong file này được ưu tiên vì đã được kiểm tra live ngày
-> 05/08/2026.
+> trạng thái và quyết định trong file này được ưu tiên vì đã được kiểm tra live.
+>
+> Các mục `0a`–`0m` xếp theo THỜI GIAN, mới nhất ở `0m`. Mục `0` (tóm tắt một
+> phút) viết từ 05/08 và chỉ nói về sự cố ACL hồi đó — đọc `0k`–`0m` để biết
+> trạng thái hiện tại.
+>
+> **Ba bài học lặp lại nhiều lần nhất, đọc trước khi chẩn đoán bất cứ thứ gì:**
+> 1. **Log trắng không phải bằng chứng.** Phần lớn lỗi ở đây là "hệ thống làm sai
+>    mà không báo gì". Trước khi kết luận "không xảy ra", hỏi: nếu nó hỏng ngay
+>    bây giờ, tôi có thấy dòng nào không? (27/08: tôi kết luận sai hai lần vì tin
+>    vào `gateway.log` trắng, trong khi cú bỏ tin chỉ log ở mức DEBUG.)
+> 2. **Đổi trạng thái CUỐI của một luồng thì phải soát mọi chỗ lọc theo trạng
+>    thái cũ.** Chúng không gãy — chúng im lặng ngừng chạy (`_backfill_recaps`
+>    mù với `held` gần hai tháng).
+> 3. **Bước phụ hỏng phải NÓI TO.** Một cú `continue` im lặng trong
+>    `chat_members` giấu suốt 6 ngày việc 24 nhóm được mời họp mà bot chưa vào.
+
+## 0a. Sự cố V2 tắt sau restart ngày 12–13/08/2026 — đã sửa
+
+- Windows PowerShell Operational log ghi bốn lần gọi `restart-v2.ps1` ngày
+  12/08, nhưng không có crash Python, reboot/sleep hoặc Application Error tương
+  ứng. Script cũ dùng `Start-Process run-v2-auto.bat` từ một shell/job tạm; khi
+  job cha kết thúc, cây process con bị dọn. Máy lúc đó chỉ có Startup `.vbs`,
+  không có Scheduled Task `V2_Orchestrator`, nên không có gì bật lại.
+- Nay `tools/register-v2-orchestrator.ps1` tạo task do Task Scheduler trực tiếp
+  sở hữu wrapper, `RestartCount=999`, interval 2 phút, không giới hạn runtime,
+  không dừng khi chuyển sang pin. `restart-v2.ps1` chỉ khởi động qua task này;
+  nếu đăng ký/start task hỏng thì fail rõ, không rơi về child process tạm.
+- Startup item cũ đã đổi đuôi `.disabled` để tránh hai launcher đua nhau. Đã đo
+  live: đúng một wrapper + một `python -m v2 run --send`, task `Running`, và
+  heartbeat `v2run=1` sau khi terminal restart đã thoát.
+- Sáu job `empty_transcript` cũ đã được tải/đo bằng `ffmpeg volumedetect`, không
+  in transcript: bốn clip 3–37 giây không có lời hữu ích; hai track 1517s và
+  2485s là im lặng số (`mean=max=-91 dB`). Cả sáu chuyển `discarded`; failed=0.
+  Pipeline mới đo peak trước Whisper: silent recording đi `discarded`, còn audio
+  có tín hiệu mà Whisper trả 0 chữ vẫn `failed` và cảnh báo.
+- Audit nay ghi SQLite local bền vững, payload Hermes truyền qua stdin, log câu
+  cuối sau lớp lọc an toàn, và Base mirror là opt-in (`BITABLE_AUDIT_TABLE_ID`
+  mặc định rỗng). Plugin live là `v2-enroll-gate` **1.10.0**.
+- Kiểm ngày 13/08: selftest **747 PASS / 0 FAIL**, Worker **6/6**, Doctor không
+  còn lỗi chặn, MCP kết nối và thấy đủ 9 tools, gate DM/ACL chạy và group/invalid
+  ticket fail-closed. Cảnh báo vận hành còn lại: backup vẫn cùng ổ `D:`.
+- Task tạm `V2_ApplyUpdateWhenIdle` đã được gỡ sau khi áp bản vá thủ công, tránh
+  một lần restart bất ngờ lúc queue rỗng. Chỉ watchdog chính `V2_Orchestrator`
+  còn hoạt động.
+
+## 0b. Bản vá câu từ chối, nguồn bản dịch và reset chat — đã áp live 13/08 21:24
+
+- Khi không tìm thấy cuộc trong phần user có quyền xem, Python dựng sẵn đúng một
+  câu: `Mình chưa tìm thấy cuộc “…” trong các cuộc họp bạn có quyền xem.` Plugin
+  phải chép nguyên câu này; không được nối ký ức cũ như `Workforce`, không hướng
+  người dùng sang quản trị hệ thống và không lộ gợi ý về cuộc bị ẩn.
+- Quyết định mới nhất lúc 22:21 thay thế riêng luật mời Hapas: sau **mọi cuộc** bot
+  phải hỏi người dùng có muốn lấy bản dịch chuẩn từ Hapas không. Nếu file chưa có,
+  chỉ khi họ đồng ý mới nâng ưu tiên xử lý và tự gửi khi xong; file đã có thì mời
+  nhận ngay. Phân loại DB vẫn giữ nguyên để không nói nhầm bản chưa có là đã sẵn sàng.
+- Phân loại nguồn dùng trạng thái `jobs` trong SQLite: Hapas có file thật, Lark có
+  dữ liệu/link ở trạng thái đọc được, còn lại là chưa đọc được bản nào. Nhãn và lời
+  giải thích của ba nhóm không trộn hai nguồn và chỉ phát một tin.
+- `/reset`, `/new` và alias `/lammoi` tạo phiên Hermes mới; khi là lệnh chủ động của
+  user, plugin còn gọi `python -m v2 chat-reset --union-id ...` để xóa neo cuộc họp
+  trong `chat_memory`. OAuth, ACL, job và biên bản không bị xóa.
+- Code + test mới nhất: `python -m v2 selftest` = **747 PASS / 0 FAIL**. Plugin
+  live là **1.10.0**; config live đã nhận policy mới, Hermes và V2 đã restart.
+- Thẻ `Họp xong` bỏ hẳn dòng cuối “Nguồn mặc định: Meeting Note của Lark”. Thay
+  bằng câu hỏi Hapas trong mọi trường hợp và nút lấy bản chuẩn. Nút đi qua đúng
+  gate, ACL và `send_transcript_file`, nên chưa có sự đồng ý thì không xử lý/gửi.
+- Kiểm live 22:23: đúng một V2 process, Scheduled Task `Running`, scanner quét
+  thành công lúc 22:23:00, heartbeat mã 0; gateway sống và plugin 1.10.0 enabled.
+  Bản config trước thay đổi được giữ ở
+  `config.pre-hapas-offer-20260813-222207.yaml`.
+
+### 0b.1 Vì sao cuộc mới nhất không tự gửi — phát hiện thêm lúc 21:04
+
+- Phát tự động không bị gỡ: `enqueue_minute(..., notify=True)` vẫn gọi
+  `_notify_minute`, dùng Meeting Note Lark và gửi thẻ cho người dự đã enroll.
+  Nhưng lời gọi này chỉ xảy ra sau khi scanner đưa cuộc vào DB.
+- Đo live: heartbeat tăng từ `scan=27m` tới **`scan=122m`** trong khi 28 job dài
+  đang được xử lý; monitor vẫn báo `OK` vì luật cũ miễn cảnh báo scan cũ khi còn
+  backlog. Quét thử-khô 14 ngày thấy 6 cuộc chưa vào DB, gồm
+  `08-13 | Workforce AI Weekly Meeting`. Vì chưa có job nên cuộc này không thể
+  phát tự động và chatbot cũng không thể tra đúng nó.
+- Nguyên nhân code: `scan_once()` và `process_queue()` cùng một thread;
+  `process_queue()` duyệt hết snapshot hàng đợi trước khi trả về vòng quét kế.
+- Bản vá thêm daemon `v2-scan-watch`: scanner chạy đúng nhịp kể cả khi worker
+  đang tải/ffmpeg/whisper. `_scan_lock` chặn quét chồng; heartbeat nay luôn cảnh
+  báo scan quá 20 phút, không để backlog che lỗi. Hai test mới khóa đúng ca này.
+- Đã backup DB thành `state-2026-08-13-211703.db`, rồi nạp đủ 6 cuộc bằng
+  `backfill --priority 0 --yes`; backfill xác nhận **không gửi tin cho ai**. Sau
+  restart, scanner quét lại lúc 21:24:57 và heartbeat trả mã 0.
+- Cuộc mới nhất `08-13 | Workforce AI Weekly Meeting` hiện ở DB với
+  `status=queued`, `priority=1`, nguồn `calendar[verified]`, Meeting Note Lark đọc
+  được (82.061 ký tự), chưa có file Hapas. Sau xác nhận riêng của người dùng, thẻ
+  nguồn Lark đã gửi thành công **8/8** người dự đã enroll, lỗi 0; 15 người chưa
+  enroll không nhận. Khóa chống trùng là `notice-<token>-<union>`.
+- Scanner độc lập đã tiếp tục quét đều khoảng 5 phút/lần trong lúc worker còn bận:
+  21:35, 21:40, 21:45, 21:50 và 21:55 đều thành công. Heartbeat trả mã 0,
+  `V2_Orchestrator` vẫn `Running`, đúng một process; task cập nhật tạm không còn.
+
+## 0c. Hai regression trong chat ngày 14/08 — đã áp live 10:14
+
+Ca thật 09:46–09:47 của Nguyễn Tiến Thẩm:
+
+1. Hỏi `cuộc họp workforce AI mới nhất có bản dịch từ hapas chưa` nhưng bot trả
+   cuộc `08-06`, dù DB có cuộc `08-13` mới hơn.
+2. Sau khi bot xác nhận `08-13` và hỏi có gửi file Word không, user đáp `có` thì
+   `send_transcript_file` bị gate chặn, rồi câu trả lời bị thay bằng
+   `_NO_TOOL_REPLY`.
+
+Audit Hermes xác nhận cùng một session, không phải mất phiên:
+
+- lượt đầu agent gọi thẳng `get_meeting` bằng minute token `08-06` lấy từ
+  `chat_memory`, không gọi `search_meetings`;
+- lượt `13/8` gọi `search_meetings`, kết quả thật có `OFFER_MARK` và agent chọn
+  đúng minute token `08-13`;
+- lượt `có` agent gọi đúng `send_transcript_file` cho token `08-13`, nhưng plugin
+  đã xoá cờ lời mời nên chặn write tool.
+
+Hai nguyên nhân và bản vá:
+
+- `chat_memory` sắp theo lúc cuộc được **nhắc gần đây**, không theo thời gian
+  cuộc họp, nhưng prompt cũ gọi mơ hồ là “mới nhất trước”. Nay câu
+  `mới nhất/gần nhất` không được bơm memory cũ; plugin còn chặn `get_meeting`
+  cho tới khi `search_meetings` chạy thành công trong chính lượt đó.
+- Hermes hiện phát hook tên `on_session_end` sau mỗi `run_conversation` (mỗi
+  tin nhắn). Plugin 1.10 hiểu nhầm là cuối phiên và đăng ký `_cleanup_session`,
+  làm mất `_asked/_offered` ngay sau câu mời Hapas. Plugin 1.11 đăng ký hook này
+  vào `_cleanup_turn`; chỉ `on_session_finalize/reset` mới xoá trạng thái phiên.
+
+Self-test mới kiểm cả bảng đăng ký hook và chuỗi
+`mới nhất → search → get đúng kết quả → mời Hapas → on_session_end → có → gửi`.
+Kết quả code hiện tại: **753 PASS / 0 FAIL**, compile và `git diff --check` sạch.
+
+Đã được người dùng duyệt và áp live lúc 10:13–10:14 ngày 14/08:
+
+- backup config ở
+  `config.pre-v2-enroll-gate-1.11.0-20260814-101334.yaml`; backup plugin 1.10 ở
+  `backups/v2-enroll-gate-20260814-101334/` trong `%LOCALAPPDATA%\hermes`;
+- plugin live là **1.11.0**, hai file live có SHA-256 khớp bản gốc trong repo;
+  `feishu-config.yaml` đã deep-merge và giữ các khóa live ngoài phạm vi;
+- gateway dừng sạch, restart lúc 10:14, Feishu websocket và API server cổng 8642
+  đều kết nối lại; đúng một logical gateway parent/child; `meetings` kết nối và
+  thấy đủ **9 tools**;
+- `python -m v2 doctor` chạy được; cảnh báo vận hành duy nhất vẫn là backup DB
+  cùng ổ `D:`. Không gửi tin nhắn thử nào ra Lark trong lúc triển khai.
+
+## 0d. Regression tiếp theo: search-first vẫn gửi nhầm file 06/08 — đã áp live 13:54
+
+Ca thật 13:34 ngày 14/08: user xin `biên bản cuộc họp mới nhất của mình từ
+server Hapas`, nhưng bot gửi file của `work` ngày 06/08. Audit xác nhận agent làm
+ba bước: `search_meetings("")` bị trả `Cần từ khoá`; agent tự thay bằng từ chung
+chung `họp`; kết quả chỉ giữ các record có chữ đó trong tên/nội dung và đứng đầu
+là `work`; sau đó `send_transcript_file` gửi đúng token sai mà agent vừa chọn.
+
+Vì vậy plugin 1.11 chỉ chặn được token lấy thẳng từ memory, chưa chặn được hai lỗ:
+
+1. `search_meetings` là tìm TỪ KHÓA, không phải resolver cuộc mới nhất. Từ `họp`
+   còn loại mất tiêu đề tiếng Anh `08-13 | Workforce AI Weekly Meeting`.
+2. Gate chỉ kiểm “đã search thành công”, không ràng buộc token tool gửi file với
+   record mới nhất. Agent chọn sai sau search vẫn được phép gửi.
+
+Bản code 1.12 thêm tool đọc `latest_meeting`: backend lọc ACL, gộp record/pending,
+sắp bằng thời gian cuộc họp và trả đúng một record. `họp`/`meeting` được coi là
+từ chung chung và không lọc. Kết quả mang marker nội bộ chứa token; plugin ghi
+token đó rồi chặn `get_meeting`, `get_transcript`, `create_task` và
+`send_transcript_file` nếu agent dùng token khác. Trước khi có marker, cả
+list/search/read/send cho yêu cầu “mới nhất” đều bị chặn và agent được yêu cầu gọi
+`latest_meeting`.
+
+Regression mô phỏng đúng ca live: record cũ chứa chữ `họp`, record mới có tiêu đề
+tiếng Anh không chứa chữ đó; backend vẫn chọn record mới, token marker không lộ ra
+kênh người dùng, gửi token cũ bị chặn và gửi đúng token mới được qua. Kết quả:
+**761 PASS / 0 FAIL**, compile + diff-check sạch, MCP mới thấy **10 tools**.
+Đo DB live không đọc transcript: `08-13` lúc 18:05 có file Hapas thật và mới hơn
+`08-06 Workforce`/`work`.
+
+Đã áp live lúc 13:53–13:54 sau khi user duyệt: config cũ được giữ tại
+`config.pre-v2-enroll-gate-1.12.0-20260814-135334.yaml`, plugin cũ tại
+`backups/v2-enroll-gate-20260814-135334/`. Plugin live là **1.12.0**, config đã
+deep-merge policy `latest_meeting`; gateway dừng sạch rồi lên PID 33820, trạng
+thái `running`, Feishu + API đều `connected`. MCP discover **10 tools** và
+self-test sau triển khai **761 PASS / 0 FAIL**. Doctor chạy được; cảnh báo duy
+nhất vẫn là backup cùng ổ `D:`. Không gửi tin thử ra Lark.
+Phép kiểm chỉ-đọc trên đúng ACL live của user: cả keyword rỗng và từ chung `họp`
+đều chọn `08-13`; token `work` 06/08 bị loại.
+
+## 0e. Phiên 18/08/2026 — cuộc họp rơi khỏi hệ thống, và ba lỗi phân loại
+
+Ca thật: cuộc `Chat bot Nhân sự` (chủ trì Vũ Thị Thu Hiền - GĐ Nhân Sự, 16:00
+18/08, minute `obsgh6g3m9fu3w542u9lw5l9`) có ghi hình, chủ bản ghi đã enroll, mà
+không ai được thông báo và chatbot cũng không tra ra. Không liên quan auth, cũng
+không liên quan "cuộc cũ".
+
+**Gốc:** scanner tìm cuộc bằng `minutes/search` lọc `participant_ids`. Đo cả 22
+người đã enroll: bản ghi đó KHÔNG có trong danh sách lọc-theo-người của bất kỳ ai
+— kể cả chính chủ bản ghi (`p=0`). Nó chỉ hiện ở danh sách bỏ-lọc-người của chị
+Hiền. Cờ `V2_SCAN_ALL_VISIBLE` (nguồn thứ hai, `orchestrator.scan_once`) đang TẮT
+nên V2 mù hoàn toàn. Đo rộng 7 ngày: **49/53 bản ghi có người dự được Lark ghi
+nhận, 4/53 (~8%) thì không** — tức đây không phải ca hiếm.
+
+**Đã làm:** nạp tay cuộc đó (thẻ tới 3/3 người đã enroll, nay `held`, có
+transcript); user chốt **bật lại `V2_SCAN_ALL_VISIBLE=true`** trong `v2/.env` dù
+`config.py` ghi rõ cờ này từng bật rồi tắt trong cùng ngày 04/08. `.env` ngoài
+git — xem `v2/.env.bak-20260818-scanall` để biết bản trước.
+
+Sáu phút sau khi bật, cái giá hiện ra: vòng quét vớt 3 bản ghi cũ và **gửi 5 thẻ
+"họp xong" cho cuộc đã họp 5–6 ngày trước**. Ba lỗi được vá trong phiên, tất cả
+cùng một hình dạng — **xếp sai giỏ / cắt sai đầu rồi im lặng kết luận sai**:
+
+1. **Thẻ "họp xong" cho cuộc cũ.** Đường quét không biết tuổi cuộc họp và để
+   `notify=True` mặc định. Thêm `NOTIFY_MAX_AGE_HOURS` (6h) + chần tuổi trong
+   `enqueue_minute` — chỗ duy nhất có `meta.start` thật, nên che cả ca bản ghi cũ
+   được share muộn. Quá tuổi thì VẪN nạp và phiên âm, chỉ thôi báo. Thiếu `start`
+   thì fail-open. Kiểm live: cuộc họp 18:04 phát hiện 19:03 vẫn báo 1/1 người.
+2. **Một cú rate limit biến job đáng-park thành `failed` vĩnh viễn.** `99991400`
+   về kèm HTTP 200 nên `_RetryTransport` không đỡ; nó rơi vào giỏ `other` làm
+   `denied and not other` sai → lỗi chung → đốt 5 lần thử. Job thật: `08-17 | HỌP
+   ĐỊNH KÌ THỨ 2` (56 người) mà sự thật chỉ là chủ bản ghi (Nguyễn Thảo Phương)
+   chưa enroll. Thêm giỏ `throttled` + lớp `RateLimited` + orchestrator
+   `unbump_attempts`. **Tầng sâu hơn:** cú bóp KHÔNG tự khỏi vòng sau — chính
+   thang ứng viên gọi `minutes_media_url` ~19 lần liên tiếp rồi tự đụng hạn mức,
+   nên "thử lại vòng sau" = job nằm `queued` vô hạn mà không ai báo. Nay có lượt
+   hai sau `MEDIA_THROTTLE_BACKOFF_S` (5s). Live: hỏi lại xong job về
+   `waiting_auth` đúng chỗ, `hong_can_sua` 1 → 0.
+3. **`restart-v2.ps1` chặn restart 5 ngày vì ĐẾM file trong `work/`.** File 238 MB
+   đọng từ 13/08 của một job đã `held` làm MỌI lần restart từ 13→18/08 bị chính lá
+   chắn đó huỷ (exit 3) — bản vá nào cũng không vào được máy, im lặng. Nay hỏi
+   `v2.bat workfiles` (`pipeline.work_files`): chỉ `queued/transcribing/recapping`
+   là đang dùng thật (`queued` phải tính — tải xong mới đặt `transcribing`).
+   Python hỏng thì fail-closed về hỏi người. KHÔNG dùng `2>&1` trên native exe
+   trong file đó: PS 5.1 bọc stderr thành ErrorRecord, gặp
+   `$ErrorActionPreference='Stop'` là chết chính script.
+
+**Lỗi thứ tư, lòi ra khi kiểm luồng lần cuối:** `v2 ask` không bao giờ thấy cuộc
+mới. `qa.context` gọi `records(limit=50)`, mà `limit` cắt phía Base trả về TRƯỚC,
+tức phía cũ nhất; với 255 record thì nó trả lời bằng cụm 50 cuộc cũ nhất và gọi
+một cuộc 30/07 là "gần nhất". Ba đường MCP đều lấy cả Base rồi sắp mới-trước; nay
+`context` làm y vậy rồi mới cắt. **Đường bot thật không bị lỗi này** — đã kiểm
+`qa.search_meetings` trước khi vá và nó trả đúng cuộc, ACL ẩn 243/255 record.
+`v2 ask` và bot khác nguồn: đừng lấy `ask` làm chuẩn kiểm luồng.
+
+Kiểm thử: `selftest` **783 PASS / 0 FAIL** (thêm 12 test cho các ca trên).
+`doctor` chỉ còn cảnh báo cũ: backup cùng ổ `D:`. Heartbeat OK, đúng một
+orchestrator, task `Running`, `failed=0`.
+
+Việc còn mở: cuộc `08-17` toàn công ty nằm `waiting_auth` tới khi **Nguyễn Thảo
+Phương (L&C & HR Ops Manager)** cấp quyền; file rác 238 MB đã dẹp sang
+`v2/data/work-stale/`, xoá được.
+
+## 0f. Phiên 19/08/2026 — nguồn quét theo CHỦ bản ghi, và tắt lại cờ quét rộng
+
+User hỏi một câu làm lộ chỗ tối qua làm chưa tới: *"Chat bot Nhân sự thì chị Hiền
+là chủ mà?"* Đúng — chị là chủ bản ghi VÀ đã enroll. Vấn đề là scanner chỉ lọc theo
+`participant_ids`, mà Lark KHÔNG xếp chủ bản ghi vào danh sách người dự của chính
+bản ghi họ tạo. Tối qua tôi bật `SCAN_ALL_VISIBLE` vì nó là nguồn thứ hai *có sẵn
+trong code*, không thử xem API còn bộ lọc nào hẹp hơn.
+
+Có: `owner_ids`. Đo 8 ngày trên 22 người đã enroll:
+
+| Nguồn | Số bản ghi |
+|---|---|
+| Không lọc (`SCAN_ALL_VISIBLE`) | **80** |
+| Lọc `participant_ids` | 74 |
+| Lọc `owner_ids` | 72 |
+| Người dự HOẶC chủ | **80** |
+
+Cả 6 bản ghi mà đường người-dự bỏ sót (`Chat bot Nhân sự`, `Finance weekly`,
+`Họp CĐS`, hai cuộc phỏng vấn, một cuộc 11/08 ngoài `LOOKBACK_DAYS`) đều được lượt
+chủ vớt về; **0** bản ghi còn cần đường rộng.
+
+Nên: thêm **nguồn (1b)** vào `orchestrator.scan_once` (lọc `owner_ids` cho từng
+người enroll), xếp CÙNG HẠNG với nguồn (1) — có cơ sở vì viewer vẫn chỉ được ghi
+khi `_explicit_viewer` xác nhận qua metadata, và `meta.owner_open_id` đến từ
+`minutes_get`, độc lập với bộ lọc. Không luật ACL mới. Rồi **TẮT lại**
+`V2_SCAN_ALL_VISIBLE` trong `v2/.env` (dòng bị comment, giữ lý do).
+
+Kiểm live sau restart: log có `+1 minute do CHÍNH họ làm CHỦ` cho đúng chị Hiền,
+0 dòng `MỞ XEM ĐƯỢC`, heartbeat OK, `failed=0`. `selftest` **786 PASS / 0 FAIL**.
+
+**⚠️ Bẫy phải nhớ khi thêm bộ lọc mới cho `minutes/search`:** Lark ÂM THẦM BỎ QUA
+khoá filter nó không biết. Đo 19/08: `owner_id`, `creator_ids`, `user_ids` đều trả
+`code=0` và ra y hệt danh sách KHÔNG lọc — chỉ `owner_ids` mới thật sự lọc. `code=0`
+KHÔNG chứng minh bộ lọc có tác dụng; phải kiểm nó THU HẸP kết quả, không thì tưởng
+đang lọc mà thực ra đang quét mở toang, im lặng.
+
+## 0g. Phiên 19/08/2026 (sáng) — chọn nguồn bản dịch, và luật người nhận giữ nguyên
+
+**Ca thật 07:45.** User hỏi *"phân tích qua bản dịch từ servẻr của hapas"*, bot đáp
+*"Mình chưa thể phân tích trực tiếp từ bản dịch server của Hapas"*. Bot nói ĐÚNG:
+`qa.get_transcript` đóng cứng thứ tự nguồn (Lark trước, chỉ rơi xuống Hapas khi
+Lark không đọc được) và tool không có tham số nào chọn nguồn — bản Hapas chỉ ra
+ngoài dưới dạng file Word mà agent không đọc nổi. Thiếu ĐƯỜNG, không phải agent kém.
+
+**Đã làm (phần 1+2 của đánh giá; phần 3 chưa làm):**
+
+- `qa.get_transcript(..., source=)`: `""`/`"lark"` = như cũ (mặc định Lark, giữ
+  quyết định 10/08 của anh Thiện); `"hapas"` = trả đúng bản chuẩn và **không** lặng
+  lẽ rơi về Lark. Giá trị lạ thì fail-soft về mặc định. Chưa có file Hapas thì nói
+  tình trạng, tuyệt đối không tráo bản Lark vào.
+- Bản Hapas nay có dòng `- Bản: **bản dịch từ server của Hapas** (bản chuẩn)`, để
+  agent khỏi nói "faster-whisper/medium" ra chat.
+- MCP: `source` vào `inputSchema` (`enum: [lark, hapas]`) + mô tả dạy khi nào dùng.
+- Plugin `_POLICY`: mục **HỌ CHỈ ĐỊNH NGUỒN THÌ PHẢI ĐỌC ĐÚNG NGUỒN ĐÓ** và luật
+  **MỘT NGUỒN MỘT LƯỢT** (hai bản gộp ~64.000 ký tự — Hapas 33.980 / Lark 29.991
+  cho cuộc `Chat bot Nhân sự`, tức 7 + 5 phần). `POLICY_VERSION` -> `2026-08-19.1`,
+  plugin -> **1.13.0**, đã cài sang `%LOCALAPPDATA%\hermes\plugins` và restart gateway.
+
+Kiểm live qua đúng vé gate: mặc định ra bản Lark `Phần 1/5`; `source=hapas` ra
+`bản dịch từ server của Hapas` `Phần 1/7`. `selftest` **796 PASS / 0 FAIL** (+10).
+
+**Phần 3 chưa làm — người dùng gửi file lên cho bot bàn luận.** Plugin hiện KHÔNG
+có đường nhận file: không một chỗ nào xử lý `file_key`/`media_key`. Cần sửa phía
+Hermes (nhận message dạng file -> tải qua Lark API -> đưa vào ngữ cảnh phiên), kèm
+giới hạn định dạng/kích thước và rào chặn đường vòng ACL: bot chỉ được phân tích
+CHÍNH file đó, không được trộn với dữ liệu họp người ta không có quyền xem.
+
+**Luật người nhận: GIỮ NGUYÊN (user chốt).** `_recipients` = `meta.attendees` giao
+người đã enroll; quyền xem bản ghi trên Lark không được hỏi tới, chỉ loại người bấm
+Từ chối và phòng họp. Hệ quả đã được nêu rõ trước khi chốt: người còn tên trên lời
+mời mà bị cố ý không cho xem bản ghi vẫn nhận đủ biên bản — kể cả cuộc `Phỏng vấn`.
+
+## 0h. Phiên 19/08/2026 (trưa) — nút thẻ là đồ trang trí, và săn đường chưa từng chạy
+
+**User báo: "nút nhận bản Hapas mình ấn không được".** Đúng, và nó hỏng ở HAI chỗ
+độc lập — nút đó là đồ trang trí từ 13/08 tới 19/08:
+
+1. **Cú bấm chưa từng tới Hermes.** Tìm trong MỌI log của Hermes (`gateway.log`,
+   `agent.log`, `gateway-stdio.log` 14,7 MB, `errors.log`): **0 dòng** `card action`
+   / `Routing card` / `/card`. Adapter Feishu CÓ `register_p2_card_action_trigger`
+   và CÓ hàm dựng `/card button {json}` (đúng dòng 3038 như tài liệu ghi), nhưng
+   chưa được gọi lần nào → Lark không đẩy `card.action.trigger` về app. Nghi do
+   event chưa bật trong Lark Console; **không kiểm được từ máy**, cần mở Console.
+2. **Kể cả tới được thì vẫn bị bỏ.** Adapter gọi
+   `_resolve_source_chat_type(chat_info, event_chat_type="group")` — GHIM CỨNG cho
+   card action — mà hàm đó chỉ trả `"dm"` khi tham số ấy là `"p2p"`. Nên cú bấm
+   trong chat 1-1 bị dán nhãn `group`, và plugin bỏ đúng theo luật chỉ-trả-lời-DM.
+
+Tài liệu 13/08 ghi "Nút đi qua đúng gate, ACL và send_transcript_file" — câu đó
+CHƯA TỪNG được kiểm live. Nay **bỏ nút** (user chốt): thẻ vẫn hỏi, và nói rõ
+"trả lời **có**" — đường gõ chữ đã chạy thật (07:41 sáng nay). Lý do bỏ thay vì
+sửa: nút phụ thuộc hai thứ NGOÀI repo (event Console + nội bộ adapter Hermes),
+không test nào phủ được, và hỏng thì im lặng. `selftest` nay CHẶN việc dựng lại
+nút callback; thẻ enroll vẫn được có nút vì `open_url` không cần callback.
+
+### Săn các đường CHƯA TỪNG chạy thật (dữ liệu, không phỏng đoán)
+
+| Đường | Số lần chạy thật | Ghi chú |
+|---|---|---|
+| `search_meetings` / `get_transcript` | 82 / 82 | đường chính |
+| `get_meeting` / `list_meetings` / `latest_meeting` | 29 / 27 / 10 | |
+| `send_transcript_file` | 8 | |
+| `glossary_pending` / `glossary_approve` | 1 / 1 | mỏng |
+| **`create_task`** | **0** | tạo việc trên Lark Task — CHƯA TỪNG chạy |
+| **`glossary_reject`** | **0** | |
+| **nút callback trên thẻ** | **0** | đã bỏ |
+| "hứa tự gửi khi xong" (`transcript_requests`) | **1** (11/08) | bảng rỗng vì XOÁ sau khi gửi — không phải code chết |
+
+Bài học ghi lại: **bảng rỗng không chứng minh đường chết** — phải tìm dấu trong log
+(`CỰC CAO -> gửi transcript`) trước khi kết luận.
+
+### Cảnh báo mới cho `doctor`: lệch bản LIVE ngoài repo
+
+`_check_live_plugin` so sha256 `__init__.py` + `plugin.yaml` giữa repo và
+`%LOCALAPPDATA%\hermes\plugins2-enroll-gate`. Vì sao cần: hôm nay
+`install-plugin.bat` in `Access is denied` giữa lúc cài. Lần đó cả hai file vẫn
+sang được, nhưng nếu chỉ `plugin.yaml` sang mà `__init__.py` thì không, hệ thống
+báo "1.13.0" trong khi luật vẫn là luật cũ — và không ai biết. 3 test phủ: chưa
+cài → WARN; khớp → OK; **yaml mới + code cũ → WARN LỆCH**.
+
+`selftest` **801 PASS / 0 FAIL**. Heartbeat OK, doctor chỉ còn cảnh báo backup
+cùng ổ `D:`.
+
+## 0i. Phiên 19/08/2026 (09:00) — heartbeat WARN: hai báo động GIẢ, một chặn oan
+
+User báo "heartbeat có vấn đề". Đúng, nhưng không phải V2 hỏng — là **hệ đo** sai
+ở hai chỗ, và phía sau còn một cổng chặn oan. Cả ba đều đã vá.
+
+### 1. `gwerr15m=2` — cổng chặn đúng nhưng ghi ở mức ERROR
+
+08:50 có hai dòng `[v2-gate] CHẶN write tool không do user yêu cầu:
+send_transcript_file`. Cổng làm ĐÚNG việc của nó, nhưng `logger.error` khiến
+`tools/heartbeat.py` đếm vào `gwerr15m` → WARN ba nhịp liền. Nay là `logger.info`.
+Báo động phải có nghĩa, không thì người vận hành học cách bỏ qua nó.
+
+### 2. Cổng chặn oan: chỉ dò DANH TỪ, không dò ĐỘNG TỪ
+
+08:50:42 user nhắn `Gửi cho tôi chatbot nhân sự` — rõ ràng xin gửi — nhưng câu đó
+không chứa danh từ nào trong `_TRANSCRIPT_NOUNS`, nên bị chặn và bot bắt gõ lại
+đúng khuôn `Gửi file Word bản dịch cuộc họp ...`. Chính chú thích trong plugin gọi
+việc đó là "đẩy cái dở của backend ra thành việc của họ", và trái luật user chốt
+10/08 (cách nói vô hạn, cổng phải mặc định CHO QUA).
+
+Thêm `_ASK_TO_SEND = ("gui", "tai ve", "tai xuong", "download")`. **Chỉ động từ,
+KHÔNG lấy đại từ**: bản đầu có `cho minh`/`cho toi` và làm câu "cho mình cuộc 2"
+lọt cổng — phá luật CẢ HAI VẾ (phải có lời mời VÀ có câu đáp) ở đường 3/4, tức
+agent tự mời rồi tự coi là được đồng ý. Test cũ bắt được ngay. Plugin -> **1.14.0**.
+
+### 3. `scan_cu=1440.0m` — một cú đua MỘT GIÂY thành "scanner chết 24 giờ"
+
+07:19 heartbeat báo vòng quét cũ 24 giờ. Sự thật: cả đêm `scan` chỉ 0,2–4,3m, và
+40 phút sau lại 1,2m — **đúng một mẫu** sai. Gốc: `scan_age_min` regex
+`[HH:MM:SS] scan xong` trong log, **không có NGÀY**, rồi:
+
+```python
+if t > now: t -= timedelta(days=1)     # coi "sớm hơn now" là HÔM QUA
+```
+
+Scanner ghi thêm dòng `[07:19:01]` trong lúc heartbeat đã chụp `now = 07:19:00.9`
+→ "tương lai 1 giây" → trừ trọn một ngày → 1439,98 ≈ **1440,0m**.
+
+Vá hai lớp: (a) `alerts.note_scan_ok()` ghi mốc `scan_ok` epoch ms vào
+`alert_state`, gọi ở cuối `scan_once()`; (b) `heartbeat.scan_age_min` đọc MỐC
+trước, log chỉ còn là dự phòng, và đường log không còn biến lệch ≤300s thành một
+ngày. Heartbeat KHÔNG import `v2.*` (phải chạy được cả khi V2 hỏng) nên nó đọc
+thẳng bảng `alert_state`; tên khoá `scan_ok` là hợp đồng giữa hai bên.
+
+5 test mới cho riêng ca này, gồm "lệch 1 giây về tương lai → tuổi 0" VÀ "log hôm
+qua lệch 2 giờ → vẫn ~22 giờ" (đừng vá cái này mà làm mù cái kia).
+
+### Tin tốt từ audit sáng nay
+
+`create_task` **chạy lần đầu tiên** (08:55) — trước đó 0 lần. `source=hapas` đọc
+đủ 7/7 phần với nhãn `bản dịch từ server của Hapas`, và user còn so sánh được chất
+lượng hai bản dịch trong cùng một phiên.
+
+`selftest` **812 PASS / 0 FAIL**. Heartbeat OK, `gwerr15m=0`, mốc `scan_ok` chạy.
+
+## 0j. Phiên 25/08/2026 (10:20) — luật ĐỘ DÀI chặn oan câu "bạn làm được gì"
+
+User hỏi "sao đây" khi heartbeat 10:12 báo `WARN` vì `gwerr15m=1`. Cùng hình dạng
+với §0i: **hệ đo bật báo động vì cổng làm đúng việc**, và phía sau là một cú chặn
+oan thật.
+
+**Ca thật.** Nguyễn Nam Khánh - TN Facebook Ads enroll xong 09:56, hỏi hai lượt
+liền `Ngoài ra bạn làm được tất cả những gì` (09:57:16) rồi `ý là bạn làm được
+những công việc gì` (09:57:44). Đó là câu hỏi VỀ NĂNG LỰC BOT, không cần tra một
+dòng dữ liệu nào. Cả hai lượt đều bị `_claims_data` chặn và thay bằng
+`_NO_TOOL_REPLY` ("mình phải tra dữ liệu mới dám trả lời"). Người dùng mới toanh,
+phút thứ hai dùng bot.
+
+**Gốc:** luật thứ năm của `_claims_data` — `len(body) > 600` **VÀ** có chữ trong
+`_BUSINESS_HINTS`. Một đoạn bot tự giới thiệu năng lực thì đương nhiên vừa dài vừa
+nhắc "cuộc họp/biên bản/file" nên tự dính. Bốn luật kia đều là **dấu vết cụ thể**
+(ngày giờ, số + danh từ nghiệp vụ, link, nhãn máy) — thứ chỉ tool mới cấp được;
+riêng luật này đo ĐỘ DÀI, tức đoán mò, và mặc định CHẶN khi câu trả lời dài. Ngược
+đúng nguyên tắc user chốt 10/08 (đo câu trả lời, mặc định cho qua) — cùng họ với
+bản `_claims_data` đầu tiên đoán từ câu hỏi, và với §0i.2.
+
+**Đã làm (plugin -> 1.15.0, đã áp live 10:25):**
+
+- Bỏ hẳn luật độ dài; xoá `_NO_DATA_MAX_CHARS`. `_BUSINESS_HINTS` GIỮ LẠI vì cổng
+  write-tool còn dùng. Giá phải trả, ghi rõ thành lỗ (3) trong docstring: bài dài
+  kể chuyện cuộc họp mà không có số/ngày/link/nhãn máy thì nay LỌT — có test khoá
+  cả lỗ đó lẫn ca "thêm một con số vào chính bài đó thì chặn lại ngay".
+- Ba cú chặn còn lại của cổng hạ từ `logger.error` xuống **`logger.warning`**
+  (`CHẶN … trước latest_meeting`, `CHẶN … sai token cuộc mới nhất`, `CHẶN câu
+  khẳng định dữ liệu`). §0i.1 hạ cú chặn write-tool xuống `info`; chỗ này cố ý
+  dừng ở `warning` — ba ca này là dấu hiệu agent đang cư xử sai, cần soi được khi
+  nổ hàng loạt, chỉ không được tính là sự cố hệ thống. `heartbeat.real_errors`
+  chỉ đếm dòng có chữ `ERROR` nên cả hai mức đều hết báo động giả.
+- Test: `selftest` **816 PASS / 0 FAIL** (+4 test cho ca này, trong nhóm 34j),
+  gồm một test đọc mã nguồn plugin để chặn việc lặng lẽ đưa `logger.error` trở lại.
+
+**Kiểm live sau khi áp:** backup bản 1.14 ở
+`%LOCALAPPDATA%\hermes\backups\v2-enroll-gate-20260825-102432\`; hai file live có
+SHA-256 khớp repo; gateway dừng sạch rồi lên lại 10:25 (feishu websocket +
+api_server 8642 đều connected, 43 channel), đúng một logical gateway, MCP `v2 mcp`
+respawn. **V2 orchestrator KHÔNG bị đụng** (vẫn PID cũ từ 20/08). `doctor`:
+`plugin Hermes khớp repo — phiên bản 1.15.0`, cảnh báo duy nhất vẫn là backup cùng
+ổ `D:`. Không gửi tin thử nào ra Lark; hàm `_claims_data` của **bản live** được
+gọi trực tiếp để kiểm 1 ca cho-qua + 4 ca phải-chặn.
+
+## 0k. Phiên 26/08/2026 — recap RỖNG được coi là xong, và đường tự vá mù với `held`
+
+**Ca thật.** Codex trả `HTTP 400 — model 'gpt-5.6-sol' not supported when using
+Codex with a ChatGPT account` rải rác 16:44–17:36. Ba cuộc rơi vào cửa sổ đó có
+thẻ "họp xong" đi ra với **phần tóm tắt trống**: `08-26 | HỌP ĐỊNH KỲ DỰ ÁN 20.10
+HAPAS` (7 người), `CĐS: Training` (3), `Overview IDI tết` (2) — 12 người nhận thẻ
+rỗng.
+
+**Hai lỗ, cùng một sự cố:**
+
+1. Vài lượt Codex trả *thành công* với nội dung rỗng. `_parse` dựng
+   `Recap(summary="")`, pipeline coi là xong -> job `held`, ghi Base, thẻ đi ra,
+   `recap_fails` = 0 suốt. Lớp bảo vệ 31/07 chỉ bắt `RecapUnavailable`, tức chỉ
+   bắt lỗi MẠNG — nó bỏ lọt đúng cái nguy hiểm hơn: một câu trả lời hợp lệ mà
+   rỗng. Nay `summarize._reject_empty` quy cả hai về cùng một loại lỗi.
+   `recap_from_text` vẫn KHÔNG BAO GIỜ ném (thẻ phải gửi được), nhưng ra CÂU GIỮ
+   CHỖ NÓI RÕ LÝ DO thay vì ô trống — để nó mang dấu vết của một lần hỏng.
+2. **Tệ hơn:** `_backfill_recaps` viết 02/08, chỉ quét `by_status("delivered")`.
+   Mô hình KÉO (03/08) đổi trạng thái cuối thành `held` mà không ai sửa chỗ lọc.
+   Nó không gãy — nó **im lặng ngừng chạy** gần hai tháng. Đo 27/08: **7 cuộc có
+   transcript mà tóm tắt rỗng, TẤT CẢ đều `held`**, cũ nhất từ 16/07. Nay quét cả
+   hai, và trả về ĐÚNG trạng thái cũ kèm đúng cột thời gian (trả nhầm `held`
+   thành `delivered` là nói dối rằng đã phát; ngược lại là phát lần hai).
+
+**Đã làm:** ba cuộc hỏng được dựng lại tóm tắt từ nguyên văn rồi gửi bù cho đúng
+12 người đã nhận thẻ rỗng (khóa `fixup1-…`, vì khóa cũ `notice-…` bị Lark nuốt).
+Sau khi vá, đường tự vá nhặt nốt 7 cuộc tồn từ tháng 7 — **0/447 job còn tóm tắt
+rỗng**, không ai nhận thêm tin.
+
+Cùng phiên: đăng tóm tắt `CĐS: Training` vào nhóm `Digital Transformation Chat`
+theo yêu cầu (10 người, 7 người ngoài cuộc họp). Thẻ bỏ lời mời "trả lời CÓ" vì
+bot không đọc tin nhóm — lúc đó chưa có đường đó.
+
+## 0l. Phiên 27/08/2026 — cuộc họp LẶP mất người dự, và bẫy cấu hình Hermes
+
+### 1. Sự kiện lặp: 19% biên bản chỉ tới tay chủ bản ghi
+
+User hỏi vì sao không nhận biên bản `Team Weekly CĐS` (cuộc họ không dự). Lịch CÓ
+mời nhóm `DIGITAL TRANSFORMATION`, mà job chỉ ghi 1 người.
+
+`calendar_events` (instance view) trả `event_id` của MỘT BUỔI, dạng
+`<id gốc>_<mốc thời gian>`. Đo thật:
+
+```
+…7807_1787814000  (id buổi)      -> event_attendees 193001 event not found
+…7807_0           (recurring id) -> OK, 3 khách mời (có cả nhóm chat)
+…7807             (id trần)      -> 190014 invalid parameters
+```
+
+Mọi cuộc LẶP đều không tra được khách mời rồi rơi về `fallback:owner` — **CHỈ CHỦ
+BẢN GHI nhận biên bản, im lặng**. Đo trên 489 job: **94 cuộc (19%)**, riêng từ
+14/08 là 36, toàn cuộc lặp hàng ngày. Nay thử id BUỔI trước rồi mới rơi về id
+CHUỖI (khách mời có thể sửa riêng cho một buổi).
+
+Hai lệnh mới, cả hai **không gửi tin cho ai**:
+- `v2 backfill-chats` — nạp bù `invited_chats`: **68 cuộc**, 25 nhóm.
+- `v2 reresolve` — tra lại người dự: 26/71 cuộc, +122 lượt người,
+  `fallback:owner` 94 -> 76. 45 cuộc còn lại không có nguồn để tra (cuộc VC tự
+  mở, hoặc sự kiện đã xoá).
+
+Trần giãn nhóm 60 -> **80** (`V2_MAX_CHAT_INVITE_MEMBERS`): cuộc
+`08-27 | Workforce AI Weekly Meeting` mời nhóm 71 người, vượt trần cũ. 80 chứ
+không phải 100 để vẫn chặn `CĐS_Data Mindset` (106 người).
+
+### 2. Bẫy mất nửa ngày: `group_rules` đặt sai chỗ trong config Hermes
+
+Đặt `group_rules` dưới khối `feishu:` cấp cao nhất thì **adapter không bao giờ
+đọc** — `gateway/config.py` chỉ merge `extra` từ khoá `platforms:`. Hậu quả: mọi
+nhóm rơi về `FEISHU_GROUP_POLICY=disabled`, tin bị bỏ với lý do
+`group_policy_rejected`, mà cú bỏ đó **chỉ log ở mức DEBUG** (adapter.py:2594)
+nên `gateway.log` trắng trơn.
+
+Tôi đã kết luận SAI hai lần ("Lark không đẩy tin nhóm về máy") trước khi chịu
+chạy `hermes gateway run -vv` để nhìn thấy dòng DEBUG đó. Trước đó còn suýt đẩy
+user đi mở ticket với Lark. **Log trắng không phải bằng chứng.**
+
+Đúng chỗ là `platforms.feishu.extra.group_rules`. Cũng cần biết:
+`hermes config set` đặt đúng giá trị nhưng **nuốt sạch chú thích** trong
+`config.yaml` (47 dòng, 23.463 -> 20.803 byte) — sao lưu trước khi dùng.
+
+## 0m. Phiên 28/08/2026 — hỏi đáp TRONG NHÓM, và băng không có tiếng nói
+
+### 1. Hỏi đáp trong nhóm chat — bốn lớp, đã bật cho một nhóm
+
+Từ 02/08 bot chỉ trả lời chat 1-1, lý do ghi ở `gate._refuse_group`: `qa._may_see`
+cấp quyền cho người HỎI, còn câu trả lời thì cả phòng ĐỌC. Thiết kế mở lại không
+phá luật đó mà **đổi ĐƠN VỊ quyền**: trong nhóm X chỉ trả lời về cuộc mà chính
+nhóm X được mời (`meta.invited_chats`, bằng chứng do Lark cấp).
+
+- `config.GROUP_QA_CHATS` (`V2_GROUP_QA_CHATS` trong `v2/.env`, **ngoài git**) —
+  danh sách trắng, mặc định RỖNG = tắt hoàn toàn. Vì sao phải là danh sách trắng:
+  MỘT nhóm (`PHÁT TRIỂN SẢN PHẨM TÚI XÁCH LAM SON RETAIL`) kéo theo **41 cuộc**,
+  trong đó có `HỌP ĐỊNH KÌ THỨ 2 - ALL CÔNG TY`.
+- Khớp `chat_id` CHÍNH XÁC, không đoán theo tên: workspace này có HAI nhóm cùng
+  tên `DIGITAL TRANSFORMATION`, khác thành viên, bot chỉ ở một.
+- Phạm vi buộc vào **VÉ PHIÊN** (`qa_sessions.room_chat_id`), không phải tham số:
+  agent không cầm cái nó không được trao. Vé phòng và vé chat 1-1 KHÔNG dùng
+  chung, kể cả cùng một người.
+- Trong phòng, luật phòng **THAY THẾ** luật cá nhân. Người CÓ dự cuộc B mà nhóm
+  không được mời B thì hỏi trong phòng vẫn không xem được B. `see_all` cũng không
+  mở cửa phòng.
+- Plugin 1.16.0 THÔI tự bỏ tin nhóm — luật nằm một chỗ ở V2; plugin gửi kèm
+  `chat_id`, thiếu thì V2 fail-closed.
+
+**Phương án B (user chốt):** người CHƯA enroll vẫn hỏi được trong nhóm trắng —
+quyền đến từ việc ở trong phòng, và trả lời được vì dữ liệu đã có sẵn trong DB
+(lấy bằng token của CHỦ BẢN GHI lúc phiên âm). Hai đường ghi vẫn đóng:
+`tasks` tự chặn (cần token của chính họ), còn `sendfile` **không tự chặn** (bot
+upload bằng danh tính app) nên có chốt riêng — chưa enroll thì từ chối file, kèm
+lời mời cấp quyền. **Chat 1-1 KHÔNG mở**: ở đó không có phòng nào định nghĩa phạm
+vi.
+
+⚠️ Commit `c724d47` viết "Người trong nhóm KHÔNG cần enroll để hỏi" — lúc đó
+**SAI** (cổng chạy lớp enroll trước lớp phòng, đo live ra `decision=invite`).
+Commit `a28eb7d` mới làm câu đó thành đúng. Đừng đọc commit cũ rồi tưởng nó luôn đúng.
+
+Hiện bật cho đúng `Digital Transformation Chat` (mở được 1 cuộc: `CĐS: Training`).
+`Technical & AI Automation` có bot nhưng **0 cuộc** nào mời nhóm đó.
+
+### 2. Băng không có tiếng nói bị báo nhầm là "hỏng"
+
+Hai job `failed` chặn `doctor`. Đo bằng ffmpeg: peak −7.1 / mean −48.3, và peak
+−44.2 / mean −81.9. Cả hai KHÔNG có tiếng nói (whisper xử lý 25 phút audio hết 24
+giây — VAD lọc sạch). Lưới cũ chỉ đo PEAK nên cái đầu bị coi là "rất to".
+
+- `_volume_db` nay trả cả (peak, mean) — ffmpeg in cả hai dòng trong cùng một lời
+  gọi, trước đây code chỉ đọc `max_volume`. Mean ≤ −45 dB KÈM whisper 0 chữ =
+  `silent_recording` (discarded). **Chỉ dùng để PHÂN LOẠI**, không dùng để bỏ qua
+  whisper: cuộc 25 phút mà chỉ nói 2 phút cũng có mean thấp.
+- Chặn **PROMPT VỌNG**: whisper chép thẳng `initial_prompt` ra khi không nghe
+  được gì (12 "từ" thu được chính là câu prompt). Prompt dài hơn thì một băng câm
+  có thể sinh transcript ĐỦ DÀI để pipeline coi là thành công rồi gửi cho người
+  dự một biên bản dựng từ chính câu prompt của mình.
+
+### 3. Việc còn mở
+
+- **Mời bot vào nhóm** (chạy khô đã liệt kê 24 nhóm được mời họp mà bot chưa
+  vào): `PHÁT TRIỂN SẢN PHẨM TÚI XÁCH LAM SON RETAIL` 43 cuộc,
+  `CĐS_AI & Automation_Workforce AI Team` 7, `Sharing ai thích học cái mới` 4,
+  `DIGITAL TRANSFORMATION` 3. Không mời bot thì người trong nhóm vẫn mất biên bản.
+- **Phạm Hoàng Phúc - Tiktok Ads**: refresh token đã bị thu hồi (`20064`) nhưng
+  DB vẫn ghi `active` — đang âm thầm không nhận gì. `v2 scopes` cũng chết giữa
+  chừng vì người này, bỏ dở phần danh sách còn lại.
+- **Backup vẫn cùng ổ VẬT LÝ với `state.db`** — và `C:` với `D:` là cùng một SSD
+  (Lexar 1TB chia hai phân vùng), nên chuyển sang `C:` là vô nghĩa. Nặng hơn:
+  khoá Fernet (`C:\Users\PC\.meetingxlark\`), `v2/.env`, `config.yaml` và `.env`
+  của Hermes cũng nằm cùng ổ và KHÔNG có trong git — mất ổ là mất hết. Phương án
+  đề xuất (chưa chốt): `V2_BACKUP_DIR` -> OneDrive, khoá Fernet để chỗ khác, sao
+  lưu cả bốn thứ ngoài git, và `doctor` so **ổ vật lý** thay vì ký tự ổ.
+- **Nghiệm thu hỏi đáp trong nhóm bằng người thật** — chưa làm.
 
 ## 0. Tóm tắt để tiếp quản trong một phút
 
@@ -32,11 +652,14 @@ Sau bản vá:
 - Sau OAuth, job cũ chỉ được nâng quyền khi xác minh được chuỗi
   **event → VC recording → đúng minute token**, và chính user vừa OAuth có trong
   attendee VC.
-- 6 job `waiting_auth` vẫn được giữ. Hệ thống không chủ động gửi link OAuth; chỉ khi
-  người đó nhắn bot thì gate mới gửi link như luồng mặc định.
+- Hệ thống không chủ động gửi link OAuth; chỉ khi người đó nhắn bot thì gate mới
+  gửi link như luồng mặc định. (28/08: con số `waiting_auth` là **30**, không
+  phải 6 như dòng viết ngày 05/08.)
 - Transcript không tự bị đổ vào chat. Job đã dịch có thể ở `held`, chờ người dự hỏi;
   yêu cầu file đi qua tool có ACL.
-- Self-test hiện tại: **648 PASS, 0 FAIL** (06/08/2026). Cloudflare Worker: **6/6 PASS**.
+- Self-test hiện tại: **873 PASS, 0 FAIL** (28/08/2026). Cloudflare Worker: **6/6 PASS**.
+  Plugin Hermes live: **1.16.0**. (Con số PASS trong các mục `0a`–`0m` là ghi chép
+  của từng phiên, đừng lấy làm mốc hiện tại.)
 - Phiên 06/08/2026 làm thêm bốn việc — xem §11b: hồ sơ bot (`Thư Ký`), ký ức hội
   thoại bền qua reset phiên, văn phong bớt cứng, và heartbeat nhiều chỉ số. Đã áp
   lên hệ đang chạy lúc 13:52.
@@ -362,12 +985,13 @@ git diff --check
 
 Kỳ vọng hiện tại:
 
-- self-test: `PASS 648 FAIL 0` (06/08/2026; con số 483 trong bản trước đã cũ);
+- self-test: `PASS 747 FAIL 0` (13/08/2026);
 - Worker tests: 6/6;
 - `git diff --check`: không có lỗi whitespace; cảnh báo CRLF của Windows không phải
   lỗi nội dung;
 - Doctor: chạy được, chỉ warning backup cùng ổ;
-- `waiting_auth` vẫn bằng 6 nếu chưa có user liên quan tự OAuth.
+- queue live sau triển khai: `waiting_auth=42`; đây là backlog quyền hiện hữu, không
+  được tự mở bằng Base, `minute_viewers` hoặc ghép lịch gần giờ.
 
 ### 9.2 Test hội thoại an toàn
 
@@ -483,6 +1107,10 @@ hai vẫn nguyên. `at_hour: 4` giữ nguyên.
 - Câu xác nhận sau `list_meetings` không còn là một chuỗi cố định duy nhất:
   câu của agent được giữ nếu qua `_safe_confirm` (không chữ số, một dòng,
   <=180 ký tự) — agent không cầm danh sách nên chữ số ở lượt đó luôn là bịa.
+  **BỎ HẲN 10/08/2026** (plugin 1.3.1): không còn câu xác nhận nào, vì cũng
+  không còn tin nhắn nào do V2 tự gửi để mà xác nhận. `list_meetings` trả danh
+  sách qua khối GỬI NGUYÊN VĂN và `transform_llm_output` lấy đúng khối đó làm
+  câu trả lời — một câu hỏi, một tin nhắn. Xem §11e.
 - Câu hỏi về chính bot không còn bị ép gọi tool (`_SELF_PHRASES`).
 
 ### 11b.5 Lỗi tiềm ẩn tìm ra khi làm: `_plain()` xoá mất chữ `đ`
@@ -854,6 +1482,291 @@ additive, chạy ở mọi `db.init()`).
    `platform_hints.feishu.append`. Sao lưu trước. Bỏ qua cũng được: `_POLICY`
    của plugin chạy MỖI LƯỢT và đã mang đủ luật.
 
+## 11e. Phiên 10/08/2026 — một câu hỏi, một tin nhắn
+
+Người dùng gửi hai ảnh chụp chat của anh Thiện kèm nhận xét: **"nhận feedback
+rất tệ, trả lời 1 tin thôi đừng trả lời song song"**.
+
+### 11e.1 Vì sao bot trả lời hai tin
+
+Đúng thiết kế 04/08: `sendlist.send_list` gửi THẲNG một thẻ danh sách vào khung
+chat rồi trả cho agent một lời dặn "hãy nói một câu ngắn". Agent nói câu đó, và
+Hermes gửi nó như một tin nữa. Người dùng nhận: thẻ danh sách + "Danh sách các
+cuộc họp tuần trước của bạn ở trên nhé." Đo trong `gateway.log` 15:10:37 — phần
+Hermes gửi chỉ 53 ký tự, phần dài là thẻ do V2 tự gửi ngoài luồng.
+
+Lý do phải tự gửi khi đó vẫn đúng ở thời điểm đó: LLM viết lại con số ("Bạn có 8
+cuộc họp" → "hệ thống tìm thấy 22 cuộc họp"). Nhưng **09/08 đã dựng lớp chặn ở
+đúng chỗ**: `transform_llm_output` lấy khối GỬI NGUYÊN VĂN của tool làm câu trả
+lời cuối và vứt bản LLM viết. Từ lúc đó, đường tự gửi chỉ còn để lại cái giá của
+nó — tin nhắn thứ hai — mà không mua thêm gì.
+
+Không có cách nào bỏ tin thứ hai bằng cách chặn câu của agent: Hermes không có
+hook nào huỷ được tin nhắn đi ra (`transform_llm_output` trả chuỗi rỗng = giữ
+nguyên bản cũ, xem `agent/turn_finalizer.py`). Nên vế phải bỏ là vế tự gửi.
+
+### 11e.2 Đã sửa
+
+- Gỡ `v2/sendlist.py`. `mcp_server._tool_list_meetings` gọi lại
+  `qa.list_meetings` → khối GỬI NGUYÊN VĂN → plugin lấy đúng chuỗi đó làm tin
+  nhắn. Không tool nào còn tự gửi trong một lượt hỏi đáp.
+- Gỡ theo: `qa.agent_only`, bảng `outbound_dedup` + `db.try_reserve_outbound` /
+  `release_outbound` (chống gửi lặp cho đường tự gửi), và nhánh `_DIRECT_CONFIRM`
+  / `_safe_confirm` bên plugin. Plugin lên **1.3.1**.
+- Định dạng không mất: danh sách in đậm bằng markdown, và câu trả lời của agent
+  đi kiểu `post` nên Hermes render markdown (thẻ `lark_md` trước đây chỉ cần vì
+  tin `text` của Lark không render). Trần 8.000 ký tự/tin của adapter Feishu vẫn
+  rộng hơn danh sách 50 cuộc.
+- `"alo em"` (tin thật 15:09) bị xử như câu hỏi dữ liệu rồi trả về câu chặn
+  "chưa tra được dữ liệu": `_SMALLTALK` so khớp NGUYÊN CÂU nên bắt "alo" mà
+  trượt "alo em". Chuyển "alo " sang nhánh tiền tố xã giao cạnh "chao ", vẫn giữ
+  chốt cũ — có động từ nghiệp vụ thì vẫn phải gọi tool.
+
+### 11e.2b Hệ quả phải biết: gọi `list_meetings` là DỘI LẠI CẢ BẢNG
+
+Đo end-to-end bằng dữ liệu thật 10/08: người dùng hỏi *"còn cuộc họp nào nữa
+không"*, agent định trả lời "Hết rồi bạn nhé, chỉ có 9 cuộc thôi" — nhưng vì nó
+gọi `list_meetings`, `transform_llm_output` thay câu đó bằng nguyên bảng 1.286
+ký tự. Đây là mặt trái CỦA CHÍNH cơ chế ghi đè: khi tool đã dựng tin thành phẩm
+thì agent không còn quyền nói gì khác trong lượt đó.
+
+Không sửa bằng cách nới ghi đè (danh sách là đúng thứ không được viết lại), mà
+bằng cách chọn tool: mô tả tool nay nói rõ `list_meetings` CHỈ dùng khi người ta
+muốn XEM danh sách; câu hỏi VỀ danh sách ("còn cuộc nào nữa không", "cuộc nào
+gần nhất", "tuần trước họp mấy buổi") thì đi `search_meetings` — kênh DỮ LIỆU,
+agent đọc rồi trả lời bằng lời của nó, và `transform` không đụng vào.
+
+### 11e.2c Trần hiển thị — để một câu hỏi luôn là một tin nhắn
+
+Adapter Feishu cắt tin ở 8.000 ký tự rồi gửi làm NHIỀU tin. Danh sách tốn ~143
+ký tự/cuộc (đo thật, 9 cuộc = 1.286), nên `limit=50` mặc định ≈ 7.100 ký tự —
+lọt, nhưng chỉ dư ~12%: một người có tên cuộc họp dài hơn trung bình là vượt, và
+lúc đó "một câu hỏi một tin nhắn" tự vỡ. Cộng thêm chuyện đọc được: 50 cuộc
+trong một bong bóng chat thì không ai đọc.
+
+`qa._fit_list` (10/08/2026): trần **12 dòng** và **3.500 ký tự**, cắt từ đuôi
+(cuộc cũ nhất) vì hai danh sách vào đây đã sắp mới-nhất-trước. Khối CHƯA CÓ BIÊN
+BẢN được giữ chỗ tối thiểu 4 — đó là những cuộc hệ thống còn nợ người dùng, bỏ
+chúng để nhường chỗ cho cuộc cũ đã xong là ngược thứ tự quan tâm.
+
+Hai thứ KHÔNG được đổi khi cắt: **tổng số đầu câu vẫn là tổng thật** (hỏi "tôi
+có bao nhiêu cuộc họp" thì con số phải đúng, số dòng hiện ra là chuyện hiển
+thị), và **cắt thì phải nói** — `_FOOT_MORE` báo còn N cuộc kèm cách xem tiếp.
+Đây không phải câu "Còn N cuộc họp khác" user đã bỏ ngày 04/08: câu đó đếm cuộc
+họp của NGƯỜI KHÁC bị ACL ẩn — một con số người đọc không làm gì được; câu này
+đếm cuộc của CHÍNH HỌ và nói luôn cách lấy tiếp.
+
+Kèm theo, giảm ma sát gõ phím: chân trang nay là "gửi nguyên văn **&lt;số hoặc
+tên&gt;**" — gõ `gửi nguyên văn 2` thay vì gõ lại "08-06 | Workforce AI Weekly
+Meeting". Cổng write-tool nhận vì câu đó vẫn có "nguyên văn"; `_POLICY` thêm một
+luật: số thứ tự chỉ danh sách VỪA gửi trong phiên, không còn trong ngữ cảnh thì
+phải hỏi lại tên chứ không được đoán.
+
+### 11e.3 Cổng "không bịa" đổi chỗ đo: từ CÂU HỎI sang CÂU TRẢ LỜI
+
+User nói tiếp: *"người ta hỏi thì thiên biến vạn hoá sao mà cứng nhắc... giờ alo
+mày hoặc hỏi gì khác thì lại trả lời cứng nhắc thế hả?"* — đúng gốc.
+
+`_requires_tool` đoán từ TIN NHẮN VÀO xem câu này có buộc phải gọi tool không,
+**mặc định là CÓ**, rồi trừ ra bằng ba danh sách chuỗi: `_SMALLTALK` (so khớp
+nguyên câu), `_SELF_PHRASES` (chủ ngữ × đuôi câu), `_HELP_PHRASES`. Tập câu chào
+và câu tán gẫu là vô hạn, danh sách thì hữu hạn — nên mọi cách nói chưa ai nghĩ
+ra đều rơi vào nhánh "phải gọi tool", và vì không tool nào trả lời được một
+tiếng "alo" nên người dùng nhận câu chặn. Đã vá ba lần bằng cách thêm chuỗi
+("alo" 05/08, `_SELF_PHRASES` 06/08, "alo em" 10/08) — cả ba đều là vá triệu
+chứng, và lần nào cũng có tin nhắn thật rơi vào đúng cái bẫy đó.
+
+Điều thật sự phải chặn không phải "câu hỏi loại nào" mà là **"câu trả lời có
+khẳng định gì về dữ liệu cuộc họp mà lượt đó không hề tra không"**. Vế "không hề
+tra" là sự thật do `post_tool_call` ghi; vế "khẳng định" để lại dấu vết trong
+chính câu văn. Nên cổng chuyển sang đo hai thứ đó, và **mặc định đảo lại thành
+CHO QUA**:
+
+```
+if not tool_called and _claims_data(response):  -> thay bằng _NO_TOOL_REPLY
+```
+
+`_claims_data` bắt: ngày giờ (`06/08`, `18:11`, `2026`); số lượng gắn danh từ
+nghiệp vụ (`8 cuộc họp`, `3 biên bản`); link hoặc `minute_token`; nhãn máy
+(`CHƯA CÓ BIÊN BẢN`, `held`…); và bài dài >600 ký tự có nhắc phạm vi nghiệp vụ.
+
+Bản đầu tiên chặn **mọi chữ số và mọi danh sách** — thử lại thì chính câu bot tự
+giới thiệu ("mình làm được 3 việc: 1. … 2. …") bị chặn, tức lại đúng cái cứng
+nhắc đang sửa. Đã siết lại thành mẫu cụ thể, và selftest khoá luôn ca đó.
+
+Hai lỗ **biết và chấp nhận**: (1) câu bịa không số không ngày ("tuần trước bạn có
+vài cuộc họp"); (2) danh sách ngắn chỉ có tên cuộc họp, không kèm ngày/link. Bịt
+(2) phải chặn mọi danh sách — chặn nhầm nhiều hơn bắt đúng. Đổi lại không đổi:
+`qa._may_see` vẫn là cửa duy nhất của dữ liệu thật, tool vẫn phải có vé phiên.
+
+Kèm theo: `POLICY_VERSION` → `2026-08-10.1`, và `_POLICY` viết lại theo cùng
+nguyên tắc ("ranh giới nằm ở CÂU TRẢ LỜI, không ở loại câu hỏi"). `_NO_TOOL_REPLY`
+rút từ bốn dòng xuống một câu — cổng mới hiếm khi chạm tới, nhưng chạm thì cũng
+không nên là một bài giảng.
+
+Đã gỡ hẳn: `_requires_tool`, `_SMALLTALK`, `_SELF_SUBJECTS/_SELF_TAILS/`
+`_SELF_PHRASES`, `_HELP_PHRASES`, `_ACTION_HINTS`. `_BUSINESS_HINTS` và
+`_TRANSCRIPT_NOUNS` giữ lại vì cổng write-tool và `_is_yes` vẫn dùng.
+
+### 11e.4 Tên gọi: đặt theo NGUỒN, không theo tính chất
+
+User chốt 10/08/2026: phải phân biệt được **"bản dịch từ Lark"** và **"bản dịch
+từ server của Hapas"** (chất lượng hơn). Tên cũ "BẢN NGUYÊN VĂN" nói đúng TÍNH
+CHẤT (đúng từng chữ) nhưng không nói gì về NGUỒN — mà cả hai bản đều là chép
+từng chữ, nên người dùng nhìn "bản nguyên văn" cạnh "bản chép sẵn của Lark"
+không suy ra được cái nào tốt hơn. Đúng thứ họ cần để chọn thì lại không có
+trong tên.
+
+Đổi ở MỌI chỗ người dùng đọc: chân trang danh sách, `fmt_record`, dòng nguồn của
+`get_transcript`, câu mời trong thẻ biên bản, câu báo sau khi gửi file, hồ sơ
+bot, và các câu từ chối/lỗi. Hai hằng số `qa.BAN_LARK` / `qa.BAN_HAPAS` để không
+lệch chữ giữa các chỗ. Prompt (`_POLICY` + `platform_hints`) có khối riêng dạy
+agent gọi đúng tên và không nói lẫn hai bản.
+
+Chân trang nay mời gõ `gửi bản dịch <số hoặc tên>`, nên `_TRANSCRIPT_NOUNS` bên
+plugin thêm `"ban dich"`/`"hapas"` — đổi tên hiển thị mà quên mở cổng cho chính
+câu lệnh mình vừa mời là bot bảo gõ A rồi chặn A. **Lệnh cũ `gửi nguyên văn` giữ
+nguyên hiệu lực**, và selftest khoá cả hai chiều.
+
+### 11e.4b Lời mời, không phải cú pháp lệnh — và cổng phải nhận câu đáp
+
+Chân trang bản đầu dạy người ta gõ `gửi bản dịch <số hoặc tên>` kèm ví dụ — đọc
+như hướng dẫn dùng máy. User chốt đổi thành lời mời: *"Bạn cần **bản dịch chuẩn**
+của cuộc nào thì cứ nói với mình nhé."*
+
+Nhưng đổi lời mời mà không đổi cổng thì **bot mời rồi bot chặn chính câu trả lời
+cho lời mời của mình**: đo thật, `cần` / `cho mình cuộc 2` / `ừ có` đều không gọi
+tên bản ghi nên `_on_pre_tool_call` chặn `send_transcript_file`. User: *"sao lại
+bị chặn, thêm vào backend cũng được mà"* — đúng, bắt người dùng gõ đúng khuôn để
+lọt cổng là đẩy cái dở của backend ra thành việc của họ.
+
+Chữa bằng đúng cơ chế đã có sẵn cho lời mời một-cuộc-họp (07/08):
+`qa.list_meetings` nay kèm `OFFER_MARK` ở kênh NỘI BỘ, nên plugin ghi nhận "bot
+vừa mời" (`_offered_recently`), và cổng nhận thêm **đường vào thứ 4** —
+`_picks_item`: câu NGẮN (≤8 từ) có SỐ, tức người ta đang chỉ vào một dòng vừa
+đọc. Vẫn cần CẢ HAI vế (có lời mời VÀ có câu đáp) nên agent không tự mời rồi tự
+duyệt. Kèm lời dặn ở kênh nội bộ: câu đáp không chỉ rõ cuộc nào thì HỎI LẠI,
+tuyệt đối không đoán — mở cổng là để nhận câu trả lời của người ta, không phải
+để agent đoán bừa rồi gửi nhầm file.
+
+Đo lại trên dữ liệu thật, ba nhóm đều đúng: sau danh sách thì `cần`, `cho mình
+cuộc 2`, `ừ có`, `cái 2`, `2`, `số 3 nhé` đều QUA; `cuộc họp hôm qua bàn gì`,
+`tóm tắt cuộc họp Workforce`, câu dài có số đều CHẶN; và khi CHƯA có danh sách
+nào thì cả `cần` lẫn `cho mình cuộc 2` đều CHẶN.
+
+### 11e.5 Trạng thái
+
+Self-test **713 PASS / 0 FAIL** (trước 693). Hai nhóm phép kiểm bị THAY chứ
+không phải bỏ: 9 phép kiểm của `sendlist` → nhóm `34c` đo hợp đồng "một
+tin nhắn"; ~20 phép kiểm liệt kê câu hỏi của `_requires_tool` → nhóm `34j` đo
+`_claims_data` trên CÂU TRẢ LỜI, cộng ba phép end-to-end qua đúng hook.
+
+Đã áp lên hệ đang chạy 10/08 (lần cuối 20:19, plugin 1.5.0): chép plugin, deep-merge
+`platform_hints.feishu.append` vào `config.yaml` (backup
+`config.yaml.bak-20260810-154239`), `hermes gateway restart` — MCP server chạy
+trong tiến trình Hermes nên `qa`/`mcp_server` mới có hiệu lực từ bước này.
+Orchestrator KHÔNG cần khởi động lại: bản vá không chạm đường phát biên bản.
+
+## 11f. Phiên 10/08/2026 (tối) — phân loại theo NGUỒN BẢN DỊCH
+
+Anh Thiện đọc danh sách thật rồi chốt bốn điều, và cả bốn đều nói về **cách phân
+loại**, không phải câu chữ:
+
+1. *"đã có biên bản => dễ bị hiểu nhầm nhé"* — kèm *"ví dụ 11 biên bản kia server
+   xử lý rồi"*: người đọc hiểu nhãn đó là "server đã xử lý xong 11 cuộc".
+2. *"phân biệt: bản dịch từ Lark / bản dịch từ server của Hapas (chất lượng hơn)
+   … bám cái này mà build luồng hệ thống"*.
+3. *"hiển thị ghi chú ở dưới cùng là user đó đã có bao nhiêu biên bản được dịch
+   từ server của hapas"*.
+4. *"e phải phân được luồng xử lý trong từng trường hợp … logic tư duy mọi trường
+   hợp xảy ra => phương án trả lời và xử lý như thế nào"*.
+
+### 11f.1 Vì sao nhãn cũ sai từ gốc
+
+`ĐÃ CÓ BIÊN BẢN / CHƯA CÓ BIÊN BẢN` chia theo **"đã có record trên Base hay
+chưa"** — một sự thật SỔ SÁCH NỘI BỘ. Nó lệch với thứ người dùng cần biết ở cả
+hai chiều: một cuộc có thể đã có bản dịch đầy đủ mà chưa lên Base (`held`), và
+ngược lại Base có record cho cả job đang chờ. Tệ hơn, "biên bản" trong hệ thống
+này nghĩa là BẢN TÓM TẮT, nên dùng nó để nói "server xong chưa" là trộn hai
+chuyện khác nhau vào một chữ.
+
+### 11f.2 Trục mới, đọc từ DB chứ không đoán
+
+`qa.source_of(job)` — MỘT hàm, và mọi chỗ khác bám vào nó:
+
+| nguồn | điều kiện đọc từ `jobs` | nghĩa với người dùng |
+|---|---|---|
+| `SRC_HAPAS` | `transcript_path` có file | chép đúng từng câu, lấy được file Word |
+| `SRC_LARK` | `lark_chars > 0`, hoặc có link + status ∈ `_CAN_READ_LARK` | đọc/tóm tắt được ngay, tên riêng dễ sai |
+| `SRC_NONE` | còn lại | kèm LÝ DO thật (chờ cấp quyền / đang dịch / hỏng) |
+
+Hai cái bẫy đã bịt, và cả hai đều là "hứa thứ mình không lấy được":
+* `lark_tried_at` mà `lark_chars = 0` → **không** tính là có bản Lark (đã thử và
+  không được — quyền đọc bản chép thuộc CHỦ bản ghi);
+* `waiting_auth` **không** nằm trong `_CAN_READ_LARK` dù cuộc nào cũng có link
+  Minutes: `coverage.py` đo được 0/27 cuộc `waiting_auth` đọc được bản của Lark.
+
+### 11f.3 Ba con số trong tin nhắn đều phải là số THẬT
+
+Đây là chỗ sinh ra hiểu nhầm "11 biên bản": số trong ngoặc từng là **số dòng
+đang hiện**, không phải tổng nhóm. Nay:
+* tổng đầu câu = tổng cuộc họp họ thấy được;
+* số trong ngoặc mỗi nhóm = tổng của NHÓM đó;
+* chân trang = `k/n` cuộc đã có bản dịch từ server Hapas (yêu cầu 3);
+* cắt bớt cho vừa một tin thì nói rõ còn bao nhiêu, KHÔNG hạ ba con số trên.
+`_fit_list` thêm sàn `_MIN_PER_GROUP = 2`: nhóm đông không được đè cho nhóm
+"chưa có bản dịch nào" biến mất — đó đúng là nhóm hệ thống còn nợ người dùng.
+
+### 11f.4 Luồng trả lời theo từng trường hợp (yêu cầu 4)
+
+Dạy trong `_POLICY` + `platform_hints`, và `fmt_record` nay ghi rõ tóm tắt dựng
+từ nguồn nào:
+
+| tình huống | bot phải làm |
+|---|---|
+| có bản Lark, bản Hapas **chưa xong** | trả lời bằng bản Lark, rồi hỏi MỘT câu: có cần bản từ server Hapas không, kèm ước tính tool đưa |
+| có bản Lark, bản Hapas **đã sẵn sàng** | vẫn trả lời bằng bản Lark, rồi hỏi: bản server Hapas **đã sẵn sàng, muốn nhận luôn không** — cấm nói "chờ phiên âm" |
+| chỉ có bản Hapas (Lark không đọc được) | trả lời bằng bản Hapas, nói rõ đây là bản chuẩn |
+| chưa có bản nào | nói thẳng tình trạng + bước tiếp theo, không bịa nội dung |
+
+Hàng thứ hai là **đảo lại quyết định 09/08** ("đã có whisper thì không phục vụ
+bản Lark kém hơn"), theo anh Thiện 10/08: *"cứ để bản Lark rồi mời người ta theo
+nhu cầu ấy, hỏi là có bản dịch trên server Hapas đã sẵn sàng có muốn nhận luôn
+không"*. Đảo có lý do: cái sai hồi 09/08 không phải thứ tự phục vụ mà là **âm
+thầm** đưa bản kém — lời mời khi đó còn hứa "phiên âm lại, mất khoảng 10 phút"
+trong khi file đã nằm sẵn trên đĩa. Nay `_lark_note` có HAI biến thể và selftest
+khoá đúng phần đó: bản sẵn sàng thì tuyệt đối không được hứa chờ.
+
+Lời mời đổi thì cổng write-tool phải theo: `_YES_HEADS` nhận thêm động từ của
+chính lời mời ("cho mình luôn", "nhận nhé", "lấy giúp mình"), và `_record_notes`
+phát `OFFER_MARK` khi cuộc đó có bản Hapas — mời mà không mở cổng thì bot lại tự
+chặn câu trả lời cho lời mời của mình.
+
+Kèm một lệnh cấm: **đừng dùng chữ "biên bản" để nói hệ thống xử lý xong hay
+chưa**. Nhãn tình trạng đổi sang "BẢN TÓM TẮT" ở cả `fmt_pending`,
+`_pending_block`, `search_meetings` và bản admin ở terminal.
+
+### 11f.5 Trạng thái
+
+Self-test **730 PASS / 0 FAIL** (trước 713), nhóm mới khoá: 9 phép kiểm cho
+`source_of` (gồm cả hai cái bẫy trên), 3 nhóm hiển thị đúng tổng, đánh số liên
+tục qua ba nhóm, chân trang `k/n`, đủ bản xịn thì thôi mời, và sàn mỗi nhóm khi
+cắt. Đo trên dữ liệu thật của anh Thiện: 34 + 1 = 35, chân trang `34/35`, tin
+nhắn 2.149 ký tự — vẫn một tin.
+
+Đã áp 11/08 00:25: plugin **1.7.0**, deep-merge `platform_hints.feishu.append`
+(backup `config.yaml.bak-20260810-235832`), `hermes gateway restart`, và
+`restart-v2.ps1` cho orchestrator (PID 12932) để thẻ tự gửi cũng nói cùng ngôn
+ngữ.
+
+### 11f.6 Quyết định mới 13/08 — thay thế lời mời Hapas ở 11f.4
+
+Yêu cầu mới đảo riêng hàng “có Lark, Hapas chưa xong” ở bảng 11f.4: bot vẫn trả
+Lark ngay nhưng **không hỏi có cần Hapas không, không hứa tự xử lý và không đưa
+ETA**. Chỉ khi file Hapas thật sự đã tồn tại mới được nói bản chất lượng cao đã
+sẵn sàng và mời nhận. Quy tắc mới này được khóa ở `qa._has_hapas`, `source_of`,
+`_lark_note`, footer danh sách, policy plugin và self-test.
+
 ## 12. Checklist cho chat/code agent mới
 
 Trước khi làm việc:
@@ -881,4 +1794,3 @@ Các câu hỏi mà tài liệu này phải trả lời được cho reader mớ
 - Lệnh nào kiểm sức khỏe và tiêu chuẩn PASS hiện tại là gì?
 - Những external write nào vẫn chưa được duyệt?
 - Điều gì tuyệt đối không được reset hoặc mở rộng?
-

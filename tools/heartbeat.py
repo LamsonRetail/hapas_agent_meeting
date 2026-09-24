@@ -59,8 +59,13 @@ COUNT_STATUSES = ACTIVE_STATUSES + ("held", "waiting_auth", "failed")
 # noi. Chung se `failed` VINH VIEN, nen dem ca chung vao canh bao nghia la
 # heartbeat WARN mai mai. Mot canh bao khong bao gio tat la mot canh bao nguoi
 # ta hoc cach bo qua, va roi bo qua luon lan hong that.
-SILENT_FAIL_CODES = frozenset({"empty_transcript"})
+SILENT_FAIL_CODES = frozenset({"silent_recording"})
 _ERR_CODE_RE = re.compile(r"^\[([a-z_]+)\]\s*")
+
+
+def _is_silent_failure(error: str | None) -> bool:
+    code_match = _ERR_CODE_RE.match(error or "")
+    return bool(code_match and code_match.group(1) in SILENT_FAIL_CODES)
 
 # Nguong canh bao. Dat o day, mot cho, de doi khoi phai doi ca `collect` lan
 # ban do mau cua monitor.
@@ -214,20 +219,25 @@ def db_stats() -> dict:
         # cuoi hang doi 3-4 tieng la binh thuong vi nhung cuoc truoc no moi cai
         # 2-3 tieng audio. Chi so do bao dong dung luc he thong lam viec cham
         # chi nhat. Con so DUY NHAT phan biet duoc "dang chay cham" voi "dung
-        # han" la: lan cuoi co mot cuoc DICH XONG.
+        # han" la: lan cuoi co mot cuoc DICH XONG. Nhưng nếu hàng đợi vừa xuất
+        # hiện sau nhiều ngày không có việc, tuổi đó phải chặn bởi tuổi của job
+        # active cũ nhất; nếu không heartbeat báo "tắc 41 giờ" ngay phút đầu.
         row = c.execute("SELECT MAX(transcribed_at) FROM jobs").fetchone()
         done = row[0] if row else None
-        out["idle"] = (round((now - int(done)) / 60000, 1) if done else None)
+        row = c.execute(
+            "SELECT MIN(COALESCE(queued_at, detected_at)) FROM jobs "
+            "WHERE status IN ('queued','transcribing','recapping')").fetchone()
+        active_since = row[0] if row else None
+        ages = [max(0.0, (now - int(ts)) / 60000)
+                for ts in (done, active_since) if ts]
+        out["idle"] = round(min(ages), 1) if ages else None
 
-        # Job hong CO THE LAM GI DUOC. `empty_transcript` (ban ghi khong co
-        # tieng noi) bi tru ra: no vinh vien va khong ai sua duoc — dem no vao
-        # la WARN khong bao gio tat.
+        # Chi tru empty_transcript NGAN. Audio dai ra 0 chu la dau hieu Whisper
+        # nuot du lieu; no phai lam heartbeat WARN de nguoi van hanh dieu tra.
         out["failed_act"] = sum(
             1 for (err,) in c.execute(
                 "SELECT error FROM jobs WHERE status='failed'")
-            if (_ERR_CODE_RE.match(err or "").group(1)
-                if _ERR_CODE_RE.match(err or "") else "")
-            not in SILENT_FAIL_CODES)
+            if not _is_silent_failure(err))
 
         row = c.execute(
             "SELECT COUNT(*) FROM deliveries WHERE ok=1 AND sent_at >= ?",
@@ -259,7 +269,40 @@ def latest_log(pattern: str) -> str | None:
     return files[0] if files else None
 
 
+SCAN_MARK_KEY = "scan_ok"          # hợp đồng với alerts.note_scan_ok
+
+
+def scan_age_from_mark(now: datetime.datetime) -> float | None:
+    """Tuổi vòng quét theo MỐC trong DB (epoch ms). None nếu chưa có mốc.
+
+    Đường ĐÚNG, thêm 19/08/2026. Đường log bên dưới chỉ còn là dự phòng cho lúc
+    V2 chưa kịp ghi mốc lần nào.
+    """
+    try:
+        with sqlite3.connect(f"file:{DB}?mode=ro", uri=True) as c:
+            row = c.execute("SELECT value FROM alert_state WHERE key=?",
+                            (SCAN_MARK_KEY,)).fetchone()
+        if not row or not str(row[0]).strip().isdigit():
+            return None
+        age_s = now.timestamp() - int(row[0]) / 1000
+        return round(max(age_s, 0.0) / 60, 1)
+    except Exception:
+        return None
+
+
 def scan_age_min(now: datetime.datetime) -> float | None:
+    """Tuổi vòng quét gần nhất, phút. Ưu tiên mốc DB; log là dự phòng.
+
+    Vì sao KHÔNG chỉ đọc log (đo 19/08/2026): log chỉ có `[HH:MM:SS]`, không có
+    NGÀY. Scanner ghi thêm một dòng `[07:19:01]` trong lúc heartbeat đã chụp
+    `now = 07:19:00.9` -> dòng đó "ở tương lai 1 giây" -> nhánh "coi như hôm qua"
+    biến nó thành 1439,98 phút, và cả hệ báo `scan_cu=1440.0m` trong khi cả đêm
+    chỉ 0,2–4,3m. Một cú đua một giây thành "scanner chết 24 giờ" — báo động giả
+    kiểu này làm người vận hành học cách bỏ qua cảnh báo, tức nó đắt hơn là vô hại.
+    """
+    by_mark = scan_age_from_mark(now)
+    if by_mark is not None:
+        return by_mark
     f = latest_log("v2-*.log")
     if not f:
         return None
@@ -273,6 +316,10 @@ def scan_age_min(now: datetime.datetime) -> float | None:
     hh, mm, ss = (int(x) for x in last)
     t = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
     if t > now:
+        # Lệch nhỏ = đua giây/đồng hồ, KHÔNG phải hôm qua. Chỉ lùi một ngày khi
+        # nó thật sự trông như phần cuối của log ngày trước.
+        if (t - now).total_seconds() <= 300:
+            return 0.0
         t -= datetime.timedelta(days=1)
     return round((now - t).total_seconds() / 60, 1)
 
@@ -299,11 +346,24 @@ def real_errors(path: str, now: datetime.datetime, minutes: int = 15) -> int:
 
 
 def min_token_days() -> float | None:
+    """So ngay con lai cua token SAP HET HAN NHAT trong so nguoi CON DUNG BOT.
+
+    CHI dem `status='active'` (sua 06/09/2026). Ban dau doc moi dong, va mot
+    dong CHET keo chi so am VINH VIEN: anh Pham Hoang Phuc bi `expired` tu
+    27/08, dong do nam lai voi moc cu, nen tu 01/09 heartbeat bao `token=-4.8d`
+    mai trong khi ca 40 nguoi con lai deu o muc 7,0 ngay. Sau 6 ngay WARN lien
+    tuc, khong ai con nhin con so do nua.
+
+    Dung cai bay ma docstring dau file nay canh bao: "mot canh bao khong bao gio
+    tat la mot canh bao nguoi ta hoc cach bo qua". Nguoi da thu hoi/het han thi
+    khong con gi de canh bao — ho da ngung dung bot, va viec moi ho quay lai la
+    viec cua `alerts`, khong phai cua dong nay.
+    """
     try:
         import sqlite3
         c = sqlite3.connect(DB)
-        rows = [r[0] for r in c.execute("select refresh_exp from tokens")
-                if r[0]]
+        rows = [r[0] for r in c.execute(
+            "select refresh_exp from tokens where status='active'") if r[0]]
         c.close()
         if not rows:
             return None
@@ -331,18 +391,11 @@ def problems(d: dict) -> list[str]:
         p.append("whisper=" + d["whisper"])
     if not d["hermes"]:
         p.append("hermes8642=DOWN")
-    # Scan cu KHONG phai loi khi CON VIEC: vong `run` chay mot mach (tai ->
-    # ffmpeg -> whisper -> recap) roi moi quet lai, nen mot cuoc 2 tieng audio
-    # lam khoang cach giua hai lan quet dai ra 20-30 phut. Do la thiet ke, va
-    # do 06/08/2026 no bao dong lien tuc suot dot nap bu.
-    #
-    # Vi sao dieu kien la `backlog` chu khong phai "co job dang transcribing":
-    # ca giai doan tai file + ffmpeg (may phut voi file 277 MB) job van con o
-    # `queued`, nen do theo status se ho ngay giua hai cuoc — dung nhu lan chay
-    # dau bat duoc. Hang doi rong ma van khong quet moi that su la vong lap
-    # dung; con hang doi day ma vong lap chet thi `tac_nghen` bat duoc.
-    if (d["scan"] is not None and d["scan"] > SCAN_WARN_MIN
-            and not d["backlog"]):
+    # Từ 13/08/2026 scanner chạy thread riêng, nên hàng đợi bận KHÔNG còn là lý
+    # do hợp lệ để scan cũ. Chính luật miễn trừ `and not backlog` đã che ca live
+    # scan=122m: V2 vẫn phiên âm nên heartbeat báo OK, nhưng cuộc mới không vào
+    # DB và không thể tự gửi Meeting Note.
+    if d["scan"] is not None and d["scan"] > SCAN_WARN_MIN:
         p.append(f"scan_cu={d['scan']}m")
     if d["gwerr"] and d["gwerr"] > 0:
         p.append(f"gwerr15m={d['gwerr']}")

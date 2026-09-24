@@ -63,6 +63,7 @@ ALL_STATUSES = (# `detected` là MẶC ĐỊNH của cột `jobs.status` trong s
 # Nhận diện bằng MÃ chứ không bằng cách dò chuỗi tiếng Việt trong câu lỗi: câu
 # chữ sẽ được sửa, và một phép `in` trên câu chữ sẽ lặng lẽ ngừng khớp.
 ERR_EMPTY_TRANSCRIPT = "empty_transcript"
+ERR_SILENT_RECORDING = "silent_recording"
 
 _ERR_CODE_RE = re.compile(r"^\[([a-z_]+)\]\s*")
 
@@ -78,6 +79,11 @@ def error_text(error: str | None) -> str:
     return _ERR_CODE_RE.sub("", (error or "").strip())
 
 
+def is_silent_failure(error: str | None) -> bool:
+    """Recording đã được pipeline xác nhận không có nội dung lời nói hữu ích."""
+    return error_code(error) == ERR_SILENT_RECORDING
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -90,6 +96,7 @@ def _meta_to_json(meta: MeetingMeta) -> str:
         "app_link": meta.app_link, "participants_source": meta.participants_source,
         "attendees": [{"open_id": a.open_id, "union_id": a.union_id,
                        "name": a.name} for a in meta.attendees],
+        "invited_chats": list(meta.invited_chats),
     }, ensure_ascii=False)
 
 
@@ -110,6 +117,8 @@ def meta_from_json(s: str) -> MeetingMeta:
         participants_source=d.get("participants_source", ""),
     )
     m.attendees = [Attendee(**a) for a in d.get("attendees", [])]
+    # `.get` chứ không `d["…"]`: 479 job ghi TRƯỚC 26/08/2026 không có khoá này.
+    m.invited_chats = [c for c in (d.get("invited_chats") or []) if c]
     return m
 
 

@@ -332,7 +332,7 @@ QA_TOKEN_TTL = _get_int("QA_TOKEN_TTL", 900)
 # được version-control và được selftest kiểm nội dung. Đọc qua `_get` chứ không
 # `os.environ` trực tiếp: mọi env của V2 nằm trong `v2/.env`, và chỉ `_get` mới
 # nạp file đó.
-BOT_NAME = _get("V2_BOT_NAME", "").strip() or "Thư Ký"
+BOT_NAME = _get("V2_BOT_NAME", "").strip() or "Agent Meeting của Chuyển đổi số"
 
 # ------------------------------------------ glossary tự cải thiện (part B)
 #
@@ -359,6 +359,62 @@ BOT_NAME = _get("V2_BOT_NAME", "").strip() or "Thư Ký"
 # không đọc được. Đổi lại chỉ vớt được 1 cuộc thật trong 7 ngày.
 # Bật khi cần quét rộng một đợt (vd đi tìm cuộc bị sót), rồi tắt lại.
 SCAN_ALL_VISIBLE = _get_bool("V2_SCAN_ALL_VISIBLE", False)
+
+# Thẻ "họp xong" chỉ được gửi cho cuộc CÒN MỚI. Thêm 18/08/2026 sau một ca thật:
+# bật `SCAN_ALL_VISIBLE` xong, vòng quét kế vớt 3 bản ghi cũ (hai cuộc phỏng vấn
+# 12/08 và một cuộc 13/08) rồi gửi 5 thẻ "họp xong" cho cuộc đã họp 5-6 ngày
+# trước, lúc 18:43 tối. Docstring `enqueue_minute` đã ghi "backlog thì TẮT
+# notify", nhưng chỉ đường enroll tự truyền notify=False; đường quét (cả lọc
+# người lẫn mở-xem-được) không biết mình đang nạp cuộc cũ nên để mặc định True.
+#
+# Chần tuổi đặt trong `enqueue_minute` — chỗ DUY NHẤT đã có `meta.start` thật —
+# nên nó che cả hai đường, kể cả ca bản ghi cũ được share muộn cho người enroll.
+# Cuộc quá tuổi vẫn NẠP và vẫn phiên âm; chỉ không báo "họp xong" nữa.
+#
+# 6 giờ: dài hơn mọi cuộc họp đã đo (dài nhất 2h25) cộng thời gian Lark xử lý
+# bản ghi cộng một vòng quét sót, nhưng vẫn ngắn hơn "hôm qua". <=0 = tắt chần
+# (quay lại hành vi cũ: cuộc nào nạp cũng báo).
+NOTIFY_MAX_AGE_HOURS = _get_int("V2_NOTIFY_MAX_AGE_HOURS", 6)
+
+# Mean dB dưới ngưỡng này, KÈM whisper ra 0 chữ = băng không có tiếng nói ->
+# `discarded` (không có việc gì cho người vận hành), thay vì `failed`.
+# Xem `pipeline._NO_SPEECH_MEAN_DB` để biết vì sao chỉ dùng để PHÂN LOẠI.
+NO_SPEECH_MEAN_DB = float(_get("V2_NO_SPEECH_MEAN_DB", "-45"))
+
+# Trần giãn NHÓM CHAT được mời trên lịch -> thành người nhận biên bản.
+# 28/08/2026: 60 -> 80. Xem `meetings.MAX_CHAT_INVITE_MEMBERS` để biết vì sao
+# con số này tồn tại và vì sao 80 chứ không phải 100.
+MAX_CHAT_INVITE_MEMBERS = _get_int("V2_MAX_CHAT_INVITE_MEMBERS", 80)
+
+# ---------------------------------------------------------------------------
+#  Hỏi đáp TRONG NHÓM CHAT — danh sách trắng, mặc định RỖNG (tắt hoàn toàn)
+# ---------------------------------------------------------------------------
+# Từ 02/08/2026 bot chỉ trả lời chat 1-1. Lý do ghi ở `gate._refuse_group`:
+# `qa._may_see` cấp quyền cho người HỎI, còn câu trả lời thì cả phòng ĐỌC được.
+#
+# Thiết kế mở lại (user chốt 27/08/2026) không phá luật đó mà đổi ĐƠN VỊ quyền:
+# trong nhóm X, bot CHỈ trả lời về cuộc họp mà chính nhóm X được mời
+# (`meta.invited_chats`). Khi đó "cả phòng đọc được" không còn là rò rỉ — cả
+# phòng đúng là tập khán giả hợp lệ của cuộc đó.
+#
+# VÌ SAO PHẢI LÀ DANH SÁCH TRẮNG, không phải "hễ có nhóm là mở": đo ngày
+# 27/08 sau khi nạp bù `invited_chats` cho 487 cuộc — một nhóm duy nhất
+# (`PHÁT TRIỂN SẢN PHẨM TÚI XÁCH LAM SON RETAIL`) kéo theo **41 cuộc họp**,
+# trong đó có cả `HỌP ĐỊNH KÌ THỨ 2 - ALL CÔNG TY`. Mở đại trà là mở 41 cuộc
+# cho mọi thành viên nhóm đó cùng lúc, và không ai kịp nhìn thấy điều đó.
+#
+# Người trong nhóm KHÔNG cần enroll để hỏi — quyền đến từ việc ở trong phòng.
+# Đó là hệ quả đã được nêu rõ và user chốt. Nhưng FILE .docx nguyên văn thì
+# VẪN đi đường DM + ACL từng người, không bao giờ vào nhóm.
+GROUP_QA_CHATS = tuple(
+    c.strip() for c in _get("V2_GROUP_QA_CHATS", "").replace(",", " ").split()
+    if c.strip())
+
+# Nghỉ bao lâu trước khi hỏi lại người bị Lark bóp tần suất (99991400) trong
+# thang ứng viên tải bản ghi. Xem `pipeline.download_recording`: cuộc đông người
+# tự đụng hạn mức vì gọi liên tiếp ~19 lần, và cú bóp đó KHÔNG tự khỏi ở vòng
+# sau, nên phải hỏi lại ngay trong lượt. 0 = thôi lượt hai (chỉ để test).
+MEDIA_THROTTLE_BACKOFF_S = _get_int("V2_MEDIA_THROTTLE_BACKOFF_S", 5)
 
 GLOSSARY_ENABLED = _get_bool("V2_GLOSSARY_ENABLED", True)
 # Chỉ nổi ứng viên gặp >= ngần này CUỘC trong digest (cắt nhiễu nghe-nhầm một lần).
@@ -401,6 +457,9 @@ ALERT_RUN_STALE_MIN = _get_int("ALERT_RUN_STALE_MIN", 30)
 # tắt hẳn phần ghi Base; phát biên bản vẫn chạy bình thường.
 BITABLE_APP_TOKEN = _get("BITABLE_APP_TOKEN", "")
 BITABLE_TABLE_ID = _get("BITABLE_TABLE_ID", "")
+# Audit ngoài máy phải là opt-in rõ ràng. Không hard-code table thật: chỉ cần
+# BITABLE_APP_TOKEN tồn tại là bản cũ tự gửi toàn bộ prompt/response ra Base.
+BITABLE_AUDIT_TABLE_ID = _get("BITABLE_AUDIT_TABLE_ID", "")
 
 # Hỏi đáp về cuộc họp: KHÔNG có config riêng ở đây. Bot chat là Hermes (app Lark
 # riêng của nó, cấu hình trong ~/.hermes/), còn V2 chỉ phơi dữ liệu qua MCP
@@ -529,5 +588,9 @@ def summary() -> str:
         f"oauth_relay={'Cloudflare ' + CF_RELAY_URL if CF_RELAY_URL else ('Vercel ' + OAUTH_PULL_URL if OAUTH_PULL_URL else '(tắt)')}\n"
         f"dashboard={STATUS_PUSH_URL or '(tắt)'}\n"
         f"base={'bảng ' + BITABLE_TABLE_ID if BITABLE_APP_TOKEN else '(tắt)'} "
+        # In ra vì đã mất 4 ngày im lặng (13→17/08/2026): commit 4aa1435 đổi
+        # audit thành opt-in mà .env không có BITABLE_AUDIT_TABLE_ID, nên bảng
+        # Base đứng yên còn không chỗ nào báo. Audit vẫn vào SQLite local.
+        f"audit_base={BITABLE_AUDIT_TABLE_ID or '(tắt — chỉ SQLite local)'} "
         f"cảnh báo={str(len(ALERT_UNION_IDS)) + ' người' if ALERT_UNION_IDS else '(tắt)'}"
     )

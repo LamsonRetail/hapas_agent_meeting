@@ -179,11 +179,52 @@ def cmd_gate(args) -> None:
         try:
             out = gate.check(args.union_id, args.user_id, args.name,
                              send=not args.no_send,
-                             chat_type=args.chat_type)
+                             chat_type=args.chat_type,
+                             chat_id=args.chat_id,
+                             mentions=args.mentions)
         except Exception as exc:                      # noqa: BLE001
             # Cửa đóng khi hỏng: thà bot im còn hơn mở cho người chưa cấp quyền.
             out = {"decision": "wait", "reason": f"gate lỗi: {exc}"}
     print(_json.dumps(out, ensure_ascii=False))
+
+
+def cmd_audit_log(args) -> None:
+    _init()
+    from . import audit, db
+    payload = {}
+    if getattr(args, "stdin_json", False):
+        import json
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(f"audit-log: stdin JSON không hợp lệ: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise SystemExit("audit-log: stdin JSON phải là object")
+    name = str(payload.get("name", args.name) or "")
+    union_id = str(payload.get("union_id", args.union_id) or "")
+    if union_id and not name:
+        r = db.conn().execute("SELECT name FROM tokens WHERE union_id=?", (union_id,)).fetchone()
+        if r:
+            name = r["name"]
+    audit.log_qa_event(
+        name=name,
+        union_id=union_id,
+        prompt=str(payload.get("prompt", args.prompt) or ""),
+        tool_called=str(payload.get("tool", args.tool) or "hermes_response"),
+        meeting_title=str(payload.get("meeting", args.meeting) or ""),
+        meeting_status=str(payload.get("meeting_status", "") or ""),
+        response=str(payload.get("response", args.response) or "")
+    )
+
+
+def cmd_chat_reset(args) -> None:
+    """Xoá ký ức cuộc họp bền vững của đúng người; không đụng OAuth hay ACL."""
+    _init()
+    from . import db
+    union_id = (args.union_id or "").strip()
+    if not union_id:
+        raise SystemExit("chat-reset: cần --union-id")
+    db.forget_meetings(union_id)
 
 
 def cmd_base_sync(args) -> None:
@@ -432,11 +473,62 @@ def cmd_enqueue(args) -> None:
     print("Đã nạp job." if ok else "Không nạp (đã có/đã khóa hoặc lỗi).")
 
 
+def cmd_workfiles(args) -> None:
+    """Chỉ đọc: file nào trong `work/` đang được dùng thật, file nào là rác.
+
+    `restart-v2.ps1` gọi lệnh này thay cho phép ĐẾM file cũ. Tiền tố BUSY/STALE
+    để script đọc bằng máy; đừng đổi hai từ đó mà không sửa script.
+    """
+    _init()
+    from . import pipeline
+    rows = pipeline.work_files()
+    for r in rows:
+        print(f"{'BUSY ' if r['busy'] else 'STALE'} {r['name']}  "
+              f"status={r['status']}  {r['size_mb']:.1f}MB  "
+              f"{r['age_hours']:.1f}h truoc")
+    busy = sum(1 for r in rows if r["busy"])
+    print(f"[workfiles] tong={len(rows)} dang_dung={busy} rac={len(rows) - busy}")
+
+
 def cmd_coverage(args) -> None:
     """Chỉ đọc: không tạo job, không đổi status, không nhắn ai."""
     _init()
     from . import coverage
     sys.exit(coverage.report(args.days))
+
+
+def cmd_reresolve(args) -> None:
+    """Tra lại người dự cho cuộc cũ chưa tra được. Mặc định THỬ KHÔ.
+
+    KHÔNG gửi tin cho ai, kể cả với `--yes`. Chỉ sửa dữ liệu người dự trong DB
+    để bot trả lời đúng và ACL đúng; ai chưa nhận biên bản cuộc cũ thì vẫn
+    chưa nhận (user chốt 28/08/2026).
+    """
+    _init()
+    seen, fixed, gained = orchestrator.reresolve_stale(
+        args.days, dry_run=not args.yes)
+    print(f"\nXét {seen} cuộc chưa tra được người dự · tra ra {fixed} cuộc"
+          f" · thêm {gained} lượt người vào danh sách")
+    if not args.yes:
+        print("Thử khô — chưa ghi gì. Thêm --yes để ghi thật.")
+    else:
+        print("KHÔNG ai nhận thêm tin nhắn nào — chỉ dữ liệu trong DB đổi.")
+
+
+def cmd_backfill_chats(args) -> None:
+    """Nạp bù `invited_chats` (nhóm chat được mời) cho job cũ. Mặc định THỬ KHÔ.
+
+    KHÔNG gửi tin cho ai và KHÔNG đổi danh sách người dự — chỉ điền một trường
+    dữ liệu mà trước 27/08/2026 chưa tồn tại. Cần nó để đường hỏi đáp trong
+    nhóm biết cuộc nào thuộc nhóm nào.
+    """
+    _init()
+    seen, found, written = orchestrator.backfill_invited_chats(
+        args.days, dry_run=not args.yes)
+    print(f"\nXét {seen} cuộc chưa có nhóm · tra được {found} cuộc có nhóm mời"
+          + (f" · đã ghi {written}" if args.yes else ""))
+    if not args.yes:
+        print("Thử khô — chưa ghi gì. Thêm --yes để ghi thật.")
 
 
 def cmd_backfill(args) -> None:
@@ -684,9 +776,33 @@ def main() -> None:
                         "thread. Chỉ `dm` được trả lời — trong phòng nhiều "
                         "người thì câu trả lời lọt sang người không có quyền "
                         "xem. Trống = plugin đời cũ, cho đi tiếp + cảnh báo")
+    g.add_argument("--chat-id", default="",
+                   help="chat_id của phòng. Chỉ dùng cho phòng NHÓM: nhóm có "
+                        "trong V2_GROUP_QA_CHATS mới được hỏi, và về sau chính "
+                        "id này giới hạn cuộc họp bot được phép trả lời")
+    g.add_argument("--mentions", default="",
+                   help="open_id của những người/bot được @ trong tin, cách "
+                        "nhau bằng dấu phẩy. Trong NHÓM, bot chỉ trả lời khi "
+                        "chính nó có trong danh sách này — `@All` không có "
+                        "open_id nên tự rơi ra")
     g.add_argument("--no-send", action="store_true",
                    help="chỉ tra, không nhắn ai (để thử)")
     g.set_defaults(fn=cmd_gate)
+
+    al = sub.add_parser("audit-log", help="ghi log audit hỏi đáp")
+    al.add_argument("--name", default="")
+    al.add_argument("--union-id", default="")
+    al.add_argument("--prompt", default="")
+    al.add_argument("--tool", default="hermes_response")
+    al.add_argument("--meeting", default="")
+    al.add_argument("--response", default="")
+    al.add_argument("--stdin-json", action="store_true",
+                    help="đọc payload JSON từ stdin; không lộ prompt/response trên command line")
+    al.set_defaults(fn=cmd_audit_log)
+
+    cr = sub.add_parser("chat-reset", help="xoá ký ức cuộc họp của một người")
+    cr.add_argument("--union-id", required=True)
+    cr.set_defaults(fn=cmd_chat_reset)
 
     ep = sub.add_parser("enroll-poll",
                         help="kéo code OAuth từ hộp thư Vercel rồi enroll")
@@ -759,6 +875,9 @@ def main() -> None:
 
     sub.add_parser("scan").set_defaults(fn=cmd_scan)
 
+    sub.add_parser("workfiles",
+                   help="file trong work/: cái nào đang xử lý, cái nào rác đọng")       .set_defaults(fn=cmd_workfiles)
+
     eq = sub.add_parser("enqueue")
     eq.add_argument("--token", required=True, help="minute_token cần nạp")
     eq.add_argument("--reader", help="open_id người enroll để mượn token đọc")
@@ -783,6 +902,24 @@ def main() -> None:
     bf.add_argument("--yes", action="store_true",
                     help="nạp thật — không có thì chỉ liệt kê rồi thoát")
     bf.set_defaults(fn=cmd_backfill)
+
+    bc = sub.add_parser(
+        "backfill-chats",
+        help="nạp bù NHÓM CHAT được mời cho cuộc cũ (mặc định thử khô)")
+    bc.add_argument("--days", type=int, default=14,
+                    help="xét cuộc họp trong bao nhiêu ngày gần đây (mặc định 14)")
+    bc.add_argument("--yes", action="store_true",
+                    help="ghi thật — không có thì chỉ in ra rồi thoát")
+    bc.set_defaults(fn=cmd_backfill_chats)
+
+    rr = sub.add_parser(
+        "reresolve",
+        help="tra lại NGƯỜI DỰ cho cuộc cũ chưa tra được (KHÔNG gửi tin cho ai)")
+    rr.add_argument("--days", type=int, default=30,
+                    help="xét cuộc họp trong bao nhiêu ngày gần đây (mặc định 30)")
+    rr.add_argument("--yes", action="store_true",
+                    help="ghi thật — không có thì chỉ in ra rồi thoát")
+    rr.set_defaults(fn=cmd_reresolve)
 
     p = sub.add_parser("process")
     p.add_argument("--send", action="store_true", help="gửi thật")

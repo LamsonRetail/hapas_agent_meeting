@@ -111,6 +111,18 @@ class MeetingMeta:
     attendees: list[Attendee] = field(default_factory=list)
     # Nguồn suy ra người dự: "calendar:<tên>" hoặc "fallback:owner"...
     participants_source: str = ""
+    # chat_id của các NHÓM CHAT được mời thẳng trên lịch (Lark trả về dưới dạng
+    # một mục `{"type": "chat", "chat_id": ...}` trong `event_attendees`).
+    #
+    # Giữ lại chứ không dùng-xong-vứt (26/08/2026): đây là bằng chứng DUY NHẤT,
+    # do Lark cấp, cho câu hỏi "cuộc họp này thuộc về nhóm nào". Trước đó
+    # `_chat_invitees` đọc `chat_id` để giãn ra người rồi bỏ đi, nên không cách
+    # nào trả lời được câu đó về sau.
+    #
+    # Ghi CẢ KHI không giãn được người (thiếu quyền, nhóm quá đông, bot chưa
+    # vào nhóm): việc "nhóm nào được mời" và việc "giãn ra được ai" là hai
+    # chuyện khác nhau, và trộn chúng đúng là cách làm mất dữ liệu lần trước.
+    invited_chats: list[str] = field(default_factory=list)
 
     @property
     def invitee_count(self) -> int:

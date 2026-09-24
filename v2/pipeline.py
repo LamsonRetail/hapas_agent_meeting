@@ -11,6 +11,7 @@ Các bước dùng USER TOKEN của một người có dự để tải bản gh
 from __future__ import annotations
 
 import re
+import os
 import shutil
 import subprocess
 import time
@@ -70,6 +71,10 @@ def extract_audio(video: Path) -> Path:
 # Lark trả mã này khi token hợp lệ, có scope `minutes:minutes.media:export`,
 # nhưng NGƯỜI đó không được phép tải bản ghi CỤ THỂ này.
 _CODE_MEDIA_DENY = 2091005
+# Lark bóp tần suất: HTTP 200 nhưng body code 99991400. Tầng transport
+# (`_RetryTransport`) chỉ thử lại theo STATUS, nên cú này đi thẳng ra thành
+# `LarkError` — xem `RateLimited`.
+_CODE_RATE_LIMIT = 99991400
 
 
 class EmptyTranscript(PipelineError):
@@ -93,6 +98,109 @@ class EmptyTranscript(PipelineError):
     """
 
 
+class SilentRecording(EmptyTranscript):
+    """Recording im lặng số hoặc quá ngắn và Whisper không nghe được lời nào.
+
+    Đây không phải lỗi hạ tầng và không có dữ liệu để cứu; orchestrator đưa job
+    sang `discarded`. Audio dài, có tín hiệu mà Whisper vẫn ra 0 chữ KHÔNG vào
+    lớp này — nó vẫn là EmptyTranscript actionable.
+    """
+
+
+_DIGITAL_SILENCE_MAX_DB = -70.0
+_SHORT_EMPTY_MAX_SEC = 60.0
+
+# Mean dB dưới ngưỡng này = băng KHÔNG CÓ TIẾNG NÓI, dù peak có to đến đâu.
+#
+# CHỈ dùng để PHÂN LOẠI sau khi whisper đã trả 0 chữ, KHÔNG dùng để bỏ qua
+# whisper. Khác biệt này quan trọng: một cuộc 25 phút mà người ta chỉ nói 2 phút
+# cũng có mean thấp, nên lấy mean chặn TRƯỚC là tự tay vứt một cuộc họp thật.
+# Sau khi whisper đã nói "không có gì", mean chỉ còn để trả lời một câu: chuyện
+# này có đáng gọi người dậy không.
+#
+# -45: giữa hai cụm đã đo. Băng có người nói thật nằm khoảng -20…-30; hai job
+# `failed` ngày 28/08 là -48.3 và -81.9.
+_NO_SPEECH_MEAN_DB = config.NO_SPEECH_MEAN_DB
+
+
+def _volume_db(media: Path) -> tuple[float | None, float | None]:
+    """(peak dB, mean dB) đo bằng ffmpeg. None ở ô nào = không đo chắc chắn được.
+
+    Vì sao cần CẢ HAI (28/08/2026): peak một mình bị một tiếng động lẻ đánh lừa.
+    Đo thật trên hai job `failed` cùng ngày:
+
+        Review định biên team MKT (25 phút): peak -7.1 dB  mean -48.3 dB
+        [IDI-TET] MM-01-258-13   (75 giây): peak -44.2 dB  mean -81.9 dB
+
+    Cả hai đều KHÔNG có tiếng nói (whisper xử lý 25 phút audio hết 24 giây — VAD
+    lọc sạch — và 12 "từ" thu được chính là prompt vọng lại). Nhưng peak của cái
+    đầu là -7.1 dB, tức "rất to" theo lưới cũ, nên chúng bị đánh `failed` (đòi
+    người xử lý, chặn `doctor`) thay vì `discarded` (không có gì để làm).
+
+    `mean_volume` nằm ngay dòng bên cạnh trong cùng một lời gọi ffmpeg — trước
+    đây code chỉ đọc `max_volume` rồi bỏ. Không tốn thêm lời gọi nào.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None, None
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", str(media),
+             "-map", "0:a:0", "-af", "volumedetect", "-f", "null",
+             os.devnull],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+
+    def _pick(label: str) -> float | None:
+        m = re.findall(rf"{label}:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB",
+                       proc.stderr or "", re.IGNORECASE)
+        if not m:
+            return None
+        return float("-inf") if m[-1].lower() == "-inf" else float(m[-1])
+
+    return _pick("max_volume"), _pick("mean_volume")
+
+
+def _max_volume_db(media: Path) -> float | None:
+    """Chỉ peak. Giữ lại vì `selftest` và `doctor` gọi tên này."""
+    return _volume_db(media)[0]
+
+
+# Transcript ngắn hơn ngần này TỪ mới đem so với prompt. Dài hơn thì dù có lặp
+# lại prompt cũng đã có nội dung thật xen vào — cắt cả bài là mất biên bản.
+_ECHO_MAX_WORDS = 60
+# Bao nhiêu phần chữ của transcript phải nằm trong prompt thì coi là vọng.
+_ECHO_MIN_OVERLAP = 0.8
+
+
+def _norm_words(s: str) -> list[str]:
+    return [w for w in re.sub(r"[^\w\s]", " ", (s or "").lower()).split() if w]
+
+
+def _is_prompt_echo(text: str, hint: str) -> bool:
+    """Transcript này thực chất chỉ là `initial_prompt` chép lại?
+
+    Đo bằng CHỮ THẬT, không bằng độ dài hay bằng danh sách câu mẫu: gần như mọi
+    từ trong transcript đều có trong prompt, và transcript đủ ngắn để không thể
+    lẫn nội dung thật vào. Prompt rỗng thì không có gì để vọng.
+
+    Ca thật 28/08/2026 (`Review định biên team MKT`): 1491 giây audio -> đúng 12
+    từ, và cả 12 nằm trong prompt. Xem chỗ gọi để biết vì sao đây là lỗi NGUY
+    HIỂM chứ không chỉ là rác.
+    """
+    words = _norm_words(text)
+    if not words or len(words) > _ECHO_MAX_WORDS:
+        return False
+    hint_words = set(_norm_words(hint))
+    if not hint_words:
+        return False
+    trong_prompt = sum(1 for w in words if w in hint_words)
+    return trong_prompt / len(words) >= _ECHO_MIN_OVERLAP
+
+
 class MediaDenied(PipelineError):
     """Không một ai đã enroll được phép tải bản ghi này.
 
@@ -101,6 +209,26 @@ class MediaDenied(PipelineError):
     ngược chiều — hai cái kia KHÔNG được tiêu quota vì sẽ tự khỏi, cái này phải
     dừng NGAY vì sẽ không tự khỏi. `orchestrator` bắt riêng và đánh `failed`
     luôn, kèm câu nói rõ phải nhờ ai làm gì.
+    """
+
+
+class RateLimited(PipelineError):
+    """Lark bóp tần suất giữa lúc dò ai tải được bản ghi — thang ứng viên DỞ DANG.
+
+    Thêm 18/08/2026 sau một ca thật đáng giá: job `08-17 | HỌP ĐỊNH KÌ THỨ 2 -
+    HÀNG TUẦN - ALL CÔNG TY` (56 người) có chủ bản ghi CHƯA enroll, tức kết luận
+    đúng phải là `WaitingForAuth` — park lại, chờ chị ấy cấp quyền. Nhưng ĐÚNG MỘT
+    ứng viên vấp `99991400`, cú đó rơi vào giỏ `other`, nên điều kiện
+    `denied and not other` thành sai, hàm ném `PipelineError` thường, và job đốt
+    hết 5 lần thử rồi `failed` VĨNH VIỄN — kèm câu lỗi không ai đọc ra được là
+    "chỉ cần chủ bản ghi enroll".
+
+    Vì sao phải là lớp riêng chứ không nhét vào `other`: người bị bóp KHÔNG cho ta
+    biết gì về quyền của họ. Kết luận `MediaDenied` (vĩnh viễn) lúc đó là bịa, mà
+    kết luận `WaitingForAuth` (park tới khi có người enroll) cũng là bịa — có thể
+    chính người vừa bị bóp mới là người tải được. Việc duy nhất đúng là THỬ LẠI,
+    và không tiêu quota `MAX_ATTEMPTS` vì đây là hạ tầng chứ không phải cuộc họp
+    này. Cùng họ `TranscribeUnavailable`, ngược họ `MediaDenied`.
     """
 
 
@@ -152,6 +280,46 @@ def _reader_candidates(meta: MeetingMeta) -> list[str]:
     return out
 
 
+# Job đang thật sự dùng file trong `work/`. `transcribing` là lúc whisper chạy,
+# nhưng `queued` cũng tính: `download_recording` tải xong mới tới
+# `set_status(..., "transcribing")`, nên có một khoảng file đã nằm đó mà status
+# vẫn `queued`. Bỏ `queued` ra là mở đúng cửa sổ để restart giết một cú tải.
+WORK_BUSY_STATUSES = ("queued", "transcribing", "recapping")
+
+
+def work_files() -> list[dict]:
+    """Phân loại file trong `work/`: đang dùng thật, hay rác đọng.
+
+    Vì sao cần (18/08/2026): `restart-v2.ps1` chỉ ĐẾM file trong `work/` rồi coi
+    như "có cuộc họp đang xử lý" và tự huỷ. Đo được: `obsgd4544….mp4` 238 MB đọng
+    từ 13/08 trong khi job ấy đã `held` (xong) — nên MỌI lần restart từ 13/08 tới
+    18/08 đều bị chính lá chắn đó huỷ, tức bản vá nào cũng không vào được máy mà
+    không ai biết. Lá chắn phải đối chiếu STATUS JOB, không phải sự tồn tại file.
+
+    Không có job cho token đó cũng là rác: job bị xoá rồi thì không ai còn đọc
+    file này nữa. Trả list dict; người gọi tự quyết, hàm này không xoá gì.
+    """
+    out: list[dict] = []
+    if not config.WORK_DIR.is_dir():
+        return out
+    now = time.time()
+    for f in sorted(config.WORK_DIR.iterdir()):
+        if not f.is_file():
+            continue
+        row = jobstore.get(f.stem)
+        status = (row or {}).get("status") or ""
+        try:
+            age_h = (now - f.stat().st_mtime) / 3600
+            size_mb = f.stat().st_size / 1_048_576
+        except OSError:
+            age_h, size_mb = 0.0, 0.0
+        out.append({"name": f.name, "token": f.stem,
+                    "status": status or "(không có job)",
+                    "busy": status in WORK_BUSY_STATUSES,
+                    "age_hours": age_h, "size_mb": size_mb})
+    return out
+
+
 def download_recording(meta: MeetingMeta) -> tuple[Path, str]:
     """Tải bản ghi, thử TỪNG người đã enroll tới khi có ai lấy được URL.
 
@@ -164,9 +332,15 @@ def download_recording(meta: MeetingMeta) -> tuple[Path, str]:
     denied: list[str] = []          # 2091005 — không được phép, VĨNH VIỄN
     no_token: list[str] = []        # chưa enroll / token hết hạn
     other: list[str] = []           # mạng, 5xx, URL rỗng — có thể TỰ KHỎI
+    throttled: list[str] = []       # 99991400 — bị bóp, CHƯA biết gì về quyền
     cands = _reader_candidates(meta)
 
-    for oid in cands:
+    def _attempt(oid: str) -> tuple[Path, str] | None:
+        """Mượn token của MỘT người. Trả (file, oid) nếu tải được, None nếu không.
+
+        Lỗi được xếp vào bốn giỏ ở ngoài — chính việc xếp sai giỏ là gốc của cả
+        hai lần hỏng đã trả giá thật (xem `MediaDenied`, `RateLimited`).
+        """
         try:
             token = tokenstore.get_access_token(oid)
         except tokenstore.TokenError:
@@ -176,18 +350,22 @@ def download_recording(meta: MeetingMeta) -> tuple[Path, str]:
             # biến nhất — làm điều kiện `denied and not other` không bao giờ
             # đúng, và job lại quay về đốt 5 lần thử rồi báo lỗi vô nghĩa.
             no_token.append(oid)
-            continue
+            return None
         try:
             url = lark_api.minutes_media_url(token, meta.minute_token)
         except lark_api.LarkError as exc:
             if exc.code == _CODE_MEDIA_DENY:
                 denied.append(oid)
+            elif exc.code == _CODE_RATE_LIMIT:
+                # KHÔNG vào `other`: xem `RateLimited`. Một cú bóp từng biến một
+                # job đáng-park thành `failed` vĩnh viễn.
+                throttled.append(oid)
             else:
                 other.append(f"{oid[:12]}: {exc}")
-            continue
+            return None
         if not url:
             other.append(f"{oid[:12]}: Lark trả URL rỗng")
-            continue
+            return None
 
         dest = config.WORK_DIR / f"{meta.minute_token}.mp4"
         size = lark_api.download_to(url, dest, token)
@@ -195,6 +373,42 @@ def download_recording(meta: MeetingMeta) -> tuple[Path, str]:
               f"(mượn quyền của {oid[:12]}…)")
         return dest, oid
 
+    for oid in cands:
+        got = _attempt(oid)
+        if got:
+            return got
+
+    # Lượt hai cho riêng người bị bóp. Vì sao phải có (đo 18/08/2026): cú bóp
+    # KHÔNG tự khỏi giữa các vòng quét — job `08-17 | HỌP ĐỊNH KÌ THỨ 2` (56
+    # người, ~19 người đã enroll) bị bóp đúng ở người cuối trong MỌI vòng, vì
+    # chính thang này gọi `minutes_media_url` ~19 lần liên tiếp trong một nhịp
+    # rồi tự đụng hạn mức. "Thử lại vòng sau" nghe hợp lý nhưng thực tế là job
+    # nằm `queued` vô hạn: attempts không tăng nên không ai báo, và không ai
+    # biết cuộc họp đó chưa có biên bản. Hỏi lại NGAY, sau một nhịp nghỉ, thì
+    # câu trả lời thật (được phép / bị từ chối) mới hiện ra để kết luận đúng.
+    # `_RetryTransport` không đỡ được ca này: nó chỉ thử lại theo HTTP status,
+    # còn 99991400 về kèm HTTP 200.
+    if throttled:
+        again, throttled = list(throttled), []
+        print(f"       {len(again)} người bị Lark bóp tần suất — nghỉ "
+              f"{config.MEDIA_THROTTLE_BACKOFF_S}s rồi hỏi lại")
+        time.sleep(config.MEDIA_THROTTLE_BACKOFF_S)
+        for oid in again:
+            got = _attempt(oid)
+            if got:
+                return got
+
+    # Bị bóp thì thang ứng viên chưa chạy hết -> KHÔNG được kết luận gì vĩnh
+    # viễn. Đặt TRƯỚC cả `WaitingForAuth` và `MediaDenied`: cả hai đều là kết
+    # luận về quyền, và người bị bóp là người ta chưa hỏi được câu nào.
+    if throttled:
+        raise RateLimited(
+            f"Lark bóp tần suất ({_CODE_RATE_LIMIT}) khi dò người tải được "
+            f"{meta.minute_token}: {len(throttled)} người chưa hỏi xong"
+            + (f", {len(denied)} bị từ chối" if denied else "")
+            + (f", {len(no_token)} chưa enroll" if no_token else "")
+            + (f"; lỗi khác: {'; '.join(other)}" if other else "")
+            + ". Thử lại vòng sau, KHÔNG tính lần thử.")
     if not cands or (no_token and not denied and not other):
         # Chưa ai đủ điều kiện thử. KHÔNG để queued: vòng run sẽ thử lại mỗi 5
         # phút dù chưa có gì thay đổi, rồi đốt hết MAX_ATTEMPTS. Chờ đúng sự kiện
@@ -262,6 +476,16 @@ def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Path]:
     if video.suffix.lower() in (".mp4", ".mkv", ".mov", ".webm"):
         audio = extract_audio(video)
 
+    max_db, mean_db = _volume_db(audio)
+    if max_db is not None and max_db <= _DIGITAL_SILENCE_MAX_DB:
+        try:
+            audio.unlink()
+        except OSError:
+            pass
+        raise SilentRecording(
+            f"[{jobstore.ERR_SILENT_RECORDING}] track âm thanh im lặng "
+            f"(peak {max_db:.1f} dB); không có lời nói để phiên âm")
+
     t0 = time.time()
     # Tên người dự -> initial_prompt của whisper (bias viết đúng chính tả tên).
     # Dữ liệu chuẩn có sẵn từ resolve_participants, không phải đoán từ audio méo.
@@ -285,15 +509,42 @@ def run_transcription(meta: MeetingMeta) -> tuple[Transcript, Path]:
     print(f"       transcript {t.word_count} từ, {t.duration:.0f}s audio "
           f"-> {tpath.name}")
 
+    # PROMPT VỌNG LẠI (28/08/2026). `initial_prompt` là văn bản dẫn, và whisper
+    # có thể chép thẳng nó ra khi không nghe được gì. Đo thật trên
+    # `Review định biên team MKT`: 25 phút audio -> 12 "từ", và 12 từ đó CHÍNH
+    # LÀ câu prompt ("Cuộc họp kỹ thuật bằng tiếng Việt, có xen…").
+    #
+    # Lần này nó vẫn bị bắt vì quá ngắn. Nhưng prompt dài hơn — nhiều người dự
+    # cộng thuật ngữ glossary — thì một băng câm có thể sinh ra transcript ĐỦ
+    # DÀI để pipeline coi là thành công, rồi tóm tắt, ghi Base và gửi cho người
+    # dự một biên bản dựng từ chính câu prompt của mình. Đó là bịa ra nội dung
+    # cuộc họp, loại lỗi tệ nhất mà hệ này có thể mắc.
+    # Dựng LẠI đúng hint mà `transcribe` vừa gửi đi. Không đọc lén biến của nó:
+    # cùng hàm, cùng tham số, nên hai bên không thể lệch nhau mà không ai biết.
+    hint = transcribe._prompt_hint(meta.title, names, gloss)
+    if t.word_count and _is_prompt_echo(t.text, hint):
+        print(f"       [prompt-vọng] {t.word_count} từ thu được trùng khớp "
+              f"initial_prompt — coi như KHÔNG có nội dung")
+        t.segments = []
+
     # Ghi .json xong mới kiểm, và kiểm TRƯỚC khi lưu `transcript_path`:
     # xem docstring `EmptyTranscript`.
     if t.word_count == 0:
-        # Mã `[empty_transcript]` ở đầu câu: `alerts` dùng nó để KHÔNG DM (bản
-        # ghi im lặng thì không có việc gì cho người vận hành làm), còn `qa`
-        # dùng nó để nói lý do bằng tiếng người khi có ai hỏi tới cuộc họp này.
-        raise EmptyTranscript(
-            f"[{jobstore.ERR_EMPTY_TRANSCRIPT}] "
+        # Ba đường vào `silent_recording` (bỏ job, không phiền ai): clip quá
+        # ngắn, HOẶC mean dB thấp tới mức không thể có tiếng nói. Còn lại là
+        # `empty_transcript` — audio có tiếng thật mà whisper câm, đáng gọi
+        # người. `qa` dùng cả hai mã để nói lý do bằng tiếng người khi có ai hỏi.
+        khong_co_tieng = (mean_db is not None
+                          and mean_db <= _NO_SPEECH_MEAN_DB)
+        exc_type = (SilentRecording
+                    if (t.duration <= _SHORT_EMPTY_MAX_SEC or khong_co_tieng)
+                    else EmptyTranscript)
+        err_code = (jobstore.ERR_SILENT_RECORDING
+                    if exc_type is SilentRecording else jobstore.ERR_EMPTY_TRANSCRIPT)
+        raise exc_type(
+            f"[{err_code}] "
             f"whisper chạy xong nhưng KHÔNG ra chữ nào ({t.duration:.0f}s audio, "
+            f"mean {mean_db if mean_db is not None else '?'} dB, "
             f"engine {t.engine}). Bản ghi im lặng thật, hoặc whisper đang hỏng "
             f"(sai model/VAD nuốt hết). Bằng chứng: {tpath.name}. "
             f"Nghe thử bản ghi: im lặng thật thì bỏ job này; whisper sai thì sửa "

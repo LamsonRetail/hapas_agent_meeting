@@ -399,6 +399,58 @@ def _dir_size_mb(path: Path) -> float:
     return total / 1_048_576
 
 
+def _check_live_plugin(r: Report) -> None:
+    """Bản plugin Hermes ĐANG CHẠY có khớp bản trong repo không.
+
+    Thêm 19/08/2026, sau một ca thật: `install-plugin.bat` in ra `Access is
+    denied` giữa lúc cài. Lần đó cả hai file vẫn sang được, nhưng nếu chỉ
+    `plugin.yaml` sang mà `__init__.py` thì không, ta sẽ có một hệ thống báo
+    "version 1.13.0" trong khi luật vẫn là luật cũ — và không ai biết, vì không
+    có gì so hai bản.
+
+    Cùng họ với `V2_GATE_BAT`: plugin sống ở `%LOCALAPPDATA%\hermes\plugins`,
+    NGOÀI repo, không version-control. Mọi thứ nằm ngoài repo mà hệ thống phụ
+    thuộc thì phải có một phép đo, không thì nó là điểm hỏng im lặng.
+    """
+    import hashlib
+    import os
+
+    repo = Path(__file__).resolve().parent.parent / "hermes" / "v2-enroll-gate"
+    base = os.environ.get("LOCALAPPDATA") or ""
+    if not base:
+        r.add(WARN, "plugin Hermes: không đọc được LOCALAPPDATA",
+              "không so được bản live với bản repo")
+        return
+    live = Path(base) / "hermes" / "plugins" / "v2-enroll-gate"
+    if not live.is_dir():
+        r.add(WARN, "plugin Hermes CHƯA được cài",
+              f"{live} không tồn tại — chạy hermes/install-plugin.bat")
+        return
+
+    lech = []
+    for name in ("__init__.py", "plugin.yaml"):
+        a, b = repo / name, live / name
+        if not a.is_file() or not b.is_file():
+            lech.append(f"{name}: thiếu file")
+            continue
+        ha = hashlib.sha256(a.read_bytes()).hexdigest()[:12]
+        hb = hashlib.sha256(b.read_bytes()).hexdigest()[:12]
+        if ha != hb:
+            lech.append(f"{name}: repo {ha} != live {hb}")
+    if lech:
+        r.add(WARN, "plugin Hermes LỆCH với repo",
+              "; ".join(lech) + " — chạy hermes/install-plugin.bat rồi "
+              "hermes gateway restart")
+        return
+
+    ver = ""
+    for ln in (live / "plugin.yaml").read_text(encoding="utf-8").splitlines():
+        if ln.startswith("version:"):
+            ver = ln.split(":", 1)[1].strip()
+            break
+    r.add(OK, "plugin Hermes khớp repo", f"phiên bản {ver or '?'}")
+
+
 def _check_disk(r: Report) -> None:
     work = _dir_size_mb(config.WORK_DIR)
     trans = _dir_size_mb(config.TRANSCRIPT_DIR)
@@ -474,6 +526,7 @@ def collect(*, check_relay: bool = True) -> Report:
     _check_queue(r)
     _check_disk(r)
     _check_backup(r)
+    _check_live_plugin(r)
     return r
 
 

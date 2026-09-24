@@ -23,9 +23,11 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import (alerts, backup, cards, config, db, jobstore, lark_api, meetings,
-               pipeline, summarize, tokenstore, transcribe, whisper_supervisor)
+               pipeline, summarize, telemetry, tokenstore, transcribe,
+               whisper_supervisor)
 from .models import MeetingMeta
 
 
@@ -93,6 +95,9 @@ def enqueue_minute(reader_open_id: str, minute_token: str,
     priority: 1 = cuộc mới (mặc định), 0 = backlog lúc enroll.
     notify:   gửi thẻ "họp xong" (Minute+tóm tắt) hay không. Backlog thì TẮT —
               cuộc cũ đã liệt kê trong tin chào, đừng báo "họp xong" lần nữa.
+              notify=True KHÔNG bảo đảm gửi: `config.NOTIFY_MAX_AGE_HOURS` còn
+              chần theo tuổi cuộc họp, vì người gọi ở đường quét không biết
+              mình đang nạp cuộc cũ hay cuộc vừa xong.
     """
     if not db.try_claim_minute(minute_token):
         return False                     # người/luồng khác đã chiếm
@@ -126,6 +131,19 @@ def enqueue_minute(reader_open_id: str, minute_token: str,
         # Báo NGAY khi họp xong (mô hình kéo): gửi tóm tắt Minute Lark + lời
         # mời transcript. Whisper chạy nền -> held, chờ người dự tự hỏi. Không
         # được làm hỏng enqueue: báo hỏng thì job vẫn còn, vòng sau vẫn dịch.
+        # Chần tuổi (18/08/2026, sau ca thật): đường quét đưa cuộc CŨ vào đây
+        # với notify=True — hoặc vì `SCAN_ALL_VISIBLE` vừa mở nguồn rộng, hoặc
+        # vì bản ghi cũ mới được share cho người đã enroll. Hôm đó 5 thẻ "họp
+        # xong" đã đi ra cho ba cuộc 12-13/08 lúc 18:43. Quyết ở ĐÂY vì đây là
+        # chỗ duy nhất đã biết `meta.start` thật; `scan_once` chỉ có raw item.
+        # Cuộc quá tuổi VẪN nạp và vẫn phiên âm — chỉ thôi báo "họp xong".
+        if notify and config.NOTIFY_MAX_AGE_HOURS > 0 and meta.start:
+            age_h = (_now_ms() / 1000 - meta.start) / 3600
+            if age_h > config.NOTIFY_MAX_AGE_HOURS:
+                notify = False
+                print(f"[enqueue] {minute_token}: cuộc họp {age_h:.1f}h trước "
+                      f"(quá {config.NOTIFY_MAX_AGE_HOURS}h) — nạp nhưng KHÔNG "
+                      f"gửi thẻ 'họp xong'")
         if notify:
             try:
                 _notify_minute(meta)
@@ -179,7 +197,10 @@ def _notify_minute(meta: MeetingMeta) -> None:
             ensure_ascii=False))
     except Exception as exc:                  # noqa: BLE001 — lưu recap là phụ
         print(f"[notify] {meta.minute_token} lưu recap_json hỏng (bỏ qua): {exc}")
-    card = cards.minute_notice_card(meta, recap)
+    row = jobstore.get(meta.minute_token) or {}
+    transcript_path = row.get("transcript_path") or ""
+    hapas_ready = bool(transcript_path and Path(transcript_path).is_file())
+    card = cards.minute_notice_card(meta, recap, hapas_ready=hapas_ready)
     if not config.SEND_MODE:
         print(f"[notify] (dry-run) {meta.minute_token} -> báo Minute+tóm tắt "
               f"cho {len(recips)} người")
@@ -488,11 +509,12 @@ def scan_once() -> int:
             print(f"[scan] {u['name'] or oid}: lỗi khi lấy token, bỏ qua người "
                   f"này trong vòng này: {exc}")
             continue
-        # HAI NGUỒN, cố ý tách bạch:
+        # BA NGUỒN, cố ý tách bạch (nguồn (1b) thêm 19/08/2026):
         #  (1) lọc theo chính người này -> ứng viên mà tài khoản này tìm thấy.
         #      Nó KHÔNG tự chứng minh họ có dự; Search vẫn có thể trả bản ghi
         #      được share của người khác. Quyền chỉ được ghi sau khi job metadata
         #      xác nhận owner/attendee.
+        #  (1b) lọc theo CHỦ bản ghi -> xem chú thích ở chỗ gọi. Cùng hạng (1).
         #  (2) không lọc người -> mọi minute token này MỞ XEM ĐƯỢC. Chỉ để NẠP.
         #      Cần vì Lark không xếp người ta vào `participant_ids` của mọi bản
         #      ghi họ thực sự dự: đo trên tài khoản BOD ra 5 so với 7, hai cuộc
@@ -502,6 +524,27 @@ def scan_once() -> int:
         # chia sẻ bản ghi sẽ thành "người dự" và kéo được biên bản. Đừng gộp.
         items = lark_api.minutes_list(token, start, end, oid)
         mine = {it.get("token") or it.get("minute_token") for it in items}
+        # NGUỒN (1b): lọc theo CHỦ BẢN GHI (`owner_ids`). Thêm 19/08/2026 sau khi
+        # user hỏi đúng một câu: "Chat bot Nhân sự thì chị Hiền là chủ mà?" — và
+        # đúng, chị ấy là chủ VÀ đã enroll, nhưng Lark không xếp chủ bản ghi vào
+        # `participant_ids` của chính bản ghi họ tạo, nên nguồn (1) mù hẳn với
+        # cuộc đó. Đo 8 ngày trên 22 người: (1) thấy 74, (1b) thấy 72, HỢP LẠI 80
+        # — đúng bằng danh sách không lọc, tức 6 bản ghi mà (1) bỏ sót thì (1b)
+        # vớt được HẾT và nguồn (2) không còn thêm gì.
+        #
+        # Xếp vào `mine` — cùng hạng với người dự, KHÔNG phải hạng (2) — là có cơ
+        # sở: chính Lark trả lời "bản ghi này người đó làm CHỦ" khi được hỏi theo
+        # `owner_ids`, và `enqueue_minute` còn xác minh lại `owner_open_id` từ
+        # metadata trước khi cho fallback. Khác hẳn nguồn (2), nơi "mở xem được"
+        # không nói gì về quan hệ với cuộc họp.
+        owned = [it for it in
+                 lark_api.minutes_list(token, start, end, "", owner_open_id=oid)
+                 if (it.get("token") or it.get("minute_token")) not in mine]
+        if owned:
+            print(f"[scan] {u['name'] or oid}: +{len(owned)} minute do CHÍNH họ "
+                  f"làm CHỦ (Lark không xếp họ vào danh sách người dự)")
+            mine |= {it.get("token") or it.get("minute_token") for it in owned}
+            items = items + owned
         if config.SCAN_ALL_VISIBLE:
             extra = [it for it in lark_api.minutes_list(token, start, end, "")
                      if (it.get("token") or it.get("minute_token")) not in mine]
@@ -539,6 +582,13 @@ def scan_once() -> int:
                 _note_verified_viewer(mt, oid, u.get("union_id", ""),
                                       u.get("name", ""))
     print(f"[{datetime.now():%H:%M:%S}] scan xong, {created} job mới")
+    # Mốc có timestamp đầy đủ cho heartbeat. Đặt SAU khi quét xong thật, và chỉ ở
+    # đây — xem `alerts.note_scan_ok` để biết vì sao không để heartbeat tự đoán
+    # từ log. Mốc hỏng không được làm sập vòng quét.
+    try:
+        alerts.note_scan_ok()
+    except Exception as exc:              # noqa: BLE001
+        print(f"[scan] ghi mốc scan_ok hỏng (bỏ qua): {exc}")
     return created
 
 
@@ -559,10 +609,11 @@ def scan_once() -> int:
 # Bỏ lượt chứ không xếp hàng: hai lượt liên tiếp không làm được gì hơn một lượt,
 # vì lượt đang chạy sẽ quét lại cả hàng đợi ở cuối.
 _queue_lock = threading.Lock()
+_scan_lock = threading.Lock()
 
 
 def process_queue(dry_run: bool | None = None) -> None:
-    """Xử lý job queued -> transcribe + recap -> phát ngay cho người dự."""
+    """Xử lý job queued -> transcribe + recap -> held/gửi theo yêu cầu."""
     if not _queue_lock.acquire(blocking=False):
         print("[queue] đã có một lượt xử lý đang chạy — bỏ lượt này")
         return
@@ -578,6 +629,10 @@ def _process_queue(dry_run: bool | None = None) -> None:
     for row in jobstore.active_by_priority():
         token = row["minute_token"]
         priority = int(row["priority"]) if row["priority"] is not None else 1
+        # Dọn token còn sót của bước TRƯỚC vòng lặp (`_notify_minute` lúc quét,
+        # `_backfill_recaps` cuối vòng trước) để chúng không bị tính sang cuộc
+        # này. Cặp với lời gọi `take_usage()` ở cuối thân vòng.
+        summarize.take_usage()
         # Backlog (priority 0) chỉ chạy 1 job/vòng: whisper CPU không cắt ngang
         # được, nhưng đừng ôm cả loạt backlog trong một vòng — để cuộc mới (1) và
         # cực cao (2), vốn đã đứng trước nhờ active_by_priority, luôn chạy trước.
@@ -634,6 +689,22 @@ def _process_queue(dry_run: bool | None = None) -> None:
                 print(f"[queue] {token} -> waiting_auth (không tự gửi link, không "
                       f"retry nóng): {exc}")
                 continue
+            except pipeline.RateLimited as exc:
+                # Lark bóp tần suất giữa thang ứng viên: hạ tầng, không phải lỗi
+                # cuộc họp này. Cùng cách xử với `TranscribeUnavailable` — trả
+                # lại lần thử, giữ `queued`. PHẢI bắt TRƯỚC `MediaDenied` và
+                # `except Exception`: cả hai đều là PipelineError, và chính việc
+                # rơi xuống nhánh chung đã biến job 08-17 (56 người) thành
+                # `failed` vĩnh viễn hôm 18/08 trong khi đúng ra nó chỉ cần chủ
+                # bản ghi enroll.
+                if dry_run:
+                    print(f"[queue] {token} (dry-run) Lark bóp tần suất: {exc}")
+                    continue
+                jobstore.unbump_attempts(token)
+                jobstore.set_status(token, "queued", error=str(exc))
+                print(f"[queue] {token} Lark bóp tần suất — KHÔNG tính lần thử "
+                      f"(attempts giữ {attempts - 1}): {exc}")
+                continue
             except pipeline.MediaDenied as exc:
                 # Ngược hẳn với hai nhánh dưới: cái này KHÔNG tự khỏi. Không ai
                 # được phép tải bản ghi thì vòng sau, và vòng sau nữa, vẫn vậy.
@@ -649,6 +720,17 @@ def _process_queue(dry_run: bool | None = None) -> None:
                 print(f"[queue] {token} KHÔNG tải được bản ghi (quyền) — "
                       f"đánh failed NGAY, không thử lại: {exc}")
                 continue
+            except pipeline.SilentRecording as exc:
+                # Recording im lặng số, hoặc clip <=60s không có lời nào. Đây
+                # không phải job hỏng và retry cũng không thể tạo ra nội dung.
+                if dry_run:
+                    print(f"[queue] {token} (dry-run) recording KHÔNG có lời "
+                          f"nói — lần chạy THẬT sẽ discard: {exc}")
+                    continue
+                jobstore.set_status(token, "discarded", error=str(exc))
+                print(f"[queue] {token} recording KHÔNG có lời nói — discarded: "
+                      f"{exc}")
+                continue
             except pipeline.EmptyTranscript as exc:
                 # Cùng lý lẽ với MediaDenied ngay trên: KHÔNG tự khỏi, nên dừng
                 # NGAY thay vì đốt 5 lần thử rồi báo "quá 5 lần thử". Khác chỗ
@@ -656,7 +738,7 @@ def _process_queue(dry_run: bool | None = None) -> None:
                 # không tồn tại và job đi tiếp thành `delivered` — người dự nhận
                 # một thẻ tóm tắt "Bản ghi trống" mà không có transcript, còn
                 # mọi bảng trạng thái đều báo thành công.
-                # `failed` là thứ `alerts._check_failed_jobs` nhìn thấy -> có DM.
+                # Audio dài/có tín hiệu mà 0 chữ vẫn là lỗi cần điều tra -> DM.
                 if dry_run:
                     print(f"[queue] {token} (dry-run) transcript RỖNG — lần chạy "
                           f"THẬT sẽ đánh failed ngay: {exc}")
@@ -737,6 +819,26 @@ def _process_queue(dry_run: bool | None = None) -> None:
         #     leo lên digest như "gặp 2 cuộc", tức hỏng đúng cái nó sinh ra để chặn.
         if config.GLOSSARY_ENABLED and not dry_run and not done:
             _collect_glossary(t, meta)
+
+        # Báo "đã xử lý xong một lượt" về LSR Agent Platform (AG-MEETINGNOTE).
+        # Đặt CUỐI thân vòng chứ không sau `_deliver_requested`: luồng rẽ hai
+        # nhánh (gửi cho người đã hỏi / giữ `held` chờ người hỏi), nên không có
+        # một "điểm đã gửi xong" duy nhất — chỉ có điểm ĐÃ XỬ LÝ XONG, là đây.
+        #
+        # Chỉ dùng `token` và `priority`: hai biến gán ở đầu thân vòng nên chắc
+        # chắn tồn tại ở mọi nhánh tới được đây. Đừng thêm biến của nhánh con
+        # vào (vd `sent`/`failed` — chúng KHÔNG tồn tại ở đây): sai kiểu đó là
+        # NameError lúc chạy, mà `import` vẫn OK, nên nó chỉ lộ ra khi có cuộc
+        # họp thật và vòng `:loop` của run-v2-auto.bat sẽ chết đi chết lại.
+        #
+        # Mặc định TẮT (V2_TELEMETRY=0). Bật rồi cũng không chặn (thread daemon)
+        # và không ném. Chỉ metadata, KHÔNG có nội dung biên bản.
+        # Xem docs/LSR_PLATFORM.md.
+        if not dry_run:
+            telemetry.send(task_id=token[:12],
+                           summary=f"priority={priority} processed",
+                           llm_calls=summarize.take_usage(),
+                           tool_calls=[{"ok": True, "name": "whisper"}])
 
     if not dry_run:
         # Recap TRƯỚC Base: `_backfill_recaps` sửa recap trong DB, và
@@ -822,10 +924,23 @@ def _backfill_recaps() -> None:
     rồi; gửi thêm một thẻ nữa cho cùng cuộc họp là tin rác, và "phát" là hành
     động hướng ra ngoài nên không nên tự động lặp. Ở đây chỉ sửa thứ đọc lại
     được: recap trong DB và ô tóm tắt trên Base — đúng cái bot dùng để trả lời.
+
+    QUÉT CẢ `held` (sửa 27/08/2026). Hàm này viết 02/08, khi luồng kết thúc ở
+    `delivered`. Mô hình KÉO (03/08) đổi trạng thái cuối thành `held` — chờ
+    người dự hỏi — mà không ai sửa lại chỗ này. Hệ quả đo được ngày 27/08:
+    **7 cuộc có transcript mà tóm tắt rỗng, tất cả đều `held`**, tức đường tự
+    vá chưa từng nhìn thấy chúng; cũ nhất từ 16/07. Ba cuộc hỏng vì Codex hôm
+    26/08 cũng nằm đúng nhóm này và phải sửa tay.
+
+    Bài học ghi lại: khi đổi trạng thái CUỐI của một luồng, phải đi soát mọi
+    chỗ đang lọc theo trạng thái cũ — chúng không gãy, chúng im lặng ngừng chạy.
     """
     from . import bitable, summarize
     done = 0
-    for row in jobstore.by_status("delivered"):
+    # `held` trước: đó là trạng thái cuối của mô hình kéo, nên phần lớn nợ nằm
+    # ở đấy. `delivered` vẫn phải quét — job cũ trước 03/08 dừng ở đó.
+    rows = list(jobstore.by_status("held")) + list(jobstore.by_status("delivered"))
+    for row in rows:
         if done >= BACKFILL_RECAPS_PER_ROUND:
             return
         if not row.get("transcript_path"):
@@ -853,11 +968,18 @@ def _backfill_recaps() -> None:
             continue                       # LLM trả rỗng: không phải lỗi hạ tầng
         done += 1
         jobstore.reset_recap_fails(token)
-        # `run_recap` đặt status='recapping' — trả lại `delivered`, nếu không
-        # thì vòng SAU sẽ nhặt job này lên và PHÁT LẠI cho tất cả người dự.
-        jobstore.set_status(token, "delivered", delivered_at=row.get("delivered_at"))
+        # `run_recap` đặt status='recapping' — TRẢ LẠI ĐÚNG trạng thái cũ, nếu
+        # không thì vòng SAU sẽ nhặt job này lên và PHÁT LẠI cho tất cả người
+        # dự. Trả về CHÍNH trạng thái nó đang có (`held` hay `delivered`), kèm
+        # đúng cột thời gian của trạng thái đó — đặt nhầm `held` thành
+        # `delivered` là nói dối rằng đã phát, và ngược lại là phát lần hai.
+        was = row["status"]
+        stamp = ({"delivered_at": row.get("delivered_at")} if was == "delivered"
+                 else {"transcribed_at": row.get("transcribed_at")})
+        jobstore.set_status(token, was, **stamp)
         print(f"[recap] {token} ({meta.title!r}) đã có tóm tắt thật sau khi "
-              f"LLM sống lại — người dự KHÔNG nhận thêm tin, chỉ Base đổi")
+              f"LLM sống lại — người dự KHÔNG nhận thêm tin, chỉ Base đổi "
+              f"(giữ nguyên trạng thái {was})")
         bitable.update_recap(token, new)
 
 
@@ -1009,6 +1131,132 @@ _SOURCE_RESOLVED = ("calendar[verified]", "calendar[title]")
 
 def _needs_reresolve(source: str) -> bool:
     return not (source or "").startswith(_SOURCE_RESOLVED)
+
+
+def reresolve_stale(days: int = 30, *, dry_run: bool = True) -> tuple[int, int, int]:
+    """Tra lại người dự cho job cũ chưa tra được. Trả (đã xét, tra ra, thêm người).
+
+    KHÔNG GỬI GÌ CHO AI (user chốt 28/08/2026). Đây là sửa DỮ LIỆU: job cũ
+    đang mang danh sách sai nên bot trả lời sai khi có người hỏi, và ACL của
+    chính họ cũng sai. Việc "gửi bù cho người lẽ ra phải nhận" là quyết định
+    khác hẳn — 36+ cuộc nhân vài chục người, tức một loạt thông báo về các
+    cuộc đã cũ — và user đã chốt KHÔNG làm.
+
+    Vì sao cần (28/08/2026): bản vá sự kiện lặp chỉ áp cho cuộc TỪ GIỜ. Đo
+    trên DB: 94/489 job đang ở `fallback:owner`, tức chỉ chủ bản ghi có tên.
+    Không có lệnh này thì chúng mang danh sách một-người vĩnh viễn.
+
+    `_maybe_reresolve` lo phần khó: chạy trên bản sao, chỉ ghi khi tra RA
+    được, giữ nguyên meta cũ khi hỏng. Ở đây chỉ chọn job và đếm.
+    """
+    cut = _now_ms() - max(1, days) * 86_400_000
+    seen = fixed = gained = 0
+    for row in jobstore.all_jobs():
+        start = float(row.get("start_ts") or 0)
+        if start and start < 1e11:
+            start *= 1000
+        if not start or start < cut:
+            continue
+        try:
+            meta = jobstore.meta_from_json(row["meta_json"])
+        except Exception as exc:              # noqa: BLE001
+            print(f"[reresolve] {row['minute_token']} meta_json méo: {exc}")
+            continue
+        if not _needs_reresolve(meta.participants_source):
+            continue
+        seen += 1
+        before = len(meta.attendees)
+        print(f"[reresolve] ({seen}) {meta.minute_token} {meta.title[:40]!r} "
+              f"— đang có {before} người, nguồn {meta.participants_source!r}",
+              flush=True)
+        fresh = _maybe_reresolve(meta, dry_run=dry_run)
+        if _needs_reresolve(fresh.participants_source):
+            continue
+        fixed += 1
+        gained += max(0, len(fresh.attendees) - before)
+    return seen, fixed, gained
+
+
+def backfill_invited_chats(days: int = 14, *,
+                           dry_run: bool = True) -> tuple[int, int, int]:
+    """Nạp bù `meta.invited_chats` cho job cũ. Trả (đã xét, tra được, đã ghi).
+
+    Vì sao cần (27/08/2026): `invited_chats` chỉ bắt đầu được ghi từ trưa nay,
+    nên mọi cuộc trước đó không có trường này — kể cả `CĐS: Training`, cuộc mà
+    chính nhóm `Digital Transformation Chat` được mời. Không nạp bù thì đường
+    hỏi đáp trong nhóm (giới hạn theo `chat_id`) sẽ trả về rỗng cho gần như mọi
+    câu hỏi, tức bật lên cũng vô dụng.
+
+    CHỈ GHI ĐÚNG MỘT TRƯỜNG. `resolve_participants` sửa meta TẠI CHỖ và xoá
+    trắng `attendees` khi tra thất bại, nên nó chạy trên BẢN SAO và ta chỉ bốc
+    `invited_chats` ra — `attendees` cùng `participants_source` của job giữ
+    nguyên tuyệt đối. Đây không phải chỗ để tra lại người dự: việc đó là của
+    `_maybe_reresolve`, có luật riêng và chạy đúng lúc trước khi phát. Trộn hai
+    việc vào đây là một lệnh "nạp bù nhóm" âm thầm đổi danh sách người nhận.
+
+    Không tra được thì BỎ QUA, không ghi gì — cuộc không mời nhóm nào và cuộc
+    tra hỏng đều cho `invited_chats` rỗng, nên ghi bừa là xoá mất khác biệt đó.
+    """
+    cut = _now_ms() - max(1, days) * 86_400_000
+    seen = found = written = 0
+    for row in jobstore.all_jobs():
+        # `jobs.start_ts` là MILI GIÂY (khác `meta.start`, vốn là giây). Bản đầu
+        # nhân thêm 1000 nên mọi mốc thành năm 58xxx, lớn hơn mọi `cut` — bộ lọc
+        # ngày IM LẶNG không lọc gì, `--days 2` quét sạch 485 cuộc. Nhận cả hai
+        # đơn vị để lần sau đổi kiểu dữ liệu cũng không hỏng âm thầm.
+        start = float(row.get("start_ts") or 0)
+        if start and start < 1e11:          # ai đó lưu bằng giây
+            start *= 1000
+        if not start or start < cut:
+            continue
+        try:
+            meta = jobstore.meta_from_json(row["meta_json"])
+        except Exception as exc:              # noqa: BLE001 — job cũ méo dữ liệu
+            print(f"[chats] {row['minute_token']} meta_json méo, bỏ qua: {exc}")
+            continue
+        if meta.invited_chats:
+            continue                          # đã có, không tra lại cho tốn API
+        seen += 1
+        # In TỪNG cuộc, kể cả cuộc không có nhóm. Bản đầu chỉ in khi TÌM THẤY,
+        # và một lượt 14 ngày mất >17 phút không nhả một dòng nào — nhìn y hệt
+        # treo. Mỗi cuộc ở đây là một chuỗi hàng chục lời gọi Lark (đọc lịch,
+        # người dự, có khi cả VC), nên im lặng là kiểu hỏng đắt nhất: người vận
+        # hành không biết nên chờ hay nên giết.
+        print(f"[chats] ({seen}) {meta.minute_token} {meta.title[:40]!r} …",
+              flush=True)
+        fresh = jobstore.meta_from_json(jobstore.meta_to_json(meta))
+        tried = 0
+        for oid in pipeline._reader_candidates(meta):
+            if tried >= RERESOLVE_MAX_READERS:
+                break
+            try:
+                token = tokenstore.get_access_token(oid)
+            except tokenstore.TokenError:
+                continue                      # chưa enroll / token chết
+            tried += 1
+            try:
+                meetings.resolve_participants(token, fresh)
+            except Exception as exc:          # noqa: BLE001
+                print(f"[chats] {meta.minute_token} tra lịch hỏng: {exc}")
+                continue
+            if fresh.invited_chats:
+                break
+        if not fresh.invited_chats:
+            print(f"        không mời nhóm nào (hoặc không tra được lịch)",
+                  flush=True)
+            continue
+        found += 1
+        names = ", ".join(fresh.invited_chats)
+        if dry_run:
+            print(f"[chats] (thử khô) {meta.minute_token} {meta.title!r} "
+                  f"-> {names}")
+            continue
+        # Ghi ĐÚNG một trường vào meta GỐC, không phải bản sao đã bị tra lại.
+        meta.invited_chats = list(fresh.invited_chats)
+        jobstore.update_meta(meta.minute_token, meta)
+        written += 1
+        print(f"[chats] {meta.minute_token} {meta.title!r} -> {names}")
+    return seen, found, written
 
 
 def _maybe_reresolve(meta: MeetingMeta, *, dry_run: bool) -> MeetingMeta:
@@ -1354,6 +1602,47 @@ def _start_heartbeat() -> None:
           "không ai được báo")
 
 
+def _scan_cycle() -> int | None:
+    """Quét một lượt, không cho scanner nền và vòng chính chạy chồng nhau.
+
+    `process_queue()` có thể bận hàng giờ khi vừa nạp nhiều recording dài. Trước
+    13/08/2026, quét nằm cùng thread và chỉ chạy lại SAU khi xử lý hết snapshot
+    hàng đợi; đo live có lúc `scan=122m`, nên cuộc mới không vào DB và thẻ
+    Meeting Note không thể tự gửi. Hàm này được cả vòng chính lẫn watcher gọi;
+    khóa không-chờ giữ đúng một scanner.
+    """
+    if config.PAUSED:
+        return None
+    if not _scan_lock.acquire(blocking=False):
+        return None
+    try:
+        whisper_supervisor.ensure_running()
+        found = scan_once()
+        # Giữ lời hứa Base thấy cuộc mới ngay, không phải đợi hàng đợi dài xong.
+        _backfill_base()
+        return found
+    finally:
+        _scan_lock.release()
+
+
+def _scan_watch(stop_event: threading.Event) -> None:
+    """Quét định kỳ ở thread riêng trong lúc worker đang phiên âm."""
+    while not stop_event.wait(max(1.0, float(config.POLL_INTERVAL))):
+        try:
+            config.reload_switches()
+            _scan_cycle()
+        except Exception as exc:             # noqa: BLE001 — watcher phải sống
+            print(f"[scan] lượt quét nền hỏng (vòng sau thử lại): {exc}")
+
+
+def _start_scan_watch() -> threading.Event:
+    """Bật scanner nền daemon; trả event để self-test/chủ tiến trình có thể dừng."""
+    stop = threading.Event()
+    threading.Thread(target=_scan_watch, args=(stop,), daemon=True,
+                     name="v2-scan-watch").start()
+    return stop
+
+
 def run() -> None:
     db.init()
     config.ensure_dirs()
@@ -1403,6 +1692,8 @@ def run() -> None:
         print("[backup] TẮT (V2_BACKUP_EVERY_HOURS=0) — mất state.db là mất cả "
               "token lẫn phân quyền hỏi đáp")
 
+    _start_scan_watch()
+
     while True:
         # Công tắc dừng khẩn: đọc lại .env MỖI VÒNG. Trước 31/07/2026 dòng này
         # không tồn tại, nên `PAUSED=1` chỉ ăn khi khởi động lại tiến trình —
@@ -1432,20 +1723,10 @@ def run() -> None:
 
         try:
             if not config.PAUSED:
-                # Wrapper cũ chỉ bật Whisper đúng lúc khởi động; nó rớt giữa
-                # chừng thì orchestrator vẫn sống và job nằm chờ vô hạn. Chạy
-                # supervisor mỗi vòng, trước queue. Hàm này fail-safe: không
-                # ném, không kill process sống và không spawn cho URL từ xa.
-                whisper_supervisor.ensure_running()
-                scan_once()
-                # Đẩy cuộc VỪA phát hiện lên Base NGAY, trước khi vào hàng đợi
-                # (sửa 04/08/2026). Trước đó Base chỉ được cập nhật ở CUỐI
-                # `_process_queue`, mà một cuộc họp 3,8 giờ nuốt cả lượt xử lý
-                # ~35 phút — trong suốt thời gian đó mọi cuộc mới phát hiện
-                # không có dòng nào trên Base, người vận hành nhìn vào tưởng
-                # quét sót. Rẻ khi không có gì đổi: job đã có record thì bỏ qua,
-                # `sync_jobs` chỉ ghi record lệch.
-                _backfill_base()
+                # Scanner nền vẫn quét trong lúc `process_queue` bận; lời gọi
+                # này bảo đảm lượt đầu chạy ngay khi khởi động. Khóa trong
+                # `_scan_cycle` ngăn hai lượt chồng nhau.
+                _scan_cycle()
                 process_queue()
         except KeyboardInterrupt:
             print("\nDừng.")

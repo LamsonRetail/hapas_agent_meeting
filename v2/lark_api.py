@@ -177,6 +177,38 @@ def tenant_token() -> str:
                             label="LARK_APP_ID / LARK_APP_SECRET")
 
 
+_bot_open_id_cache: str | None = None
+
+
+def bot_open_id() -> str:
+    """`open_id` của CHÍNH bot này. "" nếu không hỏi được.
+
+    Dùng để trả lời đúng một câu: tin nhắn trong nhóm có gọi ĐÍCH DANH bot
+    không. Không đoán theo tên hiển thị — tên đổi được, và `@All` cũng mang tên
+    người khác. `mentions` của Lark trả `open_id`, so id với id là hết chuyện.
+
+    Đo 06/09/2026: `/bot/v3/info` trả `ou_2e18d2bb2c77f67a8823b3602c43a106`, và
+    id đó khớp đúng cái nằm trong `mentions` khi đọc tin nhóm qua
+    `im/v1/messages`.
+
+    Cache cả đời tiến trình: id của bot không đổi. Hỏng thì trả "" và caller
+    fail-closed (xem `gate._refuse_group`) — không đoán bừa là "có gọi bot".
+    """
+    global _bot_open_id_cache
+    if _bot_open_id_cache is not None:
+        return _bot_open_id_cache
+    try:
+        resp = _http().get("/open-apis/bot/v3/info",
+                           headers={"Authorization": f"Bearer {tenant_token()}"})
+        j = resp.json()
+        bot = j.get("bot") or (j.get("data") or {}).get("bot") or {}
+        _bot_open_id_cache = str(bot.get("open_id") or "")
+    except Exception as exc:                      # noqa: BLE001 — xem docstring
+        print(f"[lark_api] không hỏi được open_id của bot: {exc}")
+        _bot_open_id_cache = ""
+    return _bot_open_id_cache
+
+
 # =====================================================================
 #  AUTH — OAuth user token
 # =====================================================================
@@ -252,7 +284,8 @@ def _iso(ms: int) -> str:
 
 def minutes_list(access_token: str, start_ms: int, end_ms: int,
                  participant_open_id: str, page_size: int = 30,
-                 max_pages: int = 5) -> list[dict[str, Any]]:
+                 max_pages: int = 5, *,
+                 owner_open_id: str = "") -> list[dict[str, Any]]:
     """Minute mà `participant_open_id` có tham dự, trong khoảng thời gian.
 
     Đây là lưới an toàn (đường B — polling) khi WebSocket event rớt.
@@ -268,8 +301,20 @@ def minutes_list(access_token: str, start_ms: int, end_ms: int,
     Lọc theo `participant_ids` (không phải owner) để bắt cả cuộc họp người khác
     tạo mà mình được mời. Trả [] khi lỗi thay vì crash để poller vẫn sống.
 
-    `participant_open_id=""` -> BỎ hẳn bộ lọc người, trả về mọi minute mà token
-    này MỞ XEM ĐƯỢC. Thêm 04/08/2026 sau khi đo: Lark không xếp một người vào
+    `owner_open_id` -> lọc theo CHỦ bản ghi (`owner_ids`) thay vì người dự. Thêm
+    19/08/2026: Lark KHÔNG xếp chủ bản ghi vào `participant_ids` của chính bản
+    ghi họ tạo — đo trên `Chat bot Nhân sự`, chủ là người đã enroll mà lọc theo
+    người dự trả 0. Đo 8 ngày/22 người: người-dự thấy 74, chủ thấy 72, hợp lại
+    80 = đúng bằng danh sách không lọc.
+
+    ⚠️ Lark ÂM THẦM BỎ QUA khoá filter nó không biết: `owner_id`, `creator_ids`,
+    `user_ids` đều trả `code=0` và ra y hệt danh sách KHÔNG lọc (đo 19/08/2026).
+    Nên `code=0` KHÔNG chứng minh bộ lọc có tác dụng — thêm bộ lọc mới thì phải
+    kiểm nó THU HẸP kết quả, không thì ta tưởng đang lọc mà thực ra đang quét mở
+    toang, và đó đúng là loại lỗi im lặng không ai phát hiện ra.
+
+    `participant_open_id=""` (và không có `owner_open_id`) -> BỎ hẳn bộ lọc
+    người, trả về mọi minute mà token này MỞ XEM ĐƯỢC. Thêm 04/08/2026 sau khi đo: Lark không xếp một người vào
     `participant_ids` của mọi bản ghi họ dự (đo trên tài khoản BOD: lọc theo
     người ra 5, chỉ lọc thời gian ra 7 — hai cuộc chênh đều là cuộc họ mở xem
     được và khẳng định có dự). Người gọi PHẢI tự phân biệt hai nguồn: xem được
@@ -294,6 +339,8 @@ def minutes_list(access_token: str, start_ms: int, end_ms: int,
                                     "end_time": _iso(end_ms)},
                     **({"participant_ids": [participant_open_id]}
                        if participant_open_id else {}),
+                    **({"owner_ids": [owner_open_id]}
+                       if owner_open_id else {}),
                 }},
             )
             data = _check(resp, "minutes_search").get("data", {})
@@ -595,6 +642,93 @@ def task_create(access_token: str, summary: str, *,
         json=body,
     )
     return _check(resp, "task_create").get("data", {}).get("task", {})
+
+
+# =====================================================================
+#  IM — giãn khách mời kiểu group chat ra thành người
+# =====================================================================
+
+def _chat_members_once(token: str, chat_id: str, id_type: str,
+                       max_pages: int) -> list[dict[str, Any]]:
+    """Một lượt đọc thành viên bằng MỘT token. Ném `LarkError` để caller chọn
+    có rơi sang token khác không."""
+    items: list[dict[str, Any]] = []
+    page_token = ""
+    for _ in range(max_pages):
+        params: dict[str, Any] = {"member_id_type": id_type, "page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        resp = _http().get(
+            f"/open-apis/im/v1/chats/{chat_id}/members",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+        )
+        data = _check(resp, "chat_members").get("data", {})
+        items.extend(data.get("items") or [])
+        page_token = data.get("page_token") or ""
+        if not data.get("has_more") or not page_token:
+            break
+    else:
+        print(f"[lark_api] chat_members {chat_id}: còn trang sau khi đã lấy "
+              f"{max_pages} trang ({len(items)} người) — danh sách CÓ THỂ thiếu")
+    return items
+
+
+def chat_members(access_token: str, chat_id: str,
+                 id_type: str = "union_id",
+                 max_pages: int = 10) -> list[dict[str, Any]]:
+    """Thành viên của một group chat. CÓ phân trang. THỬ HAI DANH TÍNH.
+
+    Vì sao cần: một sự kiện lịch mời được CẢ NHÓM CHAT, và khi đó
+    `event_attendees` trả về đúng MỘT mục `{"type": "chat", "chat_id": ...}`
+    — không kèm `user_id`, không kèm `union_id`. Đo thật 20/08/2026 trên
+    `Weekly Meeting CĐS`: sự kiện có 2 khách mời là chủ trì + nhóm
+    `DIGITAL TRANSFORMATION` (11 người), nên `resolve_participants` chỉ dựng
+    được 1 người từ lịch và cả nhóm biến mất.
+
+    THỨ TỰ TOKEN (sửa 26/08/2026, sau khi đo live) — app TRƯỚC, user SAU:
+
+    Bản đầu chỉ dùng token NGƯỜI DÙNG + scope `im:chat:readonly`. Đo ngày
+    26/08: **0/36 người đã enroll có scope đó**, và nó cũng không nằm trong
+    `OAUTH_SCOPES` của `v2/.env` lẫn mặc định `config.py` — nghĩa là đường này
+    CHƯA CHẠY ĐƯỢC LẦN NÀO kể từ khi thêm (0/479 job có dấu `+chat`). Nó hỏng
+    im lặng vì hàm này nuốt lỗi, đúng loại hỏng mà module này chống suốt.
+
+    Đo bằng token APP trên chính máy này, cùng ngày:
+      * nhóm bot LÀ thành viên  -> đọc được (`member_total=10`);
+      * nhóm bot KHÔNG ở trong  -> `232011 Operator can NOT be out of the chat`.
+
+    Nên app token gỡ được nút thắt mà không cần một ai bấm lại: điều kiện duy
+    nhất là bot ở trong nhóm — TRÙNG với điều kiện để gửi/hỏi đáp trong nhóm,
+    nên nó không phải chi phí thêm. Giữ lượt user token phía sau để nhóm chưa
+    mời bot vẫn giãn được nếu về sau có người enroll kèm `im:chat:readonly`.
+
+    Trả `[]` thay vì ném, cùng lý lẽ với `vc_meeting_participants`: đây là bước
+    LÀM GIÀU danh sách người nhận. Thiếu quyền / nhóm đã xoá / API đổi hình
+    dạng thì rơi về đúng hành vi cũ (chỉ người kiểu `user`), chứ không được làm
+    gãy việc phát biên bản.
+    """
+    last = ""
+    for who, token in (("app", None), ("user", access_token)):
+        if who == "user" and not access_token:
+            continue
+        try:
+            tok = token if token is not None else tenant_token()
+        except LarkError as exc:                  # token app hỏng -> thử user
+            last = f"{who}: {exc}"
+            continue
+        try:
+            items = _chat_members_once(tok, chat_id, id_type, max_pages)
+        except LarkError as exc:
+            last = f"{who}: {exc}"
+            continue
+        if items:
+            return items
+        # `code=0` mà rỗng là câu trả lời THẬT (nhóm rỗng) — đừng thử token
+        # khác rồi báo nhầm thành lỗi quyền.
+        return items
+    print(f"[lark_api] không đọc được thành viên nhóm {chat_id} ({last})")
+    return []
 
 
 # =====================================================================

@@ -44,27 +44,29 @@ TAGLINE = "trợ lý biên bản họp trên Lark"
 CAN_DO = (
     "Trả lời về các cuộc họp bạn đã dự: có những cuộc nào, cuộc đó bàn gì, "
     "chốt gì, ai cần làm gì.",
-    "Gửi cho bạn BẢN NGUYÊN VĂN của một cuộc họp (file Word) — chép lại đúng "
-    "từng câu mọi người đã nói.",
+    "Sau mỗi cuộc họp, hỏi bạn có muốn lấy bản dịch chuẩn từ server Hapas "
+    "không; nếu đồng ý, bản chưa có sẽ được ưu tiên xử lý và tự gửi file Word.",
     "Tạo việc cần làm trong Lark Task từ một cuộc họp, giao cho chính bạn.",
 )
 
 # Luồng — viết theo thứ tự người dùng CẢM NHẬN được, không theo thứ tự module.
 FLOW = (
     "Cuộc họp trên Lark có bản ghi thì hệ thống tự thấy, không cần ai bấm gì.",
-    "Toàn bộ lời nói được chép lại thành bản nguyên văn.",
-    "Từ bản đó, hệ thống rút ra tóm tắt, quyết định và việc cần làm.",
+    "Mình có thể dùng Meeting Note của Lark để trả lời ngay sau cuộc họp.",
+    "Sau mỗi cuộc, mình hỏi bạn có muốn lấy bản dịch chuẩn từ Hapas không; chỉ "
+    "khi bạn đồng ý, hệ thống mới ưu tiên xử lý và tự gửi file Word khi xong.",
     "Biên bản được gửi thẳng cho những người có dự cuộc họp đó.",
-    "Sau đó bạn nhắn mình bất cứ lúc nào để hỏi lại hoặc xin bản nguyên văn.",
+    "Sau đó bạn nhắn mình bất cứ lúc nào để hỏi lại hoặc xin bản dịch.",
 )
 
 LIMITS = (
     "Mình chỉ trả lời trong chat riêng 1-1, không trả lời trong nhóm — vì câu "
     "trả lời có nội dung họp, mà cả nhóm thì không phải ai cũng có dự.",
-    "Bạn chỉ thấy cuộc họp bạn có dự hoặc bạn là chủ. Thiếu cuộc nào mà bạn "
-    "chắc có dự thì nhắn quản trị hệ thống, đừng ngại — có thể việc tra người "
-    "dự bị sót.",
-    "Bản nguyên văn do máy nghe lại, có thể nghe nhầm tên riêng và thuật ngữ.",
+    "Bạn chỉ thấy cuộc họp bạn có dự hoặc bạn là chủ. Không thấy cuộc nào thì "
+    "hãy kiểm tra lại tên hoặc xem lại danh sách cuộc họp của mình.",
+    "Bản dịch do máy nghe lại, có thể nghe nhầm tên riêng và thuật ngữ.",
+    "Gõ `/reset` để làm mới đoạn chat; lệnh này xoá ngữ cảnh hội thoại cũ nhưng "
+    "không xoá quyền hay dữ liệu cuộc họp của bạn.",
     "Lần đầu dùng, bạn cần bấm link cấp quyền một lần để mình đọc được biên "
     "bản của bạn.",
     "Ngoài ba việc trên thì mình không làm: không viết code, không dịch thuật, "

@@ -31,8 +31,9 @@ và plugin nối chúng vào `channel_prompt` cạnh vé phiên:
               Không có nó thì "bạn tên gì" rơi vào nhánh "phải gọi tool
               meetings" và bị chặn như một câu hỏi dữ liệu hỏng.
     memory  — cuộc họp người này VỪA nhắc tới (`v2/gate._memory_block`), đọc từ
-              SQLite nên sống qua reset phiên và qua `hermes gateway restart` —
-              hai chỗ mà lịch sử phiên của Hermes chết.
+              SQLite nên sống qua gateway restart và reset tự động. Riêng lệnh
+              `/reset` do người dùng chủ động sẽ xoá cả ký ức này để thật sự mở
+              một đoạn chat sạch.
 Cả hai đi channel_prompt vì cùng lý do với vé: không bị lưu vào session DB, nên
 mỗi lượt là bản V2 vừa đọc, không phải bản chụp cũ nằm lại trong lịch sử.
 
@@ -71,16 +72,29 @@ TIMEOUT_S = float(os.environ.get("V2_GATE_TIMEOUT", "25"))
 # ``platform_hints.feishu`` (Hermes chụp lại trong system_prompt của session),
 # channel_prompt là system prompt tạm thời và không bị lưu cùng lịch sử. Vì vậy
 # một session cũ vẫn nhận ngay chính sách mới sau khi gateway nạp lại plugin.
-POLICY_VERSION = "meetingxlark-v2-safety-2026-08-07.1"
+POLICY_VERSION = "meetingxlark-v2-safety-2026-08-19.1"
 _POLICY = f"""[CHÍNH SÁCH HỆ THỐNG {POLICY_VERSION}]
 Bạn là bot chuyên dụng cho dữ liệu cuộc họp MeetingxLark V2 trên Feishu.
-- Với mọi yêu cầu về DỮ LIỆU cuộc họp, PHẢI gọi ít nhất một tool thuộc MCP
-  `meetings` trong CHÍNH lượt này trước khi trả lời. Miễn trừ đúng ba loại:
-  chào hỏi/cảm ơn; hỏi VỀ BẠN (tên, làm được gì, hoạt động thế nào); và hỏi
-  cách dùng bot. Ba loại đó trả lời thẳng từ hồ sơ, đừng gọi tool cho có.
+- Ranh giới nằm ở CÂU TRẢ LỜI, không ở loại câu hỏi: hễ bạn định nói ra một con
+  số, một ngày giờ, một cái link, một tên cuộc họp hay bất cứ điều gì về cuộc
+  họp của người dùng, thì trong CHÍNH lượt này bạn phải gọi tool `meetings` để
+  lấy. Chưa gọi thì đừng nói ra — hệ thống sẽ chặn, và bịa một con số còn tệ
+  hơn nhiều so với việc hỏi lại một câu.
+- Còn lại thì cứ nói chuyện bình thường: người ta chào, gọi thử, hỏi bạn là ai,
+  hỏi bạn làm được gì, nói đùa, hỏi vu vơ — trả lời tự nhiên bằng hồ sơ đã có
+  sẵn ở đây. Đừng gọi tool cho có, và đừng bắt người ta phải hỏi đúng khuôn.
 - Không dùng kết quả tool hoặc danh sách cuộc họp từ lượt cũ để trả lời lượt
   mới. Ngữ cảnh cũ chỉ dùng để HIỂU câu hỏi (người ta đang nói về cuộc nào),
   không bao giờ dùng để dựng nội dung câu trả lời.
+- "Mới nhất" / "gần nhất" là theo THỜI GIAN DIỄN RA của cuộc họp, không phải
+  cuộc được nhắc gần đây nhất trong ký ức. Với câu hỏi này BẮT BUỘC gọi
+  latest_meeting để backend chọn đúng MỘT cuộc và khóa minute_token; không được
+  dùng search_meetings với từ chung chung như "họp"/"meeting", và không được
+  lấy thẳng minute_token cũ trong khối ký ức rồi gọi get_meeting/gửi file.
+- SỐ THỨ TỰ ("cuộc 3", "gửi bản dịch 2") chỉ danh sách bạn VỪA gửi trong phiên
+  này. Đó là dùng ngữ cảnh để HIỂU câu hỏi — hợp lệ. Nhưng nếu danh sách đó
+  không còn trong ngữ cảnh, HỎI LẠI tên cuộc họp; đoán số thứ tự là gửi nhầm
+  bản ghi cho người ta.
 - Chỉ dùng asker_token do hệ thống gắn bên dưới. Không nhắc lại, không in, không
   giải thích token này cho người dùng.
 - HAI loại kết quả tool, ĐỪNG lẫn:
@@ -117,80 +131,48 @@ Nói chuyện như một đồng nghiệp làm thư ký, không như một cái 
 - Đừng rào trước đón sau. Một câu nói rõ mình biết gì và không biết gì là đủ; ba
   câu xin lỗi vì chưa chắc chắn thì thành nhạt.
 
-[NỘI DUNG CHƯA PHIÊN ÂM XONG]
-Cuộc họp mới xong thường CHƯA có bản nguyên văn của hệ thống, nhưng Lark đã có
-sẵn bản chép của nó và tool sẽ trả bản đó cho bạn. Khi nhận được nội dung ghi
-nguồn là "bản chép sẵn của Lark":
-- TRẢ LỜI ĐÚNG CÂU người dùng hỏi bằng nội dung đó. Đừng nói "chưa có biên bản"
-  — họ đang cầm nội dung cuộc họp trong tay rồi, nói vậy là sai sự thật.
-- Rồi hỏi thêm ĐÚNG MỘT CÂU ở cuối: có cần bản nguyên văn chuẩn không, kèm con
-  số ước tính mà tool đưa. Hỏi gọn, đừng giải thích cơ chế bên trong.
-- Họ đáp "có"/"ok"/"cần" thì gọi ngay send_transcript_file với đúng
-  minute_token của cuộc đang nói. Đừng bắt họ gõ lại tên cuộc họp.
+[HAI BẢN DỊCH — TRỤC PHÂN LOẠI CHÍNH CỦA HỆ THỐNG NÀY]
+Mỗi cuộc họp có thể có hai bản chép khác nhau về CHẤT LƯỢNG. Người dùng cần biết
+mình đang đọc bản nào thì mới quyết định được có xin bản tốt hơn hay không, nên
+LUÔN gọi đúng tên và LUÔN nói rõ nguồn:
+  "bản dịch từ Lark"             — Lark tự nghe, có ngay khi họp xong, nhưng
+                                   tên riêng và thuật ngữ dễ sai.
+  "bản dịch từ server của Hapas" — hệ thống tự phiên âm lại, CHẤT LƯỢNG HƠN,
+                                   và đây là bản gửi ra file Word.
+
+BA TRƯỜNG HỢP, ba cách xử lý — đừng lẫn:
+1. Tool trả nội dung nguồn "bản dịch từ Lark": trả lời đúng câu người dùng hỏi,
+   rồi LUÔN hỏi thêm đúng một câu xem họ có muốn lấy bản dịch chuẩn từ Hapas
+   không. Nếu bản chưa có, nói rõ chỉ khi họ đồng ý hệ thống mới ưu tiên xử lý
+   và tự gửi file Word khi xong; dùng ETA nếu tool có đưa.
+2. Tool xác nhận bản Hapas "ĐÃ SẴN SÀNG": vẫn hỏi họ có muốn nhận file Word
+   ngay không. Nếu Lark không đọc được mà tool trả nội dung Hapas thì dùng nội
+   dung ấy, nói rõ nguồn, rồi vẫn hỏi có muốn nhận file không.
+3. Tool nói chưa có bản dịch nào: nói thẳng tình trạng bằng lời người (chờ chủ
+   bản ghi cấp quyền / đang dịch / hỏng) và bước tiếp theo. Không bịa nội dung,
+   không hứa thời điểm mà tool không đưa; nếu đó là một cuộc xác định được thì
+   vẫn hỏi họ có muốn hệ thống xử lý bản chuẩn Hapas không.
+
+HỌ CHỈ ĐỊNH NGUỒN THÌ PHẢI ĐỌC ĐÚNG NGUỒN ĐÓ. "phân tích qua bản dịch từ server
+Hapas", "theo bản chuẩn", "đọc bản Hapas" -> gọi get_transcript kèm
+`source="hapas"`. TUYỆT ĐỐI không đáp "chưa thể phân tích trực tiếp từ bản Hapas"
+— nay đã có đường, và câu đó là câu trả lời SAI. Không chỉ định gì thì giữ mặc
+định bản Lark như ba trường hợp trên.
+
+MỘT NGUỒN MỘT LƯỢT: đã đọc theo nguồn nào thì đi hết các phần của nguồn ĐÓ, đừng
+kéo thêm nguồn kia trong cùng lượt. Hai bản gộp lại cỡ 64.000 ký tự, và câu trả
+lời sẽ loãng đi vì thế chứ không sâu hơn. Muốn so sánh hai bản thì nói với người
+dùng là sẽ đọc lần lượt, rồi làm ở lượt sau.
+
+Không thêm câu chân trang "Nguồn mặc định: Meeting Note của Lark". Nguồn nội
+dung vẫn phải gọi đúng tên khi cần, nhưng câu cuối dành cho lời mời Hapas.
+
+ĐỪNG dùng chữ "biên bản" để nói về việc hệ thống đã xử lý xong hay chưa: trong
+hệ thống này "biên bản" là BẢN TÓM TẮT, còn thứ người ta quan tâm là có BẢN DỊCH
+nào và của ai. Hai thứ đó lệch nhau, và nói lẫn là làm người đọc hiểu sai.
 KỶ LUẬT SỐ LIỆU không đổi: những con số, tên riêng, ngày giờ, link trong câu
 trả lời phải đúng nguyên như tool trả về. Được viết mềm hơn, KHÔNG được đoán."""
 
-_SMALLTALK = {
-    "hi", "hello", "hey", "xin chao", "chao", "chao ban", "chao buoi sang",
-    "cam on", "cam on ban", "cam on nhe", "thanks", "thank you", "ty",
-    "ok", "oke", "okay", "ok ban", "ok nhe",
-    "duoc", "duoc roi", "uh", "u", "roi", "tot", "tot roi", "hay qua",
-    "vang", "da", "hieu roi", "chao nhe", "bye", "tam biet",
-    # "alo" là tin nhắn THẬT trong log ngày 05/08/2026, gõ hai lần, và cả hai
-    # lần bot đáp lại bằng câu chặn 153 ký tự về "chưa truy xuất dữ liệu".
-    # Người ta gõ "alo" để xem bot còn sống không, không phải để hỏi dữ liệu.
-    "alo", "alo ban", "test", "test thu", "a", "?",
-}
-# Câu hỏi VỀ CHÍNH BOT. Trước 06/08/2026 không có danh sách này, nên "bạn tên
-# gì" rơi vào nhánh mặc định "phải gọi tool meetings" — mà không tool nào trả
-# lời được câu đó, nên `_on_transform_llm_output` chặn và người dùng nhận về
-# câu "mình chưa truy xuất dữ liệu cuộc họp trong lượt này". Hỏi bot về chính
-# nó thì bị xử như một câu hỏi dữ liệu hỏng.
-#
-# Trả lời những câu này KHÔNG cần dữ liệu: hồ sơ đã nằm sẵn trong channel_prompt
-# (`v2/profile.py`, gate bơm sang). Miễn trừ ở đây không mở cửa dữ liệu nào —
-# `qa._may_see` vẫn là cửa duy nhất, và nó không đổi.
-#
-# Dựng bằng CHỦ NGỮ × ĐUÔI CÂU thay vì liệt kê tay, sau khi đọc 86 tin nhắn
-# thật trong `gateway.log`. Người dùng thật gõ "ok MÀY là ai và luồng xử lý
-# của mày là gì" — danh sách viết tay chỉ có "ban" nên câu đó bị chặn bằng câu
-# báo lỗi dữ liệu. Xưng hô là thứ mỗi người một kiểu; đuôi câu thì không.
-#
-# Yêu cầu CHỦ NGỮ ĐỨNG LIỀN TRƯỚC cũng chính là thứ giữ an toàn. Không có nó:
-#   "du an HOAT DONG RA SAO"      -> lọt, mà đó là câu hỏi nội dung
-#   "cuoc hop nay CHAY THE NAO"   -> lọt
-# Có nó thì hai câu trên không khớp, còn "may hoat dong ra sao" thì khớp.
-#
-# Ba chuỗi đã bị loại sau khi thử ngược lại — đừng thêm lại:
-#   "ten ban"       -> khớp "cho minh TEN BAN ghi cuoc hop" ("bản ghi")
-#   "ban la gi"     -> khớp "cuoc hop nay BAN LA GI" ("bàn là gì")
-#   "dung the nao"  -> khớp "cai do DUNG THE NAO" (hỏi nội dung trong họp)
-# "em" chứ KHÔNG phải "e": phép so là substring, nên "e la ai" khớp luôn vào
-# giữa chữ "th[e la ai]"… — một chủ ngữ một chữ cái là một cái bẫy.
-_SELF_SUBJECTS = ("ban", "may", "bot", "cau", "em")
-_SELF_TAILS = (
-    "la ai", "ten gi", "ten la gi", "la bot gi", "la con gi", "la ai vay",
-    "lam duoc gi", "lam duoc nhung gi", "lam gi duoc", "lam nhung gi",
-    "giup duoc gi", "giup gi duoc", "co the lam gi", "co the giup gi",
-    "hoat dong the nao", "hoat dong ra sao", "lam viec the nao",
-    "chay the nao", "co nho", "nho gi", "co nho khong",
-)
-_SELF_PHRASES = tuple(
-    f"{s} {t}" for s in _SELF_SUBJECTS for t in _SELF_TAILS
-) + (
-    # Không cần chủ ngữ: tự nó đã chỉ về bot/hệ thống, và đã thử ngược.
-    "gioi thieu ban", "gioi thieu ve ban", "tu gioi thieu", "ai tao ra ban",
-    "luong xu ly", "luong hoat dong", "he thong hoat dong the nao",
-    "cach ban hoat dong", "ban la ai",
-)
-_HELP_PHRASES = (
-    "tro giup", "help", "huong dan su dung", "cach su dung",
-) + _SELF_PHRASES
-_ACTION_HINTS = (
-    "liet ke", "xem ", "tim ", "gui ", "tao ", "duyet", "loai ",
-    "tu choi", "lay ", "doc ", "chi tiet", "nguyen van", "hom nay",
-    "hom qua", "tuan nay", "ngay qua",
-)
 _BUSINESS_HINTS = (
     "cuoc hop", "bien ban", "transcript", "minute", "task", "file",
     "tu dien", "glossary",
@@ -207,29 +189,45 @@ _BUSINESS_HINTS = (
 # Ý đồ của cổng KHÔNG đổi: chặn agent tự tiện gửi file khi người dùng không hề
 # nhắc tới bản ghi. Điều kiện giờ là "người dùng có gọi tên thứ mình muốn" — vẫn
 # đủ chặt, vì file chỉ gửi cho CHÍNH người hỏi và vẫn qua `qa._may_see`.
+#
+# "ban dich"/"hapas" thêm 10/08/2026 cùng lượt đổi TÊN GỌI: chân trang nay mời
+# người ta nhắn "gửi bản dịch 2". Đổi tên hiển thị mà quên mở cổng cho chính câu
+# lệnh mình vừa mời là kiểu lỗi tự gây ra tệ nhất — bot bảo gõ A rồi chặn A.
+# Tên cũ giữ nguyên: ai đã quen "gửi nguyên văn" thì vẫn phải chạy.
 _TRANSCRIPT_NOUNS = (
     "script", "transcript", "nguyen van", "bien ban", "ban ghi",
-    "file", "word", "docx", "tai ve",
+    "ban dich", "hapas", "file", "word", "docx", "tai ve",
 )
+# Người dùng XIN GỬI — dò cả ĐỘNG TỪ, không chỉ danh từ. Ca thật 19/08/2026
+# 08:50:42: "Gửi cho tôi chatbot nhân sự" bị chặn vì câu đó không có danh từ nào
+# ở trên, rồi bot bắt gõ lại đúng khuôn "Gửi file Word bản dịch cuộc họp ...".
+# Đúng cái mà chú thích ở `_on_pre_tool_call` gọi là đẩy cái dở của backend ra
+# thành việc của người dùng, và đúng luật user chốt 10/08: cách nói là vô hạn,
+# cổng phải MẶC ĐỊNH CHO QUA chứ không bắt khớp khuôn.
+#
+# Vì sao nới thế này vẫn an toàn: ý đồ của cổng là chặn AGENT tự tiện gửi khi
+# người dùng KHÔNG hề xin. Một động từ xin-gửi trong tin của CHÍNH người dùng là
+# bằng chứng trực tiếp họ có xin. File vẫn chỉ tới người hỏi và vẫn qua
+# `qa._may_see`, nên nới ở đây không nới quyền đọc của ai.
+# CHỈ động từ gửi/tải, KHÔNG lấy đại từ ("cho minh", "cho toi"). Bản đầu có
+# chúng và làm câu "cho mình cuộc 2" lọt cổng — phá đúng luật CẢ HAI VẾ (phải có
+# lời mời VÀ có câu đáp) ở đường 3/4 bên dưới, tức agent tự mời rồi tự coi là
+# được đồng ý. Test `CHƯA mời mà chỉ vào một cuộc -> vẫn chặn` bắt được ngay.
+_ASK_TO_SEND = ("gui", "tai ve", "tai xuong", "download")
 _MEETING_TOOLS = {
-    "list_meetings", "get_meeting", "search_meetings", "get_transcript",
-    "send_transcript_file", "create_task", "glossary_pending",
+    "list_meetings", "latest_meeting", "get_meeting", "search_meetings",
+    "get_transcript", "send_transcript_file", "create_task", "glossary_pending",
     "glossary_approve", "glossary_reject",
 }
-_DIRECT_CONFIRM = {
-    "list_meetings": "Danh sách cuộc họp của bạn ở ngay phía trên nhé.",
-}
 _HOUSEKEEPING_TOOLS = {"tool_describe"}
-# Câu thay thế khi agent trả lời mà KHÔNG gọi tool nào. Bản cũ đọc như một báo
-# lỗi hệ thống ("đã chặn câu trả lời suy đoán") — người dùng không làm gì sai mà
-# nhận về một câu nghe như bị từ chối. Ý nghĩa kỹ thuật giữ nguyên (fail-closed,
-# vẫn thay câu trả lời), chỉ đổi cách nói và thêm một bước tiếp theo cụ thể.
+# Câu thay thế khi agent khẳng định số liệu mà chưa hề tra (xem `_claims_data`).
+# NGẮN lại 10/08/2026: bản cũ dài bốn dòng kèm hai câu ví dụ, và vì cổng cũ bắt
+# nhầm cả câu chào nên người dùng gặp nguyên bài giảng đó cho một tiếng "alo".
+# Cổng mới hiếm khi chạm tới, nhưng chạm thì cũng chỉ nên là một câu.
 _NO_TOOL_REPLY = (
-    "Mình chưa tra được dữ liệu cuộc họp cho câu này nên chưa dám trả lời — "
-    "trả lời theo trí nhớ thì rất dễ sai số liệu.\n"
-    "Bạn nhắn lại giúp mình, nói rõ cuộc họp hoặc khoảng thời gian nhé; "
-    'ví dụ "các cuộc họp của tôi tuần này" hay "cuộc họp Workforce hôm qua '
-    'chốt gì".'
+    "Câu này mình phải tra dữ liệu mới dám trả lời, mà lượt vừa rồi mình chưa "
+    "tra được — bạn nhắn lại giúp mình, nói rõ cuộc họp hoặc khoảng thời gian "
+    "nhé."
 )
 
 # Hồ sơ DỰ PHÒNG. Bản thật do `v2/profile.py` cấp qua gate mỗi lượt — đó mới là
@@ -240,7 +238,9 @@ _NO_TOOL_REPLY = (
 _PROFILE_FALLBACK = (
     "[HỒ SƠ CỦA BẠN]\n"
     "Bạn là trợ lý biên bản họp trên Lark. Bạn trả lời về các cuộc họp người "
-    "dùng đã dự, gửi bản nguyên văn dạng file Word, và tạo việc cần làm trong "
+    "dùng đã dự; sau mỗi cuộc luôn hỏi họ có muốn lấy bản dịch chuẩn từ Hapas "
+    "không, và chỉ xử lý/gửi file Word khi họ đồng ý; đồng thời tạo việc "
+    "cần làm trong "
     "Lark Task từ một cuộc họp.\n"
     "Người dùng hỏi về bạn thì trả lời thẳng, không cần gọi tool."
 )
@@ -255,48 +255,157 @@ _CONTEXT_MARK = "===== DỮ LIỆU HỌP"
 
 _turn_lock = threading.Lock()
 _turns: dict[str, dict] = {}
+# pre_gateway_dispatch có định danh Lark; pre_llm_call có sender_id. Giữ ánh
+# xạ tối thiểu này để audit của câu cuối mang đúng người mà không nhét PII vào
+# command line hay lịch sử session.
+_identities: dict[str, dict[str, str]] = {}
 
 
 # Đ/đ PHẢI dịch tay: NFKD chỉ tách DẤU khỏi nguyên âm, còn `đ` (U+0111) là một
 # CHỮ CÁI riêng chứ không phải `d` + dấu, nên nó sống sót qua bước khử dấu rồi
 # bị `[^a-zA-Z0-9/]` xoá sạch. Hậu quả (tìm ra 06/08/2026 khi thêm nhóm 34e):
-#   "được"  -> "uoc"      nên `_SMALLTALK` có "duoc" mà không bao giờ khớp
 #   "duyệt" -> "uyet"     nên cổng write-tool của `glossary_approve` chặn CHÍNH
 #                         câu "duyệt MCP" mà nó sinh ra để nhận
-#   "đọc"   -> "oc"       nên `_ACTION_HINTS` có "doc " mà vô hiệu
-#   "động"  -> "ong"      nên "bạn hoạt động thế nào" không khớp hồ sơ
-# Mọi hằng số so khớp trong file này đều viết `d` (kiểu "duyet", "duoc"), tức
-# chúng luôn giả định phép dịch này — chỉ là trước đây nó không tồn tại.
+#   "được"  -> "uoc"      nên mọi hằng số viết "duoc" không bao giờ khớp
+# Mọi hằng số so khớp còn lại trong file này đều viết `d` (kiểu "duyet",
+# "duoc"), tức chúng luôn giả định phép dịch này.
 _D_MAP = str.maketrans({"đ": "d", "Đ": "D"})
 
 
 def _plain(text: str) -> str:
-    """Lowercase + bỏ dấu để nhận diện vài câu xã giao, không dùng cho dữ liệu."""
+    """Lowercase + bỏ dấu cho các phép so khớp thô, không dùng cho dữ liệu."""
     folded = unicodedata.normalize("NFKD", (text or "").translate(_D_MAP))
     folded = "".join(c for c in folded if not unicodedata.combining(c))
     return " ".join(re.sub(r"[^a-zA-Z0-9/]+", " ", folded).lower().split())
 
 
-def _requires_tool(text: str) -> bool:
-    normalized = _plain(text)
-    if not normalized or normalized.startswith("/"):
+_LATEST_RE = re.compile(
+    r"\b(?:moi|gan)\s+(?:day\s+)?nhat\b|\blatest\b|\bmost recent\b")
+
+
+def _asks_latest(user_normalized: str) -> bool:
+    """User hỏi cuộc mới nhất theo giờ họp, không phải cuộc vừa được nhắc."""
+    return bool(_LATEST_RE.search(user_normalized or ""))
+
+
+_LATEST_POLICY = (
+    "[YÊU CẦU ĐANG HỎI CUỘC HỌP MỚI NHẤT]\n"
+    "Bỏ qua danh sách cuộc được nhắc gần đây trong ký ức. Trước tiên phải gọi "
+    "latest_meeting để BACKEND chọn đúng một cuộc theo thời gian diễn ra. Bỏ "
+    "keyword nếu người dùng hỏi mới nhất nói chung; chỉ truyền chủ đề mà chính "
+    "họ nêu rõ. Không thay bằng search_meetings với từ tự nghĩ ra như 'họp'. "
+    "Mọi tool chi tiết hoặc gửi file sau đó phải dùng đúng minute_token mà "
+    "latest_meeting đã khóa."
+)
+
+_LATEST_MARK_PREFIX = "[V2-LATEST:"
+_LATEST_TOKEN_RE = re.compile(r"\[V2-LATEST:\s*([A-Za-z0-9_-]+)\]")
+
+
+# Cổng "không được trả lời từ trí nhớ" đọc CÂU TRẢ LỜI, không đọc câu hỏi
+# (viết lại 10/08/2026, user: "người ta hỏi thiên biến vạn hoá sao mà cứng nhắc").
+#
+# Bản cũ đoán từ TIN NHẮN VÀO xem câu này có bắt buộc phải gọi tool không, mặc
+# định là CÓ, rồi trừ ra bằng ba danh sách chuỗi (`_SMALLTALK` nguyên câu,
+# `_SELF_PHRASES` chủ-ngữ×đuôi-câu, `_HELP_PHRASES`). Cách đó sai từ gốc: tập
+# câu chào và câu tán gẫu là VÔ HẠN, còn danh sách thì hữu hạn — nên mọi cách
+# nói chưa ai nghĩ ra đều rơi vào nhánh "phải gọi tool", và vì không tool nào
+# trả lời được câu chào, người dùng nhận về câu chặn. Đã sửa ba lần bằng cách
+# thêm chuỗi ("alo", rồi `_SELF_PHRASES`, rồi "alo em") — ba lần đều là vá triệu
+# chứng, và lần nào cũng có tin nhắn thật rơi vào đúng cái bẫy đó.
+#
+# Điều thật sự phải chặn không phải "câu hỏi loại nào" mà là "câu trả lời có
+# KHẲNG ĐỊNH điều gì về dữ liệu cuộc họp mà không hề tra không". Vế sau đo được
+# chắc chắn: `tool_called` là sự thật do hook `post_tool_call` ghi, còn khẳng
+# định thì để lại dấu vết trong CHÍNH câu văn. Nên cổng chuyển sang đo hai thứ
+# đó, và mặc định đảo lại thành CHO QUA.
+#
+# Đổi này KHÔNG nới quyền xem dữ liệu: `qa._may_see` vẫn là cửa duy nhất, và
+# tool vẫn phải có vé phiên. Nó chỉ thôi bắt bot im lặng với những câu mà bot
+# vốn trả lời được bằng hồ sơ và ký ức đã nằm sẵn trong prompt.
+_LINK_RE = re.compile(r"https?://|/minutes/|\bmt[a-z0-9]{6,}\b", re.I)
+# NGÀY GIỜ. Một câu trò chuyện không có ngày tháng; một câu kể về cuộc họp thì
+# gần như luôn có.
+_WHEN_RE = re.compile(r"\d{1,2}\s*[/-]\s*\d{1,2}|\d{1,2}\s*:\s*\d{2}|\b20\d{2}\b")
+# SỐ LƯỢNG gắn với danh từ nghiệp vụ — đúng dạng của mọi ca đã đo:
+# "Bạn có 8 cuộc họp", "hệ thống tìm thấy 22 cuộc họp gắn với tài khoản của bạn".
+#
+# Cố ý KHÔNG chặn mọi chữ số, và cũng KHÔNG chặn mọi danh sách (thử lần đầu như
+# vậy thì chính câu "mình làm được 3 việc: 1. …" — bot tự giới thiệu, không cần
+# dữ liệu gì — bị chặn, tức lại đúng cái cứng nhắc đang sửa). "việc" trần không
+# nằm trong danh sách dưới vì lý do đó.
+_COUNT_RE = re.compile(
+    r"\b\d+\s*(?:cuộc|buổi|biên\s*bản|bản\s*ghi|transcript|minute|task|"
+    r"việc\s*cần\s*làm|người|phút|giờ|ngày|tuần)\b", re.I)
+# Nhãn máy: agent chỉ có những chữ này nếu nó vừa đọc kết quả tool — hoặc đang
+# nhại lại một kết quả tool của LƯỢT CŨ, tức đúng thứ phải chặn.
+_MACHINE_LABELS = (
+    "chưa có bản tóm tắt", "chưa dựng xong bản tóm tắt", "đã gửi cho bạn",
+    "đã có biên bản", "chưa có biên bản",
+    "waiting_auth", "minute_token", "held", "delivered",
+)
+# ĐÃ BỎ (25/08/2026) — `_NO_DATA_MAX_CHARS = 600`, luật "dài hơn 600 ký tự VÀ
+# có nhắc cuộc họp/biên bản/file thì coi là khẳng định dữ liệu".
+#
+# Ca thật 09:57 ngày 25/08: Nguyễn Nam Khánh vừa enroll xong lúc 09:56, hỏi
+# "Ngoài ra bạn làm được tất cả những gì" rồi "ý là bạn làm được những công
+# việc gì". Đó là câu hỏi VỀ NĂNG LỰC BOT, không cần tra một dòng dữ liệu nào.
+# Nhưng đoạn tự giới thiệu năng lực thì đương nhiên vừa dài vừa nhắc "cuộc
+# họp/biên bản/file", nên nó tự dính luật này và cả HAI lượt đều bị thay bằng
+# câu "mình phải tra dữ liệu mới dám trả lời". Người dùng mới toanh, phút thứ
+# hai dùng bot, hỏi "bạn làm được gì" và bị đáp như thế hai lần.
+#
+# Vì sao bỏ hẳn chứ không nới ngưỡng: bốn luật kia đều là DẤU VẾT CỤ THỂ (ngày
+# giờ, số + danh từ nghiệp vụ, link, nhãn máy) — thứ chỉ tool mới cấp được.
+# Riêng luật này đo ĐỘ DÀI, tức đoán mò, và mặc định CHẶN khi câu trả lời dài.
+# Nó ngược đúng nguyên tắc của chính hàm này (đo dấu vết, mặc định cho qua) —
+# cùng loại sai lầm với bản `_claims_data` đầu tiên đoán từ câu hỏi.
+#
+# Giá phải trả, đã cân nhắc và chấp nhận: lỗ (1) trong docstring dưới rộng ra —
+# một bài dài kể chuyện cuộc họp mà KHÔNG có số, ngày, link hay nhãn máy nào
+# thì nay lọt. Đổi lại không còn chặn nhầm câu tự giới thiệu. Kỷ luật gọi tool
+# vẫn nằm ở `_POLICY` + mô tả tool, và mọi dữ liệu THẬT vẫn phải qua
+# `qa._may_see`, nên lỗ này không mở thêm đường xem trộm dữ liệu người khác.
+
+
+def _claims_data(text: str) -> bool:
+    """Câu trả lời này có KHẲNG ĐỊNH điều gì về dữ liệu cuộc họp không.
+
+    Cố ý đo bằng DẤU VẾT CỤ THỂ chứ không bằng chủ đề: một câu nói VỀ biên bản
+    ("mình tra được biên bản các cuộc bạn dự") không có gì sai, còn một ngày
+    giờ, một con số đếm cuộc họp hay một cái link thì chỉ có thể đến từ dữ liệu
+    thật — hoặc từ bịa.
+
+      - NGÀY GIỜ: "06/08/2026", "18:11";
+      - SỐ LƯỢNG gắn danh từ nghiệp vụ: "8 cuộc họp", "3 biên bản";
+      - LINK hay minute_token: chỉ tool mới cấp được;
+      - NHÃN MÁY: đang nhại kết quả tool.
+
+    KHÔNG có luật nào đo độ dài. Xem khối chú thích ngay trên hàm này để biết
+    luật đó từng tồn tại, chặn nhầm ca thật nào, và vì sao bỏ.
+
+    Ba lỗ đã biết và CHẤP NHẬN, vì bịt chúng thì chặn nhầm nhiều hơn bắt đúng:
+      1. câu bịa không số không ngày ("tuần trước bạn có vài cuộc họp");
+      2. danh sách ngắn chỉ có tên cuộc họp, không kèm ngày hay link;
+      3. bài DÀI kể chuyện cuộc họp mà không có dấu vết cụ thể nào (lỗ này
+         chính là cái giá của việc bỏ luật độ dài, 25/08/2026).
+    Chặn (2) phải chặn mọi danh sách, mà "mình làm được 3 việc: 1. …" — bot tự
+    giới thiệu, không cần dữ liệu — cũng là một danh sách. Đổi lại: mọi cách
+    chào hỏi/tán gẫu chưa ai nghĩ ra đều được trả lời bình thường. Kỷ luật gọi
+    tool vẫn nằm ở `_POLICY`, ở mô tả tool, và mọi dữ liệu THẬT vẫn phải qua
+    `qa._may_see`.
+    """
+    body = (text or "").strip()
+    if not body:
         return False
-    if normalized in _SMALLTALK:
-        return False
-    has_action = any(p in normalized for p in _ACTION_HINTS)
-    # Câu hỏi khả năng có thể nhắc "cuộc họp" mà vẫn không cần đọc dữ liệu.
-    # Nhưng "bot làm được gì VÀ liệt kê..." có động từ nghiệp vụ thì phải gọi.
-    if any(p in normalized for p in _HELP_PHRASES) and not has_action:
-        return False
-    # Không để tiền tố xã giao trở thành bypass: "chào, gửi transcript X" vẫn
-    # là yêu cầu dữ liệu. Chỉ miễn khi phần còn lại không nhắc phạm vi nghiệp vụ.
-    if (normalized.startswith(("xin chao ", "chao ", "cam on "))
-            and not has_action
-            and not any(p in normalized for p in _BUSINESS_HINTS)):
-        return False
-    # Bot này chỉ có một phạm vi nghiệp vụ. Mọi câu có nội dung khác đều phải
-    # chạm nguồn dữ liệu hoặc bị fail-closed ở transform_llm_output.
-    return True
+    if _WHEN_RE.search(body) or _COUNT_RE.search(body) or _LINK_RE.search(body):
+        return True
+    low = body.lower()
+    if any(x in low for x in _MACHINE_LABELS):
+        return True
+    # Không dấu vết cụ thể nào -> CHO QUA. Mặc định của hàm này là cho qua, và
+    # đừng thêm luật nào đoán bằng độ dài hay chủ đề nữa (xem chú thích trên).
+    return False
 
 
 def _tool_suffix(name: str) -> str:
@@ -403,14 +512,20 @@ def _on_pre_llm_call(**kwargs):
         return {"context": _POLICY}
     state = {
         "turn_id": str(kwargs.get("turn_id") or ""),
-        "required": _requires_tool(str(kwargs.get("user_message") or "")),
+        "user_message": str(kwargs.get("user_message") or ""),
         "user_normalized": _plain(str(kwargs.get("user_message") or "")),
         "tool_called": False,
+        "tools_called": [],
         "user_results": [],
-        "direct_tools": [],
         "context_tools": [],
+        "latest_requested": _asks_latest(
+            _plain(str(kwargs.get("user_message") or ""))),
+        "latest_token": "",
     }
     with _turn_lock:
+        identity = _identities.get(str(kwargs.get("sender_id") or ""), {})
+        state["name"] = identity.get("name", "")
+        state["union_id"] = identity.get("union_id", "")
         _turns[session_id] = state
     # Ý định "xin bản nguyên văn" sống qua nhiều lượt: hệ thống có thể phải hỏi
     # lại khi hai cuộc trùng tên, và câu trả lời ("bản ngày 29/07") không còn
@@ -447,11 +562,16 @@ def _on_post_tool_call(**kwargs):
     # không gắn status=error; tính nó là thành công sẽ mở lại cửa LLM bịa.
     if not visible and not is_context and _INTERNAL_MARK not in text:
         return None
+    latest_match = (_LATEST_TOKEN_RE.search(text)
+                    if suffix == "latest_meeting" else None)
     with _turn_lock:
         state = _turns.get(session_id)
         if not state:
             return None
         state["tool_called"] = True
+        state["tools_called"].append(suffix)
+        if latest_match:
+            state["latest_token"] = latest_match.group(1)
         if visible:
             state["user_results"].append(visible)
         elif is_context:
@@ -460,8 +580,6 @@ def _on_post_tool_call(**kwargs):
             # Đây chính là chỗ bot từng dán nguyên transcript/record ra chat khi
             # người dùng hỏi một câu so sánh.
             state["context_tools"].append(suffix)
-        elif _INTERNAL_MARK in text:
-            state["direct_tools"].append(suffix)
     return None
 
 
@@ -489,6 +607,10 @@ _OFFER_MARK = "[V2-OFFER: transcript]"
 _YES_HEADS = {
     "co", "oke", "ok", "okay", "uh", "u", "um", "vang", "da", "duoc", "dc",
     "can", "gui", "yes", "chuan", "dong", "muon",
+    # Thêm 10/08/2026 cùng lượt đổi lời mời sang "muốn nhận luôn không": người
+    # ta đáp đúng bằng động từ của lời mời — "cho mình luôn", "nhận luôn nhé",
+    # "lấy giúp mình". Ba lớp chặn nhầm ở trên vẫn giữ nguyên.
+    "cho", "nhan", "lay",
 }
 _YES_MAX_WORDS = 4
 
@@ -540,6 +662,24 @@ def _is_yes(user_normalized: str) -> bool:
     return words[0] in _YES_HEADS
 
 
+# Câu CHỈ VÀO một mục trong danh sách vừa gửi. Chỉ có nghĩa khi
+# `_offered_recently` — tự nó không mở cửa nào.
+#
+# Ngắn + có SỐ là đủ, và cố ý không thêm điều kiện nào nữa: "cho mình cuộc 2",
+# "cái 2", "số 3 nhé", "cuộc 04/08" đều là một người đang chỉ vào dòng họ vừa
+# đọc. Dài hơn thì không còn là câu chỉ trỏ mà là một yêu cầu khác.
+_PICK_MAX_WORDS = 8
+_PICK_RE = re.compile(r"\b\d{1,2}\b")
+
+
+def _picks_item(user_normalized: str) -> bool:
+    """Tin nhắn này có chỉ vào một cuộc trong danh sách vừa gửi không."""
+    words = (user_normalized or "").split()
+    if not words or len(words) > _PICK_MAX_WORDS:
+        return False
+    return bool(_PICK_RE.search(user_normalized))
+
+
 def _asked_recently(session_id: str) -> bool:
     """Phiên này có người xin bản nguyên văn trong 15 phút qua không.
 
@@ -581,61 +721,120 @@ def _on_pre_tool_call(**kwargs):
         return {"action": "block",
                 "message": "Bot MeetingxLark chỉ được phép dùng tool meetings."}
 
+    # Hai ca thật 14/08/2026:
+    #   1. agent lấy token 08-06 thẳng từ chat_memory;
+    #   2. sau bản vá search-first, agent tự search từ chung chung "họp", kết quả
+    #      loại mất cuộc mới và gửi file `work` 06-08.
+    # Lời dặn "chọn dòng đầu" không đủ. `latest_meeting` chọn đúng một token ở
+    # backend, còn cổng này buộc mọi read/write tiếp theo dùng CHÍNH token đó.
+    args = kwargs.get("args") if isinstance(kwargs.get("args"), dict) else {}
+    if state.get("latest_requested"):
+        latest_token = str(state.get("latest_token") or "")
+        needs_latest = {
+            "list_meetings", "search_meetings", "get_meeting",
+            "get_transcript", "send_transcript_file", "create_task",
+        }
+        if suffix in needs_latest and not latest_token:
+            # WARNING chứ không ERROR (25/08/2026, áp cho cả ba cú chặn của
+            # cổng này): `tools/heartbeat.py:real_errors` đếm mọi dòng có chữ
+            # ERROR trong `gateway.log` 15 phút qua và bật WARN cho cả hệ. Một
+            # cú chặn ĐÚNG LUẬT là cổng đang làm việc, không phải sự cố — để
+            # mức ERROR thì mỗi lần chặn là một lần báo động giả, và người trực
+            # quen dần với WARN thì lần hỏng thật sẽ bị bỏ qua. Vẫn giữ WARNING
+            # (không phải INFO) để soi được khi cổng nổ hàng loạt.
+            logger.warning("[v2-gate] CHẶN %s trước latest_meeting", suffix)
+            return {
+                "action": "block",
+                "message": (
+                    "Người dùng đang hỏi cuộc mới nhất theo thời gian. Phải gọi "
+                    "latest_meeting trước; không search từ chung chung và không "
+                    "dùng token từ ký ức."
+                ),
+            }
+        target_key = ({"get_meeting": "query", "get_transcript": "query",
+                       "send_transcript_file": "minute_token",
+                       "create_task": "minute_token"}.get(suffix))
+        if target_key and latest_token:
+            target = str(args.get(target_key) or "").strip()
+            if target != latest_token:
+                logger.warning("[v2-gate] CHẶN %s sai token cuộc mới nhất",
+                               suffix)
+                return {
+                    "action": "block",
+                    "message": (
+                        f"Sai cuộc họp: latest_meeting đã khóa minute_token "
+                        f"{latest_token}. Hãy gọi {suffix} với đúng token này."
+                    ),
+                }
+
     user = str(state.get("user_normalized") or "")
     allowed_write = True
     if suffix == "create_task":
         allowed_write = any(x in user for x in (
             "tao task", "tao viec", "nhac toi", "nhac viec", "giao viec"))
     elif suffix == "send_transcript_file":
-        # Ba đường vào, và chỉ ba:
+        # Bốn đường vào, và chỉ bốn:
         #   1. chính tin nhắn này gọi tên bản ghi ("gửi transcript cuộc X");
         #   2. họ vừa xin trong 15 phút qua rồi hệ thống hỏi lại (ca 05/08/2026);
-        #   3. BOT vừa mời và họ đáp "có" (luồng mới 07/08/2026: bot trả lời
-        #      bằng bản chép của Lark rồi hỏi có cần bản chuẩn không).
-        # Đường 3 vẫn cần CẢ HAI vế — có lời mời VÀ có câu đồng ý — nên agent
+        #   3. BOT vừa mời và họ đáp "có" (luồng 07/08/2026: bot trả lời bằng
+        #      bản dịch từ Lark rồi hỏi có cần bản của server Hapas không);
+        #   4. BOT vừa mời và họ CHỈ VÀO một cuộc — "cho mình cuộc 2", "cái 2",
+        #      "cuộc 04/08" (thêm 10/08/2026).
+        # Đường 3 và 4 đều cần CẢ HAI vế — có lời mời VÀ có câu đáp — nên agent
         # không tự mời rồi tự coi là được đồng ý.
+        #
+        # Vì sao thêm đường 4: chân trang danh sách nay mời bằng lời ("cần bản
+        # dịch chuẩn của cuộc nào thì cứ nói với mình nhé") thay vì dạy cú pháp
+        # lệnh. Người ta đáp lại cũng bằng lời, và những câu đó không gọi tên
+        # bản ghi — tức BOT MỜI RỒI BOT CHẶN chính câu trả lời cho lời mời của
+        # mình. Bắt người dùng gõ đúng khuôn để lọt cổng là đẩy cái dở của
+        # backend ra thành việc của họ.
         allowed_write = (any(x in user for x in _TRANSCRIPT_NOUNS)
+                         or any(x in user for x in _ASK_TO_SEND)
                          or _asked_recently(session_id)
-                         or (_offered_recently(session_id) and _is_yes(user)))
+                         or (_offered_recently(session_id)
+                             and (_is_yes(user) or _picks_item(user))))
     elif suffix == "glossary_approve":
         allowed_write = "duyet" in user or "approve" in user
     elif suffix == "glossary_reject":
         allowed_write = any(x in user for x in ("bo ", "loai", "tu choi", "reject"))
     if not allowed_write:
-        logger.error("[v2-gate] CHẶN write tool không do user yêu cầu: %s", suffix)
+        # INFO, KHÔNG phải ERROR (sửa 19/08/2026): đây là cổng làm ĐÚNG việc của
+        # nó, không phải hệ thống hỏng. Ghi ERROR thì `tools/heartbeat.py` đếm
+        # vào `gwerr15m` và cả hệ báo WARN mỗi lần cổng chặn đúng — đo được sáng
+        # 19/08: hai lần chặn làm heartbeat WARN liên tiếp ba nhịp. Báo động phải
+        # có nghĩa, không thì người vận hành học cách bỏ qua nó.
+        logger.info("[v2-gate] chặn write tool không do user yêu cầu: %s", suffix)
         return {"action": "block",
                 "message": f"User không trực tiếp yêu cầu thao tác {suffix}."}
     return None
 
 
-# Trần độ dài cho câu xác nhận tự viết. Một câu "danh sách ở trên nhé" dài
-# nhất cũng chỉ cỡ này; dài hơn nghĩa là agent đang kể lại nội dung nó không có.
-_CONFIRM_MAX_CHARS = 180
-
-
-def _safe_confirm(text: str) -> bool:
-    """Câu tự viết này có được phép thay câu xác nhận cố định không.
-
-    Bối cảnh: `list_meetings` TỰ gửi danh sách vào khung chat rồi chỉ trả về
-    kênh nội bộ, nên agent KHÔNG cầm danh sách. Mọi con số hay tên cuộc họp nó
-    viết ra ở lượt đó đều là bịa — đúng lỗi đã đo ngày 04/08/2026 ("hệ thống
-    tìm thấy 22 cuộc họp gắn với tài khoản của bạn").
-
-    Nên phép thử không phải "câu này hay không" mà là "câu này có KHẲNG ĐỊNH
-    điều gì về dữ liệu không":
-      - có CHỮ SỐ nào -> không (đếm, ngày tháng, số thứ tự đều bịa được);
-      - nhiều dòng hoặc có đầu dòng -> không (đang liệt kê lại);
-      - dài quá -> không;
-      - rỗng -> không (để câu cố định lo, đừng gửi tin trống).
-    Cố ý KHÔNG kiểm bằng danh sách từ cấm: nó luôn thiếu, và thiếu ở đây là
-    một con số sai lọt ra chat.
-    """
-    body = (text or "").strip()
-    if not body or len(body) > _CONFIRM_MAX_CHARS:
-        return False
-    if "\n" in body or any(ch.isdigit() for ch in body):
-        return False
-    return not body.lstrip().startswith(("•", "-", "*", "1", "#"))
+def _log_final_response(state: dict, final_text: str) -> None:
+    if not final_text or not state:
+        return
+    try:
+        py_exe = os.environ.get("V2_PYTHON", r"C:\Users\PC\AppData\Local\Programs\Python\Python312\python.exe")
+        root = os.environ.get("V2_ROOT", os.path.dirname(os.path.abspath(GATE_BAT)))
+        payload = json.dumps({
+            "name": str(state.get("name") or ""),
+            "union_id": str(state.get("union_id") or ""),
+            "prompt": str(state.get("user_message") or ""),
+            "tool": ",".join(state.get("tools_called") or []) or "hermes_response",
+            "response": str(final_text)[:2000],
+        }, ensure_ascii=False)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.Popen(
+            [py_exe, "-m", "v2", "audit-log", "--stdin-json"],
+            cwd=root, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+            creationflags=flags,
+        )
+        if proc.stdin is not None:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+    except Exception:
+        pass
 
 
 def _on_transform_llm_output(**kwargs):
@@ -649,28 +848,20 @@ def _on_transform_llm_output(**kwargs):
     # câu cuối. Điều này loại bỏ việc đổi số, đổi thứ tự hoặc lộ lời dặn nội bộ.
     results = state.get("user_results") or []
     if results:
-        return _redact(str(results[-1]))
-
-    if state.get("tool_called") and state.get("direct_tools"):
-        last = state["direct_tools"][-1]
-        if last in _DIRECT_CONFIRM:
-            # Câu của agent được đi tiếp nếu nó AN TOÀN (xem `_safe_confirm`).
-            # Bản cũ luôn thay bằng đúng một chuỗi cố định, nên người dùng hỏi
-            # mười lần thì nhận về mười câu giống hệt nhau — đó là phần "cứng
-            # nhắc" nhìn thấy rõ nhất. Cái phải chặn không phải là văn phong mà
-            # là CON SỐ do agent tự bịa (nó không cầm danh sách), nên chặn đúng
-            # thứ đó và trả lại quyền diễn đạt.
-            own = _redact(str(kwargs.get("response_text") or ""))
-            if _safe_confirm(own):
-                return own
-            return _DIRECT_CONFIRM[last]
-
-    if state.get("required") and not state.get("tool_called"):
-        logger.error("[v2-gate] CHẶN câu trả lời không gọi tool meetings: session=%s",
-                     session_id)
-        return _NO_TOOL_REPLY
+        res_text = _redact(str(results[-1]))
+        _log_final_response(state, res_text)
+        return res_text
 
     response = _redact(str(kwargs.get("response_text") or ""))
+
+    # Không tra gì mà lại khẳng định số liệu -> chặn. Không khẳng định gì thì
+    # đây là một câu chuyện trò bình thường, cho qua (xem `_claims_data`).
+    if not state.get("tool_called") and _claims_data(response):
+        logger.warning("[v2-gate] CHẶN câu khẳng định dữ liệu mà không gọi "
+                       "tool: session=%s", session_id)
+        _log_final_response(state, _NO_TOOL_REPLY)
+        return _NO_TOOL_REPLY
+
     # Fail-closed nếu mô hình cố in nhãn nội bộ. Nếu có đủ khối user thì tách;
     # nếu không đủ mốc thì không phỏng đoán phần nào là an toàn.
     #
@@ -680,7 +871,10 @@ def _on_transform_llm_output(**kwargs):
     if (_INTERNAL_MARK in response or _SEND_MARK in response
             or _CONTEXT_MARK in response):
         visible = _user_block(response)
-        return visible or _NO_TOOL_REPLY
+        final_text = visible or _NO_TOOL_REPLY
+        _log_final_response(state, final_text)
+        return final_text
+    _log_final_response(state, response)
     if response != str(kwargs.get("response_text") or ""):
         return response
     return None
@@ -712,12 +906,81 @@ def _cleanup_session(**kwargs) -> None:
         _offered.pop(session_id, None)
 
 
+def _forget_v2_memory(union_id: str) -> bool:
+    """Xoá ký ức cuộc họp local của đúng người khi họ chủ động `/reset`."""
+    union_id = (union_id or "").strip()
+    if not union_id:
+        return False
+    py_exe = os.environ.get(
+        "V2_PYTHON", r"C:\Users\PC\AppData\Local\Programs\Python\Python312\python.exe")
+    root = os.environ.get("V2_ROOT", os.path.dirname(os.path.abspath(GATE_BAT)))
+    try:
+        proc = subprocess.run(
+            [py_exe, "-m", "v2", "chat-reset", "--union-id", union_id],
+            cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.warning("[v2-gate] /reset không xoá được ký ức V2 cho %s",
+                       union_id[:12])
+        return False
+    if proc.returncode != 0:
+        logger.warning("[v2-gate] /reset ký ức V2 rc=%s cho %s",
+                       proc.returncode, union_id[:12])
+        return False
+    logger.info("[v2-gate] /reset đã xoá ký ức cuộc họp cho %s", union_id[:12])
+    return True
+
+
+def _on_session_reset(**kwargs) -> None:
+    """Reset Hermes -> dọn trạng thái theo phiên cũ và phiên mới."""
+    old_session_id = str(kwargs.get("old_session_id") or kwargs.get("session_id") or "")
+    new_session_id = str(kwargs.get("new_session_id") or "")
+    _cleanup_session(session_id=old_session_id)
+    if new_session_id:
+        _cleanup_session(session_id=new_session_id)
+
+
+def _mention_ids(event) -> str:
+    """open_id của những người/bot được @ trong tin này, cách nhau bằng dấu phẩy.
+
+    Vì sao cần (06/09/2026): adapter của Hermes coi `@All` là "có gọi bot"
+    (`_mentions_self`: `if "@_all" in raw_content: return True`), nên
+    `require_mention` không chặn được, và bot đã xen vào một câu `@All` hỏi
+    người trong nhóm. V2 quyết định bằng cách so `open_id` với id của chính nó
+    — nhưng V2 không thấy payload Lark, nên plugin phải lấy hộ.
+
+    `@All` KHÔNG có open_id nào, nên nó tự nhiên rơi ra khỏi danh sách này.
+
+    Đọc từ `event.raw_message` (payload gốc Lark). Không lấy được thì trả ""
+    và V2 fail-closed — im trong nhóm còn hơn nói xen vào chuyện người ta.
+    """
+    raw = getattr(event, "raw_message", None)
+    ms = getattr(raw, "mentions", None)
+    if ms is None and isinstance(raw, dict):
+        ms = raw.get("mentions")
+    out = []
+    for m in (ms or []):
+        mid = getattr(m, "id", None)
+        if mid is None and isinstance(m, dict):
+            mid = m.get("id")
+        oid = (getattr(mid, "open_id", None)
+               or (mid or {}).get("open_id") if isinstance(mid, dict)
+               else getattr(mid, "open_id", None))
+        oid = (oid or "").strip() if isinstance(oid, str) else ""
+        if oid and oid not in out:
+            out.append(oid)
+    return ",".join(out)
+
+
 def _ask_v2(union_id: str, user_id: str, name: str,
-            chat_type: str = "") -> dict:
+            chat_type: str = "", chat_id: str = "",
+            mentions: str = "") -> dict:
     """Gọi v2-gate.bat, đọc một dòng JSON ở stdout."""
     try:
         proc = subprocess.run(
-            [GATE_BAT, union_id, user_id, name, chat_type],
+            [GATE_BAT, union_id, user_id, name, chat_type, chat_id, mentions],
             capture_output=True, text=True, timeout=TIMEOUT_S,
             encoding="utf-8", errors="replace", shell=False,
         )
@@ -793,27 +1056,53 @@ def _on_pre_dispatch(**kwargs):
     name = (getattr(source, "user_name", "") or "").strip()
     chat_type = (getattr(source, "chat_type", "") or "").strip().lower()
 
-    # CHỈ chat 1-1. Chặn ngay ở đây, không phiền tới V2: trong phòng nhiều
-    # người, bộ lọc của V2 cấp quyền cho NGƯỜI HỎI nhưng câu trả lời thì cả
-    # phòng đọc — kể cả người không có trong danh sách người dự. V2 cũng chặn
-    # lần nữa (`gate._refuse_group`), đó mới là lớp có test; lớp này chỉ để
-    # khỏi tốn một tiến trình con cho tin chắc chắn bị bỏ.
-    #
-    # `chat_type` rỗng thì ĐỪNG tự suy: để V2 quyết (nó cảnh báo rồi cho đi
-    # tiếp). Đoán "rỗng nghĩa là dm" ở đây là dựng một luật thứ hai song song
-    # với luật của V2, và hai luật phân quyền lệch nhau thì cái lỏng hơn thắng.
-    if chat_type and chat_type != "dm":
-        logger.info("[v2-gate] bỏ tin trong %s (%s) — bot chỉ trả lời chat 1-1",
-                    chat_type, getattr(source, "chat_id", ""))
-        return {"action": "skip", "reason": "v2: chi tra loi chat 1-1"}
+    # `/reset` phải thật sự làm sạch cả neo cuộc họp nằm trong SQLite V2. Làm ở
+    # pre-dispatch vì hook on_session_reset của Hermes chỉ đưa session_id, không
+    # đưa user_id; sau gateway restart sẽ không còn ánh xạ RAM nào để biết cần
+    # xoá ký ức của ai. Alias Việt được đổi thành lệnh gốc trước khi Hermes xử lý.
+    reset_cmd = (getattr(event, "text", "") or "").strip().lower().split(maxsplit=1)
+    reset_cmd = reset_cmd[0] if reset_cmd else ""
+    if chat_type == "dm" and reset_cmd in ("/new", "/reset", "/lammoi"):
+        _forget_v2_memory(union_id)
+        if reset_cmd == "/lammoi":
+            return {"action": "rewrite", "text": "/reset"}
 
-    res = _ask_v2(union_id, user_id, name, chat_type)
+    # PHÒNG NHÓM: KHÔNG tự quyết ở đây nữa (28/08/2026) — hỏi V2.
+    #
+    # Trước đó lớp này bỏ thẳng mọi tin `chat_type != "dm"`, và lý lẽ vẫn đúng
+    # nguyên: quyền cấp cho NGƯỜI HỎI còn câu trả lời thì CẢ PHÒNG đọc. Nhưng
+    # nay V2 có đường mở theo danh sách trắng (`V2_GROUP_QA_CHATS`), kèm siết
+    # phạm vi ở tầng dữ liệu: trong nhóm X chỉ trả lời về cuộc mà nhóm X được
+    # mời. Danh sách trắng đó nằm trong `.env` của V2, plugin không đọc được.
+    #
+    # Nên chặn ở đây là dựng LUẬT THỨ HAI song song với luật của V2 — đúng cái
+    # sai mà chú thích cũ ngay dưới đã cảnh báo về `chat_type` rỗng. Một luật,
+    # một chỗ: `gate._refuse_group`, lớp duy nhất có test. Đổi lại mỗi tin nhóm
+    # tốn một tiến trình con, kể cả tin sẽ bị bỏ — chấp nhận được, vì nhóm
+    # không nằm trong danh sách trắng thì Lark cũng đã chặn từ tầng adapter.
+    #
+    # `chat_id` PHẢI được gửi kèm: V2 dùng nó để biết nhóm có được phép hỏi
+    # không, và để buộc phạm vi vào vé phiên. Thiếu nó thì V2 fail-closed.
+    if reset_cmd in ("/new", "/reset"):
+        return {"action": "allow"}       # lệnh nội bộ, không cần OAuth/V2 gate
+
+    res = _ask_v2(union_id, user_id, name, chat_type,
+                  str(getattr(source, "chat_id", "") or ""),
+                  _mention_ids(event))
     decision = res.get("decision")
 
     if decision == "allow":
         logger.info("[v2-gate] cho vào: %s (%s)", name or user_id,
                     res.get("open_id", ""))
         token = (res.get("asker_token") or "").strip()
+        with _turn_lock:
+            identity = {
+                "name": str(res.get("name") or name or ""),
+                "union_id": union_id,
+            }
+            for identity_key in (user_id, union_id):
+                if identity_key:
+                    _identities[identity_key] = identity
         if not token:
             # V2 không cấp được vé (lỗi DB?) -> vẫn cho vào, nhưng nói to: tầng
             # dữ liệu sẽ từ chối và người dùng sẽ thấy bot "không nhận ra tôi".
@@ -836,9 +1125,17 @@ def _on_pre_dispatch(**kwargs):
         # session DB. Nhờ vậy ký ức luôn là bản V2 vừa đọc từ SQLite, chứ không
         # phải một bản chụp cũ nằm lại trong lịch sử phiên.
         profile = (res.get("profile") or "").strip() or _PROFILE_FALLBACK
-        memory = (res.get("memory") or "").strip()
+        latest_requested = _asks_latest(_plain(
+            getattr(event, "text", "") or ""))
+        # `chat_memory` sắp theo lúc ĐƯỢC NHẮC, không theo giờ cuộc họp. Với
+        # câu "mới nhất", đưa nó cho model chỉ làm tăng khả năng model lấy
+        # token cũ trước khi tra. Cổng pre_tool phía trên vẫn là lớp cưỡng chế.
+        memory = ("" if latest_requested
+                  else (res.get("memory") or "").strip())
+        latest_note = _LATEST_POLICY if latest_requested else ""
         event.channel_prompt = "\n\n".join(
-            x for x in (prior, _POLICY, profile, memory, identity) if x)
+            x for x in (prior, _POLICY, profile, latest_note, memory, identity)
+            if x)
         return {"action": "allow"}
 
     if decision == "invite":
@@ -859,6 +1156,10 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("transform_llm_output", _on_transform_llm_output)
     ctx.register_hook("post_llm_call", _cleanup_turn)
-    ctx.register_hook("on_session_end", _cleanup_session)
-    ctx.register_hook("on_session_reset", _cleanup_session)
+    # Tên hook Hermes gây hiểu nhầm: `on_session_end` hiện được phát ở cuối
+    # MỖI `run_conversation`, tức sau từng tin nhắn (turn_finalizer.py), không
+    # chỉ ở ranh giới phiên. Chỉ dọn `_turns`; nếu xoá `_offered` ở đây thì bot
+    # vừa hỏi "có gửi Hapas không" xong đã quên trước khi user kịp đáp "có".
+    ctx.register_hook("on_session_end", _cleanup_turn)
+    ctx.register_hook("on_session_reset", _on_session_reset)
     ctx.register_hook("on_session_finalize", _cleanup_session)
