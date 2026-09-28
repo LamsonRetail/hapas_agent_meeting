@@ -1,0 +1,27 @@
+{
+  "enabledPlugins": {
+    "ponytail@ponytail": true,
+    "rtk-plugin@enix": true,
+    "ui-ux-pro-max@ui-ux-pro-max-skill": true
+  },
+  "extraKnownMarketplaces": {
+    "ponytail": {
+      "source": {
+        "source": "github",
+        "repo": "DietrichGebert/ponytail"
+      }
+    },
+    "enix": {
+      "source": {
+        "source": "github",
+        "repo": "enixCode/plugins"
+      }
+    },
+    "ui-ux-pro-max-skill": {
+      "source": {
+        "source": "github",
+        "repo": "nextlevelbuilder/ui-ux-pro-max-skill"
+      }
+    }
+  }
+}

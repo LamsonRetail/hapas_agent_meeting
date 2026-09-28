@@ -55,3 +55,4 @@ enroll-links.html
 # tracked), nên lỗi này vô hình: chỉ lộ ra vào ngày ai đó xoá rồi thêm lại, và
 # lúc đó người mới clone về sẽ không có file mẫu nào để chép.
 !.env.example
+.DS_Store
