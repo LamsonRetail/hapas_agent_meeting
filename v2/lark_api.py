@@ -1119,16 +1119,98 @@ def drive_link_close(token: str, doc_type: str = "bitable") -> dict[str, Any]:
 
 def drive_member_add(token: str, doc_type: str, member_id: str,
                      perm: str = "full_access",
-                     member_type: str = "openid") -> None:
+                     member_type: str = "openid", notify: bool = True) -> None:
     """Thêm người vào tài liệu Drive/Base. Bot tạo Base thì người KHÔNG thấy nó
-    tới khi được thêm vào đây."""
+    tới khi được thêm vào đây. `notify=False`: share IM LẶNG (V3 YC2, chốt
+    16/09/2026 — tạo folder/chia sẻ biên bản không bắn thông báo)."""
+    params = {"type": doc_type}
+    if not notify:
+        params["need_notification"] = "false"
     resp = _http().post(
         f"/open-apis/drive/v1/permissions/{token}/members",
-        headers=_im_headers(), params={"type": doc_type},
+        headers=_im_headers(), params=params,
         json={"member_id": member_id, "member_type": member_type,
               "perm": perm, "type": "user"},
     )
     _check(resp, "drive_member_add")
+
+
+# ------------------------------------------------ V3 YC2: danh bạ + Drive (bot)
+#
+# Tất cả chạy bằng TENANT token (danh tính bot) — scope cấp app, duyệt MỘT lần
+# trên Console, KHÔNG bắt ai enroll lại (khác scope của user token).
+
+
+def _pages(path: str, params: dict[str, Any], where: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    token = ""
+    for _ in range(200):                  # trần cứng: 200 trang x 50
+        q = dict(params, page_size=50, **({"page_token": token} if token else {}))
+        data = _check(_http().get(path, headers=_im_headers(), params=q),
+                      where).get("data", {})
+        out += list(data.get("items") or [])
+        if not data.get("has_more"):
+            break
+        token = data.get("page_token") or ""
+    return out
+
+
+def contact_departments() -> list[str]:
+    """Mọi open_department_id trong công ty (cả gốc "0")."""
+    items = _pages("/open-apis/contact/v3/departments/0/children",
+                   {"department_id_type": "open_department_id",
+                    "fetch_child": "true"}, "contact_departments")
+    return ["0"] + [d["open_department_id"] for d in items
+                    if d.get("open_department_id")]
+
+
+def contact_users_in(department_id: str) -> list[dict[str, Any]]:
+    """Người thuộc TRỰC TIẾP một phòng ban; `leader_user_id` là open_id."""
+    return _pages("/open-apis/contact/v3/users/find_by_department",
+                  {"department_id": department_id, "user_id_type": "open_id",
+                   "department_id_type": "open_department_id"},
+                  "contact_users_in")
+
+
+def drive_root_folder() -> str:
+    resp = _http().get("/open-apis/drive/explorer/v2/root_folder/meta",
+                       headers=_im_headers())
+    return _check(resp, "drive_root_folder").get("data", {}).get("token", "")
+
+
+def drive_folder_create(name: str, parent: str) -> str:
+    resp = _http().post("/open-apis/drive/v1/files/create_folder",
+                        headers=_im_headers(),
+                        json={"name": name, "folder_token": parent})
+    return _check(resp, "drive_folder_create").get("data", {}).get("token", "")
+
+
+def drive_upload(path: Path, folder: str) -> str:
+    """Upload một file vào folder Drive. Trả file_token."""
+    data = path.read_bytes()
+    files = {"file_name": (None, path.name), "parent_type": (None, "explorer"),
+             "parent_node": (None, folder), "size": (None, str(len(data))),
+             "file": (path.name, data, "text/markdown")}
+    resp = _http().post("/open-apis/drive/v1/files/upload_all",
+                        headers={"Authorization": f"Bearer {tenant_token()}"},
+                        files=files, timeout=120.0)
+    return _check(resp, "drive_upload").get("data", {}).get("file_token", "")
+
+
+def drive_file_delete(file_token: str) -> None:
+    resp = _http().delete(f"/open-apis/drive/v1/files/{file_token}",
+                          headers=_im_headers(), params={"type": "file"})
+    _check(resp, "drive_file_delete")
+
+
+def drive_file_url(file_token: str) -> str:
+    resp = _http().post("/open-apis/drive/v1/metas/batch_query",
+                        headers=_im_headers(),
+                        json={"request_docs": [{"doc_token": file_token,
+                                                "doc_type": "file"}],
+                              "with_url": True})
+    metas = _check(resp, "drive_file_url").get("data", {}).get("metas") or []
+    return (metas[0].get("url") or "") if metas else ""
 
 
 def new_idem(prefix: str) -> str:

@@ -301,6 +301,14 @@ def viewers_index() -> dict[str, set[str]]:
         if meta.owner_open_id:
             ids.add(meta.owner_open_id)
         out[r["minute_token"]] = ids
+    # V3 YC2: quyền VẬT CHẤT HOÁ lúc phát (`notes.grant`) — người dự + chủ +
+    # CHUỖI QUẢN LÝ từ Lark Contact. Chỉ cộng cho job còn tồn tại (fail-closed
+    # như trên). Không bao giờ bị thu hồi khi org đổi (quyết định 16/09/2026).
+    from . import db
+    for g in db.conn().execute(
+            "SELECT minute_token, open_id, union_id FROM note_grants"):
+        if g["minute_token"] in out:
+            out[g["minute_token"]] |= {x for x in (g["open_id"], g["union_id"]) if x}
     return out
 
 

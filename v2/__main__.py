@@ -456,6 +456,58 @@ def cmd_backfill(args) -> None:
               "phiên âm dần, mỗi vòng một cuộc.")
 
 
+def cmd_org_sync(args) -> None:
+    """V3 YC2: kéo cây quản lý từ Lark Contact. Mặc định THỬ KHÔ (chỉ đọc Lark).
+
+    Ghi thật = đổi quyền xem: quản lý các cấp thấy biên bản của nhánh mình."""
+    _init()
+    from . import org
+    got = org.sync(dry_run=not args.yes)
+    print(f"{got['users']} người trong cây tổ chức, {got['changed']} dòng đổi quản lý.")
+    if not args.yes:
+        print("Thử khô — chưa ghi. Thêm --yes để lưu (sau đó đặt ORG_SYNC_HOURS=24 "
+              "để vòng run tự đồng bộ).")
+
+
+def cmd_drive_provision(args) -> None:
+    """V3 YC2: tạo folder Drive cho mọi người chưa có. Mặc định THỬ KHÔ."""
+    _init()
+    from . import notes
+    names = notes.provision(dry_run=not args.yes)
+    print(f"{len(names)} người {'đã' if args.yes else 'SẼ'} được tạo folder "
+          f"(share im lặng, không thông báo):")
+    for n in names:
+        print("  -", n)
+    if not args.yes:
+        print("Thử khô. Chạy `v2 org-sync --yes` trước, rồi thêm --yes ở đây.")
+
+
+def cmd_grants_backfill(args) -> None:
+    """V3 YC2: cấp LÙI quyền cuộc cũ cho một quản lý (vd sếp mới). THỬ KHÔ mặc định."""
+    _init()
+    from . import notes
+    import datetime as _dt
+    since = 0
+    if args.since:
+        since = int(_dt.datetime.strptime(args.since, "%Y-%m-%d").timestamp() * 1000)
+    hits = notes.backfill_grants(args.open_id, since_ms=since, dry_run=not args.yes)
+    print(f"{len(hits)} cuộc họp {'đã' if args.yes else 'SẼ'} được cấp quyền cho "
+          f"{args.open_id}.")
+    if not args.yes:
+        print("Thử khô. Thêm --yes để cấp thật (không thu hồi được bằng lệnh này).")
+
+
+def cmd_notes(args) -> None:
+    """V3 YC2: ghi lại file biên bản .md cho một cuộc (hoặc mọi cuộc đã phát)."""
+    _init()
+    from . import notes
+    from . import db as _db
+    toks = [args.token] if args.token else [
+        r["minute_token"] for r in _db.conn().execute("SELECT minute_token FROM note_files")]
+    for t in toks:
+        print(t, "->", notes.publish(t))
+
+
 def cmd_process(args) -> None:
     _init()
     orchestrator.process_queue(dry_run=not args.send)
@@ -817,6 +869,22 @@ def main() -> None:
 
     sub.add_parser("mcp", help="MCP server dữ liệu họp (Hermes gọi vào)"
                    ).set_defaults(fn=cmd_mcp)
+
+    og = sub.add_parser("org-sync", help="V3: kéo cây quản lý từ Lark Contact")
+    og.add_argument("--yes", action="store_true", help="ghi thật")
+    og.set_defaults(fn=cmd_org_sync)
+    dp = sub.add_parser("drive-provision", help="V3: tạo folder Drive cho mọi người")
+    dp.add_argument("--yes", action="store_true", help="tạo thật")
+    dp.set_defaults(fn=cmd_drive_provision)
+    gb = sub.add_parser("grants-backfill",
+                        help="V3: cấp lùi quyền cuộc cũ cho một quản lý")
+    gb.add_argument("--open-id", required=True)
+    gb.add_argument("--since", default="", help="YYYY-MM-DD")
+    gb.add_argument("--yes", action="store_true", help="cấp thật")
+    gb.set_defaults(fn=cmd_grants_backfill)
+    nt = sub.add_parser("notes", help="V3: ghi lại file biên bản .md")
+    nt.add_argument("token", nargs="?", default="")
+    nt.set_defaults(fn=cmd_notes)
 
     q = sub.add_parser("ask", help="hỏi đáp về các cuộc họp ở terminal")
     q.add_argument("question", nargs="+")

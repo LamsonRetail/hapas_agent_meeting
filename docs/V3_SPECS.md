@@ -21,7 +21,7 @@
 | Việc | Code + selftest | Việc áp lên hệ đang chạy (máy Windows) |
 |---|---|---|
 | **YC1** xác nhận của chủ | ✅ **XONG 28/09/2026** — selftest 716 PASS / 0 FAIL (+21 kiểm) | restart `v2 run`; chép plugin `hermes/v2-enroll-gate` **1.4.0** + `hermes gateway restart` (tool MCP mới + policy duyệt) |
-| YC2 kho `.md` + quyền quản lý + Drive | ⏳ | |
+| **YC2** kho `.md` + quyền quản lý + Drive | ✅ **XONG 28/09/2026** — selftest 742 PASS / 0 FAIL (+26 kiểm) | Console: bật scope **tenant** đọc danh bạ (có trường `leader_user_id`, phạm vi dữ liệu = toàn công ty) + `drive`; `v2 org-sync` → `--yes` → `ORG_SYNC_HOURS=24`; `v2 drive-provision` → duyệt danh sách → `--yes` → `DRIVE_ENABLED=1`; Base tự thêm 2 cột `Xác nhận`, `File biên bản` ở lần ghi đầu (external write — C.6) |
 | YC3 semantic search | ⏳ | |
 | YC5 liên kết cuộc họp | ⏳ | |
 | YC4 dashboard | ⏳ | |
@@ -280,6 +280,38 @@ may_see(user, meeting) := ∃ dòng note_grants(meeting, user)
   nhưng người không còn enroll/không còn trong org thì không còn đường hỏi.
 - Cột `source` chính là audit log tại chỗ: trả lời được "vì sao D đọc được
   họp của C" bằng một câu SELECT.
+
+### ✅ ĐÃ LÀM (28/09/2026) — các điểm khác/bổ sung so với thiết kế trên
+- **Scope là của BOT (tenant), không phải của user** → bật trên Console một
+  lần, **không ai phải enroll lại**. Folder/file do bot tạo; bot luôn giữ
+  quyền quản lý permission.
+- **Base giữ cột Tóm tắt/Quyết định/Việc cần làm làm "trích yếu" của index**
+  thay vì bỏ — nhờ vậy `qa` không phải viết lại, ACL vẫn một chỗ. File chi
+  tiết `.md` nằm trên Drive, Base có link ở cột `File biên bản` + cột
+  `Xác nhận` (C.6, đi đường gương `sync_jobs`). Muốn bỏ hẳn cột nội dung thì
+  làm sau, là thay đổi độc lập.
+- **`.md` KHÔNG chứa transcript nguyên văn** — bản nguyên văn vẫn đi đường
+  kéo (luật cũ "không tự đẩy transcript" giữ nguyên). Hệ quả cần biết: quản lý
+  có quyền cuộc họp thì cũng *xin* được bản nguyên văn qua bot, vì chỉ có MỘT
+  luật quyền (`qa.viewers_index`).
+- Quyền vật chất hoá ở bảng `note_grants` (cột `source` = audit, vd
+  `chain:D>E>C`); `qa.viewers_index` cộng bảng này — mọi đường đọc (hỏi đáp,
+  gửi transcript, tạo task) tự áp luật mới.
+- File local (nguồn) ở `v2/data/notes/{owner_open_id}/{yyyy-mm}/…md`; Drive là
+  bản xuất bản: hỏng Drive không chặn việc phát. *ponytail:* nội dung đổi →
+  file Drive mới (link đổi, Base cập nhật theo); muốn link cố định thì import
+  thành Lark Doc.
+- **Hai công tắc MẶC ĐỊNH TẮT** (`ORG_SYNC_HOURS=0`, `DRIVE_ENABLED=0`) vì bật
+  là đổi quyền xem / ghi ra ngoài trên hệ đang chạy (AGENTS.md). Lệnh mới đều
+  THỬ KHÔ mặc định: `v2 org-sync`, `v2 drive-provision`,
+  `v2 grants-backfill --open-id … [--since]`, `v2 notes [token]`.
+- Nhân viên đã nghỉ (`is_resigned`) bị bỏ khỏi cây; quyền đã cấp không xoá.
+
+Code: `v2/org.py`, `v2/notes.py` (mới) · 4 bảng `org_edges`, `note_grants`,
+`drive_spaces`, `note_files` · `lark_api` thêm danh bạ/Drive +
+`drive_member_add(notify=False)` · `qa.viewers_index` · `orchestrator`
+(`_publish_note` ở điểm phát, làm mới khi có tóm tắt nguyên văn,
+`_maybe_org_sync` mỗi vòng) · `bitable` 2 cột index.
 
 ### Cách kiểm
 1. Dựng org giả trong `org_edges`: D→E→C. Họp (A owner, B, C dự):

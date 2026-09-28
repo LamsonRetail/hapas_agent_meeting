@@ -379,6 +379,18 @@ CONFIRM_ENABLED = _get_bool("CONFIRM_ENABLED", True)
 CONFIRM_REMIND_HOURS = _get_int("CONFIRM_REMIND_HOURS", 4)
 CONFIRM_TIMEOUT_HOURS = _get_int("CONFIRM_TIMEOUT_HOURS", 24)
 
+# Kho biên bản .md + quyền theo cây quản lý (V3 YC2). HAI công tắc MẶC ĐỊNH TẮT
+# vì chúng đổi quyền / ghi ra ngoài trên hệ đang chạy — chủ hệ thống bật sau khi
+# xem `v2 org-sync` và `v2 drive-provision` (dry-run).
+#   ORG_SYNC_HOURS > 0 : đồng bộ cây quản lý mỗi N giờ -> quản lý thấy biên bản
+#                        của nhánh mình.
+#   DRIVE_ENABLED=1    : tạo folder cho mọi người + đẩy file .md lên Drive,
+#                        share im lặng cho người dự + chuỗi quản lý.
+NOTES_DIR = Path(_get("V2_NOTES_DIR", str(DATA_DIR / "notes")))
+ORG_SYNC_HOURS = _get_int("ORG_SYNC_HOURS", 0)
+DRIVE_ENABLED = _get_bool("DRIVE_ENABLED", False)
+DRIVE_ROOT_FOLDER = _get("DRIVE_ROOT_FOLDER", "")   # trống = thư mục gốc của bot
+
 # LLM (recap) gọi không được liên tục ngần này phút thì báo. Cùng lý lẽ với
 # whisper, nhưng hậu quả KHÁC và tệ hơn: whisper chết thì job nằm chờ (không
 # mất gì), còn LLM chết quá RECAP_MAX_TRIES vòng thì biên bản PHÁT ĐI với tóm

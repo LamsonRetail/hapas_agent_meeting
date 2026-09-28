@@ -4868,6 +4868,175 @@ def _main() -> int:
         wipe_jobs()
 
     # =================================================================
+    part("V3-YC2. Biên bản .md + quyền theo chuỗi quản lý + Drive")
+    # =================================================================
+    from v2 import confirm as _cf2, notes, org
+    _n_keep = {k: getattr(lark_api, k) for k in (
+        "contact_departments", "contact_users_in", "drive_root_folder",
+        "drive_folder_create", "drive_upload", "drive_file_delete",
+        "drive_file_url", "drive_member_add", "im_send_card")}
+    _n_cfg = (config.SEND_MODE, config.DRIVE_ENABLED)
+    _drv: dict[str, list] = {"folder": [], "upload": [], "delete": [], "member": []}
+    try:
+        with db.tx() as c:
+            for t in ("org_edges", "note_grants", "drive_spaces", "note_files",
+                      "confirmations", "tokens"):
+                c.execute(f"DELETE FROM {t}")
+        wipe_jobs()
+        # Cây: D -> E -> C ; F ở nhánh khác ; A, B không có sếp trong dữ liệu.
+        _people = [("ou_A", "on_A", "A", ""), ("ou_B", "on_B", "B", ""),
+                   ("ou_C", "on_C", "C", "ou_E"), ("ou_E", "on_E", "E", "ou_D"),
+                   ("ou_D", "on_D", "D", ""), ("ou_F", "on_F", "F", ""),
+                   ("ou_Q", "on_Q", "Nghi viec", "ou_D")]
+        lark_api.contact_departments = lambda: ["0", "od_1"]
+        lark_api.contact_users_in = lambda d: [] if d == "0" else [
+            {"open_id": o, "union_id": u, "name": n, "leader_user_id": l,
+             "status": {"is_resigned": o == "ou_Q"}} for o, u, n, l in _people]
+        _dry = org.sync(dry_run=True)
+        check("org-sync THỬ KHÔ không ghi gì",
+              db.conn().execute("SELECT COUNT(*) FROM org_edges").fetchone()[0] == 0)
+        _got = org.sync(dry_run=False)
+        check("org-sync ghi cây, bỏ người đã nghỉ việc", _got["users"] == 6
+              and not db.conn().execute(
+                  "SELECT 1 FROM org_edges WHERE open_id='ou_Q'").fetchone(), str(_got))
+        check("chain_up(C) = [E, D]", org.chain_up("ou_C") == ["ou_E", "ou_D"])
+        with db.tx() as c:
+            c.execute("INSERT INTO org_edges(open_id, leader_open_id) VALUES "
+                      "('ou_L1','ou_L2'),('ou_L2','ou_L1')")
+        check("dữ liệu vòng (L1<->L2) không treo", org.chain_up("ou_L1") == ["ou_L2"])
+
+        _mA = meta(minute_token="mtORG1", title="Hop A", owner_open_id="ou_A",
+                   owner_name="A", participants_source="calendar[verified]:x",
+                   attendees=[Attendee(open_id="ou_B", union_id="on_B", name="B"),
+                              Attendee(open_id="ou_C", union_id="on_C", name="C")])
+        jobstore.create(_mA, status="held")
+        jobstore.set_status("mtORG1", "held", recap_json=_cf2.recap_to_json(
+            Recap(summary="Tom tat A", decisions=["QD1"])))
+        notes.publish("mtORG1")
+        _src = {g["open_id"]: g["source"] for g in notes.grants_of("mtORG1")}
+        check("ví dụ chuẩn: A chủ, B C dự, E quản lý C, D quản lý E -> cả 5 có quyền",
+              set(_src) == {"ou_A", "ou_B", "ou_C", "ou_E", "ou_D"}, str(_src))
+        check("...nguồn quyền ghi lại được (audit): D qua nhánh D>E>C",
+              _src.get("ou_D") == "chain:D>E>C" and _src.get("ou_E") == "chain:E>C",
+              str(_src))
+        _idx = qa.viewers_index()
+        _W = lambda o: {"union_id": o.replace("ou_", "on_"), "open_id": o, "name": o}
+        check("D và E (không dự họp) TRUY VẤN được cuộc họp qua luật quyền duy nhất",
+              qa._may_see("mtORG1", _W("ou_D"), _idx)
+              and qa._may_see("mtORG1", _W("ou_E"), _idx))
+        check("F (nhánh khác) KHÔNG thấy", not qa._may_see("mtORG1", _W("ou_F"), _idx))
+
+        _md = Path(notes.get_file("mtORG1")["local_path"]).read_text(encoding="utf-8")
+        check("file .md có tóm tắt/quyết định, nằm trong space của CHỦ",
+              "Tom tat A" in _md and "- QD1" in _md
+              and "/ou_A/" in notes.get_file("mtORG1")["local_path"].replace("\\", "/"))
+
+        # Đổi sếp: C chuyển sang F. Quyền CŨ giữ; cuộc MỚI theo nhánh mới.
+        with db.tx() as c:
+            c.execute("UPDATE org_edges SET leader_open_id='ou_F' WHERE open_id='ou_C'")
+        _mN = meta(minute_token="mtORG2", title="Hop moi", owner_open_id="ou_C",
+                   participants_source="calendar[verified]:x", attendees=[])
+        jobstore.create(_mN, status="held")
+        notes.publish("mtORG2")
+        _idx = qa.viewers_index()
+        check("đổi sếp: E, D VẪN thấy cuộc CŨ (quyền không bị thu hồi)",
+              qa._may_see("mtORG1", _W("ou_E"), _idx)
+              and qa._may_see("mtORG1", _W("ou_D"), _idx))
+        check("...cuộc MỚI của C: F thấy, E/D không",
+              qa._may_see("mtORG2", _W("ou_F"), _idx)
+              and not qa._may_see("mtORG2", _W("ou_E"), _idx)
+              and not qa._may_see("mtORG2", _W("ou_D"), _idx))
+        check("...F chưa tự có quyền cuộc CŨ (cấp lùi phải tường minh)",
+              not qa._may_see("mtORG1", _W("ou_F"), _idx))
+        _bf = notes.backfill_grants("ou_F", dry_run=True)
+        check("grants-backfill THỬ KHÔ: liệt kê, chưa cấp",
+              "mtORG1" in _bf and not qa._may_see("mtORG1", _W("ou_F"), qa.viewers_index()))
+        notes.backfill_grants("ou_F", dry_run=False)
+        check("grants-backfill --yes: F thấy cuộc cũ, nguồn ghi 'backfill'",
+              qa._may_see("mtORG1", _W("ou_F"), qa.viewers_index())
+              and any(g["source"].startswith("backfill") for g in notes.grants_of("mtORG1")
+                      if g["open_id"] == "ou_F"))
+
+        _mNear = meta(minute_token="mtORG3", owner_open_id="ou_A",
+                      participants_source="calendar[near5m]:x",
+                      attendees=[Attendee(open_id="ou_C", union_id="on_C")])
+        jobstore.create(_mNear, status="held")
+        notes.publish("mtORG3")
+        check("người dự ghép theo GIỜ (calendar[near]) KHÔNG được cấp quyền, kể cả sếp họ",
+              {g["open_id"] for g in notes.grants_of("mtORG3")} == {"ou_A"})
+
+        # Nhãn duyệt trong .md + Base index
+        with db.tx() as c:
+            c.execute("INSERT INTO confirmations(minute_token, state) VALUES "
+                      "('mtORG1','auto_published')")
+        notes.publish("mtORG1")
+        _md = Path(notes.get_file("mtORG1")["local_path"]).read_text(encoding="utf-8")
+        check(".md mang nhãn 'Chưa được chủ trì review' khi tự phát",
+              "Chưa được chủ trì review" in _md)
+        _cf2._update("mtORG1", state="confirmed")
+        notes.publish("mtORG1")
+        _md = Path(notes.get_file("mtORG1")["local_path"]).read_text(encoding="utf-8")
+        check("...và 'Chủ trì đã duyệt' sau khi chủ duyệt", "Chủ trì đã duyệt" in _md)
+        from v2 import bitable as _bt2
+        check("Base (index) có cột Xác nhận lấy từ SQLite",
+              _bt2._job_fields(jobstore.get("mtORG1")).get(_bt2.F_CONFIRM)
+              == "chủ trì đã duyệt")
+
+        # Drive: bật công tắc, mọi lời gọi là hàm giả
+        config.SEND_MODE, config.DRIVE_ENABLED = True, True
+        lark_api.drive_root_folder = lambda: "fld_ROOT"
+        lark_api.drive_folder_create = lambda name, parent: (
+            _drv["folder"].append((name, parent)) or f"fld_{len(_drv['folder'])}")
+        lark_api.drive_upload = lambda path, folder: (
+            _drv["upload"].append((path.name, folder)) or f"file_{len(_drv['upload'])}")
+        lark_api.drive_file_delete = lambda t: _drv["delete"].append(t)
+        lark_api.drive_file_url = lambda t: f"https://x.larksuite.com/file/{t}"
+        lark_api.drive_member_add = (lambda token, doc_type, member_id, perm="full_access",
+                                     member_type="openid", notify=True:
+                                     _drv["member"].append((token, doc_type, member_id,
+                                                            perm, notify)))
+        notes.publish("mtORG1")
+        _own_folder = notes.space_of("ou_A", create=False)
+        check("Drive: tạo folder cho CHỦ, share cho chủ quyền sửa, IM LẶNG",
+              _own_folder and ("fld_1", "folder", "ou_A", "edit", False) in _drv["member"],
+              str(_drv["member"][:2]))
+        check("...file .md đẩy vào ĐÚNG folder của chủ",
+              _drv["upload"] and _drv["upload"][-1][1] == _own_folder
+              and _drv["upload"][-1][0].endswith(".md"))
+        _file_shares = {m[2] for m in _drv["member"] if m[1] == "file"}
+        check("...file share cho người dự + chuỗi quản lý (xem), KHÔNG thông báo",
+              _file_shares == {"ou_B", "ou_C", "ou_E", "ou_D", "ou_F"}
+              and all(m[3] == "view" and m[4] is False for m in _drv["member"]
+                      if m[1] == "file"), str(_file_shares))
+        check("...link file lên Base index (cột File biên bản)",
+              _bt2._job_fields(jobstore.get("mtORG1")).get(_bt2.F_NOTE, "").endswith("file_1"))
+        notes.publish("mtORG1")
+        check("nội dung đổi -> đẩy bản mới, xoá bản cũ, không tạo thêm folder",
+              _drv["delete"] == ["file_1"] and len(_drv["folder"]) == 1)
+        _drv["member"].clear()
+        _made = notes.provision(dry_run=True)
+        check("drive-provision THỬ KHÔ: liệt kê người chưa có folder, chưa tạo gì",
+              set(_made) >= {"B", "C", "D", "E", "F"} and "A" not in _made
+              and len(_drv["folder"]) == 1, str(_made))
+        notes.provision(dry_run=False)
+        check("drive-provision --yes: mỗi người MỘT folder, share im lặng",
+              len({m[2] for m in _drv["member"]}) == len(_made)
+              and all(m[4] is False and m[3] == "edit" for m in _drv["member"]))
+        _n = len(_drv["folder"])
+        notes.provision(dry_run=False)
+        check("...chạy lại không tạo trùng (người mới mới được tạo)",
+              len(_drv["folder"]) == _n)
+    finally:
+        for k, v in _n_keep.items():
+            setattr(lark_api, k, v)
+        config.SEND_MODE, config.DRIVE_ENABLED = _n_cfg
+        with db.tx() as c:
+            for t in ("org_edges", "note_grants", "drive_spaces", "note_files",
+                      "confirmations"):
+                c.execute(f"DELETE FROM {t}")
+        wipe_jobs()
+
+    # =================================================================
     part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")
     # =================================================================
     # Nhiều nhóm ở trên lưu-rồi-trả-lại thuộc tính của `lark_api`. Một cái trả

@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import config, jobstore, lark_api
+from . import config, db, jobstore, lark_api
 from .models import MeetingMeta, Recap
 
 # Giá trị cột `Trạng thái` — về VIỆC PHÁT (xem docstring module).
@@ -93,6 +93,9 @@ F_TRANSCRIPT = "File transcript"  # attachment, bấm xem ngay trên Base
 F_WHISPER_SEC = "Whisper (giây)"
 F_AUDIO_SEC = "Audio (giây)"
 F_WHISPER_X = "Tốc độ whisper"    # whisper/audio, vd "0.59x realtime"
+# V3 (28/09/2026): Base là INDEX; file chi tiết .md nằm trên Drive (docs/V3_SPECS.md).
+F_CONFIRM = "Xác nhận"            # chủ trì đã duyệt / chưa review / chờ duyệt
+F_NOTE = "File biên bản"          # link file .md trên Drive
 
 TABLE_NAME = "Biên bản"
 
@@ -144,6 +147,8 @@ SCHEMA: list[dict[str, Any]] = [
     {"name": F_WHISPER_SEC, "type": "number"},
     {"name": F_AUDIO_SEC, "type": "number"},
     {"name": F_WHISPER_X, "type": "text"},
+    {"name": F_CONFIRM, "type": "text"},
+    {"name": F_NOTE, "type": "text"},
 ]
 
 
@@ -440,7 +445,21 @@ def _job_fields(row: dict[str, Any]) -> dict[str, Any]:
         v = row.get(col)
         if v:
             out[fname] = int(v)           # datetime của Base nhận epoch ms
+    # V3: trạng thái duyệt của chủ + link file biên bản trên Drive (chỉ đọc SQLite).
+    token = row.get("minute_token") or ""
+    c = db.conn().execute("SELECT state FROM confirmations WHERE minute_token=?",
+                          (token,)).fetchone()
+    if c:
+        out[F_CONFIRM] = CONFIRM_LABEL.get(c["state"], c["state"])
+    n = db.conn().execute("SELECT drive_url FROM note_files WHERE minute_token=?",
+                          (token,)).fetchone()
+    if n and n["drive_url"]:
+        out[F_NOTE] = n["drive_url"]
     return out
+
+
+CONFIRM_LABEL = {"pending": "chờ chủ trì duyệt", "confirmed": "chủ trì đã duyệt",
+                 "auto_published": "chưa được chủ trì review"}
 
 
 def _meta_fields(row: dict[str, Any]) -> dict[str, Any]:
@@ -770,7 +789,7 @@ def update_recap(minute_token: str, recap: Recap) -> bool:
 # datetime ngay trên vừa cảnh báo. Nó vẫn được sửa, chỉ là đi ké lượt đẩy do ô
 # khác kích hoạt.
 _DIFF_FIELDS = (F_JOB_STATUS, F_ERROR, F_ATTEMPTS, F_INVITEES,
-                F_TITLE, F_SOURCE)
+                F_TITLE, F_SOURCE, F_CONFIRM, F_NOTE)
 
 
 def _needs_push(rec: dict[str, Any], want: dict[str, Any]) -> bool:

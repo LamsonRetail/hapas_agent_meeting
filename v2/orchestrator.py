@@ -185,6 +185,18 @@ def _notify_minute(meta: MeetingMeta) -> None:
     if decision == "held":
         return
     _broadcast_notice(meta, recap, unreviewed=(decision == "unreviewed"))
+    _publish_note(meta.minute_token)
+
+
+def _publish_note(token: str) -> None:
+    """Ghi biên bản .md + chụp quyền (V3 YC2). Việc phụ: hỏng không chặn phát."""
+    if not config.SEND_MODE:
+        return
+    try:
+        from . import notes
+        notes.publish(token)
+    except Exception as exc:                  # noqa: BLE001
+        print(f"[notes] {token} ghi biên bản hỏng (bỏ qua): {exc}")
 
 
 def _broadcast_notice(meta: MeetingMeta, recap, *, unreviewed: bool = False,
@@ -1281,6 +1293,13 @@ def _base_record_held(token: str, meta: MeetingMeta) -> None:
         bitable.write_draft(meta, recap, 0)
     except Exception as exc:              # noqa: BLE001 — ghi Base là việc phụ
         print(f"[base] {token} ghi record (held) hỏng (bỏ qua): {exc}")
+    # Đã phát rồi thì làm mới file biên bản bằng tóm tắt từ nguyên văn (V3 YC2).
+    try:
+        from . import notes
+        if notes.get_file(token):
+            _publish_note(token)
+    except Exception as exc:              # noqa: BLE001
+        print(f"[notes] {token} làm mới biên bản hỏng (bỏ qua): {exc}")
 
 
 def _collect_glossary(t, meta: MeetingMeta) -> None:
@@ -1339,6 +1358,27 @@ def _deliver_requested(meta: MeetingMeta, t, *, dry_run: bool) -> None:
 # =====================================================================
 #  Vòng chính
 # =====================================================================
+
+_last_org_sync = 0.0
+
+
+def _maybe_org_sync() -> None:
+    """Mỗi ORG_SYNC_HOURS: kéo cây quản lý; bật Drive thì tạo folder cho người mới."""
+    global _last_org_sync
+    if config.ORG_SYNC_HOURS <= 0:
+        return
+    now = time.monotonic()
+    if _last_org_sync and now - _last_org_sync < config.ORG_SYNC_HOURS * 3600:
+        return
+    _last_org_sync = now
+    from . import notes, org
+    got = org.sync(dry_run=False)
+    print(f"[org] đồng bộ: {got['users']} người, {got['changed']} đổi quản lý")
+    if config.DRIVE_ENABLED and config.SEND_MODE:
+        made = notes.provision(dry_run=False)
+        if made:
+            print(f"[notes] tạo folder cho {len(made)} người mới")
+
 
 def _start_heartbeat() -> None:
     """Thread nền ghi "tiến trình còn sống" mỗi 60s, cho `alerts._check_run_stale`.
@@ -1480,6 +1520,13 @@ def run() -> None:
         except Exception as exc:         # noqa: BLE001
             print(f"[alert] lỗi khi kiểm cảnh báo (bỏ qua, vòng run vẫn chạy): "
                   f"{exc}")
+
+        # Cây quản lý + folder Drive (V3 YC2). Tắt mặc định (ORG_SYNC_HOURS=0):
+        # bật là đổi quyền xem trên hệ đang chạy. Khối try riêng.
+        try:
+            _maybe_org_sync()
+        except Exception as exc:         # noqa: BLE001
+            print(f"[org] đồng bộ cây tổ chức hỏng (bỏ qua): {exc}")
 
         # Xác nhận của chủ (V3 YC1): nhắc + tự phát khi quá hạn. Khối try RIÊNG,
         # cùng lý lẽ cảnh báo: hỏng ở đây không được làm chết vòng run.

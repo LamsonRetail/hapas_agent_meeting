@@ -258,6 +258,47 @@ CREATE TABLE IF NOT EXISTS confirmations (
     responded_at   INTEGER,
     released_at    INTEGER
 );
+
+-- Cây tổ chức (V3 YC2), đồng bộ từ Lark Contact bằng tenant token (`org.sync`).
+-- Khoá open_id vì `jobs.meta_json` nói chuyện bằng open_id/union_id.
+CREATE TABLE IF NOT EXISTS org_edges (
+    open_id     TEXT PRIMARY KEY,
+    union_id    TEXT,
+    name        TEXT,
+    leader_open_id TEXT,
+    synced_at   INTEGER
+);
+
+-- Ai được xem biên bản cuộc nào — VẬT CHẤT HOÁ lúc phát (V3 YC2, chốt
+-- 16/09/2026: đổi sếp thì quyền CŨ vẫn giữ). Ghi một lần, KHÔNG thu hồi khi
+-- org đổi. `source` = audit tại chỗ: 'attendee' | 'owner' | 'chain:D>E>C' |
+-- 'backfill:…'. `qa.viewers_index` cộng bảng này vào luật quyền duy nhất.
+CREATE TABLE IF NOT EXISTS note_grants (
+    minute_token TEXT NOT NULL,
+    open_id      TEXT NOT NULL,
+    union_id     TEXT,
+    source       TEXT,
+    granted_at   INTEGER,
+    PRIMARY KEY (minute_token, open_id)
+);
+
+-- Folder Drive "space" của từng người (V3 YC2). Tạo bằng danh tính BOT.
+CREATE TABLE IF NOT EXISTS drive_spaces (
+    open_id      TEXT PRIMARY KEY,
+    folder_token TEXT,
+    created_at   INTEGER
+);
+
+-- File biên bản .md của từng cuộc họp: bản local (nguồn) + bản trên Drive.
+-- `shared` = open_id đã được share trên Drive (JSON list) — để chỉ share phần MỚI.
+CREATE TABLE IF NOT EXISTS note_files (
+    minute_token TEXT PRIMARY KEY,
+    local_path   TEXT,
+    drive_token  TEXT,
+    drive_url    TEXT,
+    shared       TEXT DEFAULT '[]',
+    updated_at   INTEGER
+);
 """
 
 _local = threading.local()
