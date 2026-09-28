@@ -237,6 +237,27 @@ CREATE TABLE IF NOT EXISTS glossary_candidates (
     first_seen INTEGER,
     last_seen  INTEGER
 );
+
+-- Xác nhận biên bản của CHỦ cuộc họp (V3 YC1, docs/V3_SPECS.md). Một dòng /
+-- cuộc họp. TÁCH khỏi `jobs.status` có chủ ý: whisper vẫn chạy nền theo máy
+-- trạng thái cũ, còn đây chỉ trả lời "người dự đã được báo chưa, chủ đã duyệt
+-- chưa". state: pending (chờ chủ) | confirmed (chủ duyệt) | auto_published
+-- (quá hạn, đã phát kèm nhãn "chưa review" — chủ vẫn duyệt/sửa được sau).
+-- `original_recap_json` = bản máy sinh, giữ để đo chất lượng (dashboard YC4).
+CREATE TABLE IF NOT EXISTS confirmations (
+    minute_token   TEXT PRIMARY KEY,
+    owner_union_id TEXT,
+    state          TEXT DEFAULT 'pending',
+    version        INTEGER DEFAULT 1,     -- tăng mỗi lần nội dung đổi
+    released_version INTEGER DEFAULT 0,   -- bản người dự đã nhận (0 = chưa)
+    edits          INTEGER DEFAULT 0,     -- số lần chủ sửa
+    diff_chars     INTEGER DEFAULT 0,     -- khoảng cách bản máy -> bản chủ chốt
+    original_recap_json TEXT,
+    sent_at        INTEGER,
+    reminded_at    INTEGER,
+    responded_at   INTEGER,
+    released_at    INTEGER
+);
 """
 
 _local = threading.local()

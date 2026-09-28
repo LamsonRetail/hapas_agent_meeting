@@ -16,6 +16,18 @@
 
 ---
 
+## 0. Trạng thái triển khai (cập nhật khi xong từng việc)
+
+| Việc | Code + selftest | Việc áp lên hệ đang chạy (máy Windows) |
+|---|---|---|
+| **YC1** xác nhận của chủ | ✅ **XONG 28/09/2026** — selftest 716 PASS / 0 FAIL (+21 kiểm) | restart `v2 run`; chép plugin `hermes/v2-enroll-gate` **1.4.0** + `hermes gateway restart` (tool MCP mới + policy duyệt) |
+| YC2 kho `.md` + quyền quản lý + Drive | ⏳ | |
+| YC3 semantic search | ⏳ | |
+| YC5 liên kết cuộc họp | ⏳ | |
+| YC4 dashboard | ⏳ | |
+
+---
+
 ## A. Hiện trạng (nền để bổ sung, không viết lại)
 
 ### A.1 Dữ liệu meeting notes đang nằm ở đâu
@@ -119,6 +131,27 @@ chết: job vẫn `delivered` như thường.
 thành 2 pha), `cards.py` (card confirm), `ws_listener.py`/plugin Hermes (nhận
 phản hồi owner), `alerts.py` (backlog quá hạn), `bitable.py` (cột `Tình trạng
 xử lý` thêm giá trị mới), `selftest.py`.
+
+### ✅ ĐÃ LÀM (28/09/2026) — khác spec ở 3 chỗ, có lý do
+- **Trạng thái duyệt KHÔNG nằm trong `jobs.status`** mà ở bảng riêng
+  `confirmations` (một dòng/cuộc, có bộ đếm `version/edits/diff_chars`). Lý do:
+  thẻ báo đi lúc họp xong (bản chép của Lark) trong khi whisper còn chạy nền
+  hàng giờ — hai máy trạng thái độc lập, trộn vào một cột là phá hàng đợi.
+- **Chủ chưa enroll → phát NGAY kèm nhãn "chưa review"** (không chờ 24h): bot
+  chỉ nhắn người đã cấp quyền, nên không ai duyệt được — chờ là vô ích. Chủ
+  enroll về sau vẫn duyệt/sửa được.
+- **Không có nút bấm** — card action đi vào WebSocket của Hermes. Chủ NHẮN
+  "duyệt …"/"sửa …", agent gọi tool MCP `confirm_meeting` / `edit_meeting`
+  (policy plugin 1.4.0 dặn cách gọi).
+
+Code: `v2/confirm.py` (mới) · `orchestrator._notify_minute` gác `confirm.gate`
+trước khi phát, tách `_broadcast_notice` · `confirm.tick()` mỗi vòng run (khối
+try riêng) · `pipeline.save_recap` khoá bản của chủ · `summarize.apply_edit` ·
+`cards.confirm_card` + nhãn `unreviewed`/`revised` · 2 tool MCP · config
+`CONFIRM_ENABLED=1`, `CONFIRM_REMIND_HOURS=4`, `CONFIRM_TIMEOUT_HOURS=24`.
+
+Bản whisper về khi chủ CHƯA đụng vào → chủ nhận "Bản cập nhật" để duyệt đúng
+cái sẽ phát; chủ đã sửa/duyệt → bản của chủ bị khoá, whisper không ghi đè.
 
 ### Cách kiểm
 1. Job giả có owner = mình → nhận đúng 1 card confirm; vòng run thứ hai không

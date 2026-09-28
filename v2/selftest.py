@@ -30,6 +30,7 @@ Ba luật của file này, giữ nguyên nếu thêm phép kiểm mới:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -3912,7 +3913,8 @@ def _main() -> int:
         oauth.has_live_nonce = lambda: False
         orchestrator._sleep_with_fast_enroll(20)
         check("KHÔNG ai enroll dở -> ngủ một mạch, không tốn lời gọi mạng nào",
-              not _fast_polls and _slept == [20], f"{_fast_polls} {_slept}")
+              not _fast_polls and len(_slept) == 1 and abs(_slept[0] - 20) < 0.01,
+              f"{_fast_polls} {_slept}")
         _fast_polls.clear()
         _slept.clear()
 
@@ -3922,7 +3924,7 @@ def _main() -> int:
         oauth.has_live_nonce = _nonce_boom
         orchestrator._sleep_with_fast_enroll(20)
         check("kiểm nonce hỏng -> vẫn ngủ đủ, KHÔNG làm chết vòng run",
-              _slept == [20], str(_slept))
+              len(_slept) == 1 and abs(_slept[0] - 20) < 0.01, str(_slept))
     finally:
         oauth.has_live_nonce, oauth.poll_pending, time.sleep = _keep_fast
 
@@ -4696,7 +4698,7 @@ def _main() -> int:
           "bản chép sẵn của Lark" in _plug._POLICY
           and "send_transcript_file" in _plug._POLICY)
     check("policy đổi version để phiên cũ nhận chính sách mới",
-          _plug.POLICY_VERSION.endswith("2026-08-07.1"), _plug.POLICY_VERSION)
+          _plug.POLICY_VERSION.endswith("2026-09-28.1"), _plug.POLICY_VERSION)
 
     # --- Ước tính phải TỚI được người dùng qua sendfile -------------------
     wipe_jobs()
@@ -4714,6 +4716,156 @@ def _main() -> int:
           and any(r["requester"] == "on_S"
                   for r in db.transcript_requesters("mtETASF")))
     wipe_jobs()
+
+    # =================================================================
+    part("V3-YC1. Chủ cuộc họp duyệt biên bản trước khi báo người dự")
+    # =================================================================
+    from v2 import confirm
+    _c_keep = (lark_api.im_send_card, config.SEND_MODE, config.CONFIRM_ENABLED,
+               summarize.apply_edit)
+    _c_sent: list[tuple[str, dict, str]] = []
+    try:
+        lark_api.im_send_card = (lambda rid, card, *, id_type="union_id",
+                                 uuid_key=None: _c_sent.append((rid, card, uuid_key)) or "om")
+        config.SEND_MODE, config.CONFIRM_ENABLED = True, True
+        summarize.apply_edit = lambda recap, instr, title: Recap(
+            summary=recap.summary + " [đã sửa: " + instr + "]",
+            decisions=recap.decisions, action_items=recap.action_items)
+        with db.tx() as c:
+            c.execute("DELETE FROM confirmations")
+            c.execute("DELETE FROM tokens")
+        wipe_jobs()
+        add_user("ou_OWN", "on_OWN", "Chu Tri")
+        add_user("ou_B", "on_B", "Nguoi B")
+        add_user("ou_X", "on_X", "Nguoi Ngoai")
+        _m1 = meta(minute_token="mtCONF1", title="Hop duyet", owner_open_id="ou_OWN",
+                   owner_name="Chu Tri", participants_source="calendar[verified]:x",
+                   attendees=[Attendee(open_id="ou_OWN", union_id="on_OWN"),
+                              Attendee(open_id="ou_B", union_id="on_B")])
+        jobstore.create(_m1, status="queued")
+        _r1 = Recap(summary="Chot gia 90k", decisions=["gia 90k"])
+        jobstore.set_status("mtCONF1", "queued", recap_json=confirm.recap_to_json(_r1))
+        _own = {"union_id": "on_OWN", "open_id": "ou_OWN", "name": "Chu Tri"}
+
+        check("chủ đã enroll -> gate GIỮ lại, không báo người dự",
+              confirm.gate(_m1, _r1) == "held")
+        check("...đúng 1 thẻ duyệt, gửi cho CHỦ, không ai khác",
+              [x[0] for x in _c_sent] == ["on_OWN"]
+              and "Cần bạn duyệt" in _c_sent[0][1]["header"]["title"]["content"],
+              str([x[0] for x in _c_sent]))
+        confirm.gate(_m1, _r1)
+        check("gọi gate lần hai (vòng sau / restart) -> KHÔNG gửi lại", len(_c_sent) == 1)
+
+        _c_sent.clear()
+        _deny = confirm.approve({"union_id": "on_B", "open_id": "ou_B", "name": "B"},
+                                "mtCONF1")
+        check("người KHÔNG phải chủ nhắn 'duyệt' -> bị từ chối, không phát gì",
+              "Chỉ chủ trì" in _deny and not _c_sent
+              and confirm.get("mtCONF1")["state"] == "pending", _deny)
+
+        _ed = confirm.edit(_own, "mtCONF1", "gia la 100k")
+        _row = confirm.get("mtCONF1")
+        check("chủ sửa -> recap đổi, version 2, chưa phát cho ai",
+              "đã sửa" in _ed and _row["version"] == 2 and _row["edits"] == 1
+              and not _c_sent, _ed[:120])
+        check("...bản của chủ bị KHOÁ: tóm tắt whisper về sau không ghi đè",
+              confirm.locked("mtCONF1")
+              and "đã sửa" in pipeline.save_recap(_m1, Recap(summary="ban whisper")).summary
+              and "đã sửa" in confirm.current_recap("mtCONF1").summary)
+
+        _ap = confirm.approve(_own, "mtCONF1")
+        _row = confirm.get("mtCONF1")
+        check("chủ duyệt -> phát cho người dự (trừ chính chủ), đúng BẢN ĐÃ SỬA",
+              [x[0] for x in _c_sent] == ["on_B"]
+              and "đã sửa" in json.dumps(_c_sent[0][1], ensure_ascii=False)
+              and _row["state"] == "confirmed" and _row["released_version"] == 2,
+              f"{[x[0] for x in _c_sent]} {_ap}")
+        check("...và đo được mức chủ sửa (diff_chars > 0)", _row["diff_chars"] > 0)
+        _c_sent.clear()
+        confirm.approve(_own, "mtCONF1")
+        check("duyệt lại khi nội dung không đổi -> KHÔNG gửi gì cho người dự",
+              not _c_sent)
+
+        # --- quá hạn -> tự phát kèm nhãn; chủ sửa muộn -> báo 'Đã hiệu chỉnh' 1 lần
+        _m2 = meta(minute_token="mtCONF2", title="Hop im lang", owner_open_id="ou_OWN",
+                   participants_source="calendar[verified]:x",
+                   attendees=[Attendee(open_id="ou_B", union_id="on_B")])
+        jobstore.create(_m2, status="held")
+        jobstore.set_status("mtCONF2", "held", recap_json=confirm.recap_to_json(_r1))
+        confirm.gate(_m2, _r1)
+        _c_sent.clear()
+        _h = 3_600_000
+        _update = confirm._update
+        _update("mtCONF2", sent_at=confirm._now_ms() - 5 * _h)
+        confirm.tick()
+        check("quá 4h chưa duyệt -> nhắc chủ đúng 1 lần",
+              [x[0] for x in _c_sent] == ["on_OWN"]
+              and "Nhắc" in _c_sent[0][1]["header"]["title"]["content"])
+        confirm.tick()
+        check("...vòng sau KHÔNG nhắc lại", len(_c_sent) == 1)
+        _c_sent.clear()
+        _update("mtCONF2", sent_at=confirm._now_ms() - 25 * _h)
+        confirm.tick()
+        check("quá 24h -> tự phát cho người dự, kèm nhãn 'chưa được chủ trì review'",
+              [x[0] for x in _c_sent] == ["on_B"]
+              and "chưa được chủ trì review" in json.dumps(_c_sent[0][1], ensure_ascii=False)
+              and confirm.get("mtCONF2")["state"] == "auto_published")
+        _c_sent.clear()
+        confirm.approve(_own, "mtCONF2")
+        check("chủ duyệt MUỘN, không sửa -> chỉ gỡ nhãn, không gửi gì thêm",
+              not _c_sent and confirm.get("mtCONF2")["state"] == "confirmed")
+        confirm.edit(_own, "mtCONF2", "them y X")
+        confirm.approve(_own, "mtCONF2")
+        _hdr = [x[1]["header"]["title"]["content"] for x in _c_sent]
+        check("chủ sửa MUỘN rồi duyệt -> người dự nhận thẻ 'Đã hiệu chỉnh', đúng 1 lần",
+              [x[0] for x in _c_sent] == ["on_B"] and _hdr[0].startswith("Đã hiệu chỉnh")
+              and _c_sent[0][2] != "", str(_hdr))
+        check("...khoá chống trùng của bản hiệu chỉnh KHÁC bản đầu (Lark không nuốt)",
+              "v2" in (_c_sent[0][2] or ""), str(_c_sent[0][2]))
+
+        # --- chủ chưa enroll -> phát ngay kèm nhãn; tắt tính năng -> như cũ
+        _m3 = meta(minute_token="mtCONF3", owner_open_id="ou_NOBODY",
+                   participants_source="calendar[verified]:x",
+                   attendees=[Attendee(open_id="ou_B", union_id="on_B")])
+        jobstore.create(_m3, status="queued")
+        check("chủ CHƯA enroll -> không ai duyệt được -> phát ngay kèm nhãn",
+              confirm.gate(_m3, _r1) == "unreviewed"
+              and confirm.get("mtCONF3")["state"] == "auto_published")
+        config.CONFIRM_ENABLED = False
+        check("CONFIRM_ENABLED=0 -> hành vi cũ (phát ngay, không nhãn)",
+              confirm.gate(_m1, _r1) == "publish")
+        config.CONFIRM_ENABLED = True
+
+        # --- whisper về khi chủ CHƯA đụng vào -> gửi chủ bản mới để duyệt đúng cái sẽ phát
+        _m4 = meta(minute_token="mtCONF4", owner_open_id="ou_OWN",
+                   participants_source="calendar[verified]:x",
+                   attendees=[Attendee(open_id="ou_B", union_id="on_B")])
+        jobstore.create(_m4, status="queued")
+        confirm.gate(_m4, _r1)
+        _c_sent.clear()
+        pipeline.save_recap(_m4, Recap(summary="Ban tu nguyen van, chi tiet hon"))
+        check("tóm tắt từ nguyên văn về lúc chủ chưa duyệt -> chủ nhận 'Bản cập nhật'",
+              [x[0] for x in _c_sent] == ["on_OWN"]
+              and "Bản cập nhật" in _c_sent[0][1]["header"]["title"]["content"]
+              and confirm.get("mtCONF4")["version"] == 2)
+        check("...và bản đó CHƯA bị khoá (chủ chưa sửa/duyệt)",
+              not confirm.locked("mtCONF4"))
+
+        # --- MCP: hai tool mới có mặt, gọi qua call_tool không vỡ
+        _names = {t["name"] for t in mcp_server.public_tools()}
+        check("MCP có confirm_meeting + edit_meeting",
+              {"confirm_meeting", "edit_meeting"} <= _names)
+        _txt, _err = mcp_server.call_tool("confirm_meeting",
+                                          {"asker_token": "sai", "minute_token": "mtCONF1"})
+        check("...vé sai -> không duyệt được (fail-closed)",
+              "Chỉ chủ trì" not in _txt and confirm.get("mtCONF1")["state"] == "confirmed"
+              and not _err, _txt[:100])
+    finally:
+        (lark_api.im_send_card, config.SEND_MODE, config.CONFIRM_ENABLED,
+         summarize.apply_edit) = _c_keep
+        with db.tx() as c:
+            c.execute("DELETE FROM confirmations")
+        wipe_jobs()
 
     # =================================================================
     part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")

@@ -146,7 +146,13 @@ def recap_card(meta: MeetingMeta, recap: Recap) -> dict[str, Any]:
     }
 
 
-def minute_notice_card(meta: MeetingMeta, recap: Recap) -> dict[str, Any]:
+UNREVIEWED_NOTE = ("⚠️ Biên bản **chưa được chủ trì review** — nội dung do máy "
+                   "tóm tắt, có thể còn sai sót.")
+
+
+def minute_notice_card(meta: MeetingMeta, recap: Recap,
+                       unreviewed: bool = False,
+                       revised: bool = False) -> dict[str, Any]:
     """Thẻ báo NGAY khi họp xong (mô hình kéo, 03/08/2026).
 
     Gửi liền: tóm tắt NỘI DUNG MINUTE LARK + link Minute + LỜI MỜI lấy bản
@@ -156,6 +162,9 @@ def minute_notice_card(meta: MeetingMeta, recap: Recap) -> dict[str, Any]:
     """
     when = _fmt_time_range(meta)
     elements: list[dict[str, Any]] = []
+    if unreviewed:
+        elements.append({"tag": "div", "text": {"tag": "lark_md",
+                        "content": UNREVIEWED_NOTE}})
     if when:
         elements.append({"tag": "div", "text": {"tag": "lark_md",
                         "content": f"🕐 {when}"}})
@@ -173,6 +182,42 @@ def minute_notice_card(meta: MeetingMeta, recap: Recap) -> dict[str, Any]:
         "config": {"wide_screen_mode": True},
         "header": {"template": "blue",
                    "title": {"tag": "plain_text",
-                             "content": f"Họp xong: {meta.title}"[:100]}},
+                             "content": f"{'Đã hiệu chỉnh' if revised else 'Họp xong'}: {meta.title}"[:100]}},
+        "elements": elements,
+    }
+
+
+def confirm_card(meta: MeetingMeta, recap: Recap, *,
+                 updated: bool = False, reminder: bool = False) -> dict[str, Any]:
+    """Thẻ gửi CHỦ cuộc họp để duyệt/sửa biên bản trước khi phát (V3 YC1).
+
+    Không có nút — cùng lý do `minute_notice_card`: card action đi vào WebSocket
+    của Hermes. Chủ NHẮN "duyệt …" / "sửa …", agent gọi tool `confirm_meeting` /
+    `edit_meeting`.
+    """
+    from . import config
+    head = ("Nhắc: " if reminder else "") + ("Bản cập nhật — " if updated else "")
+    lead = ("Tóm tắt đã được làm lại từ **bản nguyên văn** (chi tiết hơn). "
+            if updated else "")
+    elements: list[dict[str, Any]] = [
+        {"tag": "div", "text": {"tag": "lark_md", "content": (
+            f"{lead}Bạn là chủ trì cuộc họp này. Biên bản **chưa gửi** cho "
+            "người dự — bạn xem giúp và chọn:\n"
+            f"• Nhắn **duyệt {meta.title}** để phát cho người dự\n"
+            f"• Nhắn **sửa {meta.title}: <nội dung cần sửa>** để chỉnh\n"
+            f"Sau {config.CONFIRM_TIMEOUT_HOURS} giờ không phản hồi, biên bản tự "
+            "phát kèm ghi chú *chưa được review* — bạn vẫn duyệt/sửa được sau đó.")}},
+        {"tag": "hr"},
+        {"tag": "div", "text": {"tag": "lark_md",
+                                "content": recap.to_markdown()[:4000]}},
+    ]
+    if meta.app_link:
+        elements.append({"tag": "div", "text": {"tag": "lark_md",
+                        "content": f"📄 [Mở bản Minute trên Lark]({meta.app_link})"}})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "orange",
+                   "title": {"tag": "plain_text",
+                             "content": f"{head}Cần bạn duyệt: {meta.title}"[:100]}},
         "elements": elements,
     }

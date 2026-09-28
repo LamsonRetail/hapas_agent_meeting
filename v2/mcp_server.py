@@ -123,6 +123,19 @@ def _tool_create_task(a: dict[str, Any]) -> str:
         due=str(a.get("due") or ""), note=str(a.get("note") or ""))
 
 
+def _tool_confirm_meeting(a: dict[str, Any]) -> str:
+    """GHI: chủ duyệt biên bản. Ràng buộc chủ-cuộc-họp nằm ở `confirm.py`."""
+    from . import confirm
+    return confirm.approve(_who(a), str(a.get("minute_token") or ""))
+
+
+def _tool_edit_meeting(a: dict[str, Any]) -> str:
+    """GHI: chủ sửa biên bản. Ràng buộc chủ-cuộc-họp nằm ở `confirm.py`."""
+    from . import confirm
+    return confirm.edit(_who(a), str(a.get("minute_token") or ""),
+                        str(a.get("instruction") or ""))
+
+
 def _terms_arg(a: dict[str, Any]) -> list[str]:
     """`terms` nhận list HOẶC chuỗi 'A, B' (agent hay gửi văn xuôi) -> list."""
     v = a.get("terms")
@@ -313,6 +326,45 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["asker_token", "minute_token", "summary"],
         },
         "_fn": _tool_create_task,
+    },
+    {
+        "name": "confirm_meeting",
+        "description": (
+            "CHỈ CHỦ TRÌ cuộc họp. DUYỆT biên bản để phát cho người dự. Dùng khi "
+            "chủ trì nhắn 'duyệt <tên cuộc họp>', 'ok phát đi', 'biên bản đúng rồi' "
+            "sau khi nhận thẻ 'Cần bạn duyệt'. `minute_token` nhận cả TÊN cuộc họp. "
+            "Người không phải chủ trì gọi sẽ bị từ chối — chuyển nguyên câu từ chối."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+                "minute_token": {"type": "string",
+                                 "description": "token hoặc tên cuộc họp cần duyệt"},
+            },
+            "required": ["asker_token", "minute_token"],
+        },
+        "_fn": _tool_confirm_meeting,
+    },
+    {
+        "name": "edit_meeting",
+        "description": (
+            "CHỈ CHỦ TRÌ cuộc họp. SỬA biên bản (tóm tắt / quyết định / việc cần "
+            "làm) theo lời chủ trì, ví dụ 'sửa <tên>: quyết định 2 là chốt giá "
+            "100k'. `instruction` = NGUYÊN VĂN yêu cầu sửa. Kết quả là bản mới — "
+            "chép cho chủ trì xem và nhắc họ nhắn 'duyệt <tên>' để phát. Không sửa "
+            "được transcript nguyên văn."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+                "minute_token": {"type": "string",
+                                 "description": "token hoặc tên cuộc họp cần sửa"},
+                "instruction": {"type": "string",
+                                "description": "nguyên văn yêu cầu chỉnh sửa"},
+            },
+            "required": ["asker_token", "minute_token", "instruction"],
+        },
+        "_fn": _tool_edit_meeting,
     },
     {
         "name": "glossary_pending",

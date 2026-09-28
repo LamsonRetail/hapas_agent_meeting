@@ -228,14 +228,28 @@ def download_recording(meta: MeetingMeta) -> tuple[Path, str]:
 
 
 def save_recap(meta: MeetingMeta, recap: Recap) -> Recap:
-    """Lưu recap vào job rồi trả lại nó (để gọi được dạng `return save_recap(...)`)."""
+    """Lưu recap vào job rồi trả lại nó (để gọi được dạng `return save_recap(...)`).
+
+    V3 YC1: chủ cuộc họp đã sửa/duyệt thì bản của CHỦ thắng — không ghi đè, trả
+    lại đúng bản đó. Chủ chưa đụng vào mà đang chờ duyệt thì báo chủ bản mới.
+    """
     import json as _json
+    from . import confirm
+    if confirm.locked(meta.minute_token):
+        kept = confirm.current_recap(meta.minute_token)
+        if kept is not None:
+            jobstore.set_status(meta.minute_token, "recapping")
+            return kept
     jobstore.set_status(meta.minute_token, "recapping",
                         recap_json=_json.dumps({
                             "summary": recap.summary,
                             "decisions": recap.decisions,
                             "action_items": [a.__dict__ for a in recap.action_items],
                         }, ensure_ascii=False))
+    try:
+        confirm.on_new_recap(meta, recap)
+    except Exception as exc:                  # noqa: BLE001 — báo chủ là việc phụ
+        print(f"[confirm] {meta.minute_token} báo chủ bản mới hỏng (bỏ qua): {exc}")
     return recap
 
 

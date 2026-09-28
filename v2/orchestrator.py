@@ -150,8 +150,9 @@ def _notify_minute(meta: MeetingMeta) -> None:
     cuộc họp gần như không bao giờ là token đọc được bản chép. Việc chọn token
     nay là của `larktext`, chỗ duy nhất biết cả thang ứng viên.
     """
+    from . import confirm
     recips, _ = _recipients(meta)
-    if not recips:
+    if not recips and not confirm.owner_union_id(meta):
         return
     # THỬ TỪNG token ứng viên, không chỉ token của người tình cờ phát hiện ra
     # cuộc họp (sửa 07/08/2026). Bản cũ gọi thẳng `minutes_transcript` bằng
@@ -179,21 +180,38 @@ def _notify_minute(meta: MeetingMeta) -> None:
             ensure_ascii=False))
     except Exception as exc:                  # noqa: BLE001 — lưu recap là phụ
         print(f"[notify] {meta.minute_token} lưu recap_json hỏng (bỏ qua): {exc}")
-    card = cards.minute_notice_card(meta, recap)
+    # V3 YC1: chủ cuộc họp duyệt TRƯỚC, người dự nhận sau (xem `confirm.py`).
+    decision = confirm.gate(meta, recap)
+    if decision == "held":
+        return
+    _broadcast_notice(meta, recap, unreviewed=(decision == "unreviewed"))
+
+
+def _broadcast_notice(meta: MeetingMeta, recap, *, unreviewed: bool = False,
+                      revised: bool = False, exclude: set[str] | None = None,
+                      tag: str = "") -> int:
+    """Gửi thẻ "Họp xong" cho người dự đã enroll. Trả số người nhận được.
+
+    `tag` đổi khoá chống trùng của Lark cho bản HIỆU CHỈNH — cùng khoá thì Lark
+    coi là tin cũ và nuốt mất (uuid dedup)."""
+    recips = [r for r in _recipients(meta)[0] if r not in (exclude or set())]
+    card = cards.minute_notice_card(meta, recap, unreviewed=unreviewed,
+                                    revised=revised)
     if not config.SEND_MODE:
         print(f"[notify] (dry-run) {meta.minute_token} -> báo Minute+tóm tắt "
               f"cho {len(recips)} người")
-        return
+        return 0
     ok = 0
     for rid in recips:
         try:
             lark_api.im_send_card(rid, card, id_type="union_id",
-                                  uuid_key=f"notice-{meta.minute_token}-{rid}"[:50])
+                                  uuid_key=f"notice{tag}-{meta.minute_token}-{rid}"[:50])
             ok += 1
         except lark_api.LarkError as exc:
             print(f"[notify] gửi báo cho {rid} hỏng: {exc}")
     print(f"[notify] {meta.minute_token} -> báo Minute+tóm tắt: "
           f"{ok}/{len(recips)} người")
+    return ok
 
 
 ENROLL_FAST_POLL_S = 5
@@ -1462,6 +1480,14 @@ def run() -> None:
         except Exception as exc:         # noqa: BLE001
             print(f"[alert] lỗi khi kiểm cảnh báo (bỏ qua, vòng run vẫn chạy): "
                   f"{exc}")
+
+        # Xác nhận của chủ (V3 YC1): nhắc + tự phát khi quá hạn. Khối try RIÊNG,
+        # cùng lý lẽ cảnh báo: hỏng ở đây không được làm chết vòng run.
+        try:
+            from . import confirm
+            confirm.tick()
+        except Exception as exc:         # noqa: BLE001
+            print(f"[confirm] lỗi vòng nhắc/tự phát (bỏ qua): {exc}")
 
         # Sao lưu: khối try RIÊNG, cùng lý lẽ với cảnh báo. Chạy cả khi PAUSED
         # (dừng phát không phải dừng bảo vệ dữ liệu), và SAU process_queue để

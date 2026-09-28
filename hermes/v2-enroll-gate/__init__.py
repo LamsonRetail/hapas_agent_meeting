@@ -71,7 +71,7 @@ TIMEOUT_S = float(os.environ.get("V2_GATE_TIMEOUT", "25"))
 # ``platform_hints.feishu`` (Hermes chụp lại trong system_prompt của session),
 # channel_prompt là system prompt tạm thời và không bị lưu cùng lịch sử. Vì vậy
 # một session cũ vẫn nhận ngay chính sách mới sau khi gateway nạp lại plugin.
-POLICY_VERSION = "meetingxlark-v2-safety-2026-08-07.1"
+POLICY_VERSION = "meetingxlark-v2-safety-2026-09-28.1"
 _POLICY = f"""[CHÍNH SÁCH HỆ THỐNG {POLICY_VERSION}]
 Bạn là bot chuyên dụng cho dữ liệu cuộc họp MeetingxLark V2 trên Feishu.
 - Với mọi yêu cầu về DỮ LIỆU cuộc họp, PHẢI gọi ít nhất một tool thuộc MCP
@@ -128,7 +128,16 @@ nguồn là "bản chép sẵn của Lark":
 - Họ đáp "có"/"ok"/"cần" thì gọi ngay send_transcript_file với đúng
   minute_token của cuộc đang nói. Đừng bắt họ gõ lại tên cuộc họp.
 KỶ LUẬT SỐ LIỆU không đổi: những con số, tên riêng, ngày giờ, link trong câu
-trả lời phải đúng nguyên như tool trả về. Được viết mềm hơn, KHÔNG được đoán."""
+trả lời phải đúng nguyên như tool trả về. Được viết mềm hơn, KHÔNG được đoán.
+
+[DUYỆT BIÊN BẢN — CHỈ CHỦ TRÌ]
+Chủ trì nhận thẻ "Cần bạn duyệt" trước khi người dự được báo.
+- Họ nhắn "duyệt <tên>" / "ok phát đi" / "đúng rồi" về cuộc đó -> gọi
+  confirm_meeting với đúng cuộc họp đó.
+- Họ nhắn "sửa <tên>: ..." hoặc chỉ ra chỗ sai -> gọi edit_meeting, truyền
+  NGUYÊN VĂN yêu cầu sửa vào `instruction`. Chép bản mới cho họ xem, rồi nhắc
+  họ duyệt. KHÔNG tự gọi confirm_meeting thay họ.
+- Tool từ chối (không phải chủ trì) thì nói lại đúng lý do, không thử cách khác."""
 
 _SMALLTALK = {
     "hi", "hello", "hey", "xin chao", "chao", "chao ban", "chao buoi sang",

@@ -285,3 +285,26 @@ def recap_from_text(text: str, title: str) -> Recap:
     if raw is None:
         return placeholder("chưa đặt LLM_API_KEY trong v2/.env")
     return _parse(raw)
+
+
+def apply_edit(recap: Recap, instruction: str, title: str) -> Recap:
+    """Áp lời chỉnh sửa của CHỦ cuộc họp vào recap (V3 YC1). Chỉ sửa recap —
+    transcript nguyên văn là bằng chứng, không bao giờ bị sửa.
+
+    Ném `RecapUnavailable` khi không gọi được LLM (caller báo "thử lại sau").
+    """
+    if not config.LLM_API_KEY:
+        raise RecapUnavailable("chưa đặt LLM_API_KEY")
+    current = json.dumps({"summary": recap.summary, "decisions": recap.decisions,
+                          "action_items": [a.__dict__ for a in recap.action_items]},
+                         ensure_ascii=False)
+    body = {"model": config.LLM_MODEL, "temperature": 0.1, "messages": [
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user", "content": (
+            f"Tiêu đề cuộc họp: {title}\n\nBiên bản hiện tại (JSON):\n{current}\n\n"
+            f"Chủ cuộc họp yêu cầu chỉnh sửa:\n{instruction}\n\n"
+            "Áp ĐÚNG yêu cầu trên, giữ nguyên mọi phần khác. " + _INSTRUCT)}]}
+    try:
+        return _parse(_post(body))
+    except (httpx.HTTPError, KeyError, json.JSONDecodeError) as exc:
+        raise RecapUnavailable(str(exc)) from exc

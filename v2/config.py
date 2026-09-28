@@ -372,6 +372,13 @@ GLOSSARY_MAX_TERMS = _get_int("V2_GLOSSARY_MAX_TERMS", 60)
 # cũng không ai đọc.
 ALERT_WHISPER_AFTER_MIN = _get_int("ALERT_WHISPER_AFTER_MIN", 15)
 
+# Xác nhận biên bản của chủ cuộc họp (V3 YC1, chốt 16/09/2026): gửi chủ trước,
+# duyệt xong mới báo người dự. Im lặng quá CONFIRM_TIMEOUT_HOURS -> tự phát kèm
+# nhãn "chưa được chủ trì review"; chủ vẫn duyệt/sửa được sau đó.
+CONFIRM_ENABLED = _get_bool("CONFIRM_ENABLED", True)
+CONFIRM_REMIND_HOURS = _get_int("CONFIRM_REMIND_HOURS", 4)
+CONFIRM_TIMEOUT_HOURS = _get_int("CONFIRM_TIMEOUT_HOURS", 24)
+
 # LLM (recap) gọi không được liên tục ngần này phút thì báo. Cùng lý lẽ với
 # whisper, nhưng hậu quả KHÁC và tệ hơn: whisper chết thì job nằm chờ (không
 # mất gì), còn LLM chết quá RECAP_MAX_TRIES vòng thì biên bản PHÁT ĐI với tóm

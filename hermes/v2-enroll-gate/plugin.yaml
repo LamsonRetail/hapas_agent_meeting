@@ -1,5 +1,5 @@
 name: v2-enroll-gate
-version: 1.3.0
+version: 1.4.0
 description: >
   Cửa vào cho bot biên bản họp (meetingxlark V2). Người chưa cấp quyền OAuth thì
   bot gửi link để họ tự bấm Đồng ý, và tin nhắn KHÔNG đi tới agent (không tốn
