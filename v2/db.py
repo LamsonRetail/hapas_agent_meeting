@@ -299,6 +299,28 @@ CREATE TABLE IF NOT EXISTS note_files (
     shared       TEXT DEFAULT '[]',
     updated_at   INTEGER
 );
+
+-- Vector ngữ nghĩa (V3 YC3). Nằm NGAY trong state.db: giữ seam "toàn bộ state
+-- trong state.db + .env". `vec` = float32 đã chuẩn hoá (cosine = tích vô hướng).
+CREATE TABLE IF NOT EXISTS embeddings (
+    minute_token TEXT NOT NULL,
+    chunk_id     INTEGER NOT NULL,
+    kind         TEXT,               -- recap | transcript
+    text         TEXT,
+    vec          BLOB,
+    model        TEXT,
+    created_at   INTEGER,
+    PRIMARY KEY (minute_token, chunk_id)
+);
+
+-- Nhật ký truy vấn (V3 YC4 dashboard): ai hỏi gì, ra mấy kết quả.
+CREATE TABLE IF NOT EXISTS query_log (
+    ts        INTEGER,
+    asker     TEXT,
+    tool      TEXT,
+    query     TEXT,
+    n_hits    INTEGER
+);
 """
 
 _local = threading.local()

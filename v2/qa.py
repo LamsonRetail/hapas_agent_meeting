@@ -309,6 +309,18 @@ def viewers_index() -> dict[str, set[str]]:
             "SELECT minute_token, open_id, union_id FROM note_grants"):
         if g["minute_token"] in out:
             out[g["minute_token"]] |= {x for x in (g["open_id"], g["union_id"]) if x}
+    # V3 YC1: đang CHỜ CHỦ DUYỆT thì chỉ chủ thấy. Không có dòng này thì người
+    # dự hỏi bot là ra nội dung trước khi chủ duyệt — đi vòng qua đúng cái cổng
+    # mà YC1 dựng lên.
+    for c in db.conn().execute("SELECT minute_token, owner_union_id FROM "
+                               "confirmations WHERE state='pending'"):
+        if c["minute_token"] in out:
+            try:
+                own = jobstore.meta_from_json(
+                    (jobstore.get(c["minute_token"]) or {})["meta_json"]).owner_open_id
+            except Exception:                  # noqa: BLE001 — fail-closed
+                own = ""
+            out[c["minute_token"]] = {x for x in (own, c["owner_union_id"]) if x}
     return out
 
 

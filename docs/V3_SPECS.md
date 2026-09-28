@@ -22,7 +22,7 @@
 |---|---|---|
 | **YC1** xác nhận của chủ | ✅ **XONG 28/09/2026** — selftest 716 PASS / 0 FAIL (+21 kiểm) | restart `v2 run`; chép plugin `hermes/v2-enroll-gate` **1.4.0** + `hermes gateway restart` (tool MCP mới + policy duyệt) |
 | **YC2** kho `.md` + quyền quản lý + Drive | ✅ **XONG 28/09/2026** — selftest 742 PASS / 0 FAIL (+26 kiểm) | Console: bật scope **tenant** đọc danh bạ (có trường `leader_user_id`, phạm vi dữ liệu = toàn công ty) + `drive`; `v2 org-sync` → `--yes` → `ORG_SYNC_HOURS=24`; `v2 drive-provision` → duyệt danh sách → `--yes` → `DRIVE_ENABLED=1`; Base tự thêm 2 cột `Xác nhận`, `File biên bản` ở lần ghi đầu (external write — C.6) |
-| YC3 semantic search | ⏳ | |
+| **YC3** semantic search | ✅ **XONG 28/09/2026** — selftest 758 PASS / 0 FAIL (+16 kiểm) | nhận virtual key từ **thienlq** → `LITELLM_API_KEY` trong `v2/.env` (đặt limit ngân sách trên LiteLLM); benchmark `v2 search --reindex --model <m> "câu hỏi thật"` cho 2–3 model rồi chốt `EMBED_MODEL`; chỉnh `semantic.MIN_SCORE` theo model đã chốt |
 | YC5 liên kết cuộc họp | ⏳ | |
 | YC4 dashboard | ⏳ | |
 
@@ -380,6 +380,25 @@ Chỉ index **bản đã confirmed**; owner sửa recap → re-embed.
 họp → gọi `semantic_search` trước, chỉ khi rỗng mới nói không có; câu hỏi có
 tên người/dự án → tự mở rộng truy vấn. Không đổi kiến trúc chiều gọi
 (Hermes → V2).
+
+### ✅ ĐÃ LÀM (28/09/2026)
+- `v2/semantic.py`: seam `embed()` → `{LITELLM_BASE_URL}/embeddings`
+  (mặc định `https://litellm.hapas-ai.tech/v1`, key `LITELLM_API_KEY`, model
+  `EMBED_MODEL=text-embedding-3-small` — rẻ nhất đủ dùng, chờ benchmark thật).
+- Index: tóm tắt (bản CHỦ đã duyệt nếu có) + nguyên văn whisper (hoặc bản chép
+  Lark) cắt 1.500 ký tự chờm 200. Dấu vân tay nguồn → recap/transcript/model
+  đổi là tự index lại. Chạy nền mỗi vòng run (`EMBED_PER_ROUND=5`), LiteLLM
+  chết thì vòng sau. Không numpy: `array` stdlib + tích vô hướng
+  (*ponytail:* tới ~10k đoạn; vượt thì numpy/sqlite-vec).
+- Tool MCP `semantic_search` (LỌC QUYỀN TRƯỚC khi xếp hạng; nhãn "bạn dự" /
+  "quyền quản lý, nhánh D>E>C"); policy plugin dặn gọi nó ĐẦU TIÊN cho câu hỏi
+  nội dung. Chưa có key / LiteLLM lỗi / chưa index → rơi về tìm từ khoá, nói rõ.
+- Mọi lượt tìm ghi `query_log` (nguồn cho dashboard YC4).
+- CLI `v2 search "…" [--as người] [--model m] [--reindex]` — cũng là công cụ
+  benchmark model.
+- **Vá kèm cho YC1** (tìm ra khi làm YC3): trong lúc CHỜ CHỦ DUYỆT, người dự
+  hỏi bot vẫn ra nội dung — đi vòng qua cổng duyệt. Nay `qa.viewers_index`
+  cho cuộc `pending` chỉ chủ thấy; duyệt/tự phát xong mới mở.
 
 ### Cách kiểm
 1. Benchmark 20 câu hỏi thật trên ≥20 recap thật: semantic vs substring, đếm

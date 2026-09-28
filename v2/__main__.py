@@ -508,6 +508,22 @@ def cmd_notes(args) -> None:
         print(t, "->", notes.publish(t))
 
 
+def cmd_search(args) -> None:
+    """V3 YC3: tìm ngữ nghĩa ở terminal — cũng là cách so model (`--model`)."""
+    _init()
+    from . import askers, semantic
+    who = askers.admin_view()
+    if args.as_who:
+        who = askers.find_enrolled(args.as_who)
+        if not who:
+            sys.exit(f"không thấy người đã enroll: {args.as_who}")
+    if args.reindex:
+        n = semantic.backfill(limit=10_000) if not args.model else sum(
+            semantic.index(t, args.model) for t in semantic.stale(10_000))
+        print(f"đã index {n} {'cuộc' if not args.model else 'đoạn'}")
+    print(semantic.search(who, " ".join(args.query), model=args.model))
+
+
 def cmd_process(args) -> None:
     _init()
     orchestrator.process_queue(dry_run=not args.send)
@@ -882,6 +898,13 @@ def main() -> None:
     gb.add_argument("--since", default="", help="YYYY-MM-DD")
     gb.add_argument("--yes", action="store_true", help="cấp thật")
     gb.set_defaults(fn=cmd_grants_backfill)
+    se = sub.add_parser("search", help="V3: tìm cuộc họp theo ngữ nghĩa")
+    se.add_argument("query", nargs="+")
+    se.add_argument("--as", dest="as_who", default="",
+                    help="tìm bằng danh tính một người đã enroll (kiểm quyền)")
+    se.add_argument("--model", default="", help="thử model embedding khác")
+    se.add_argument("--reindex", action="store_true", help="index trước khi tìm")
+    se.set_defaults(fn=cmd_search)
     nt = sub.add_parser("notes", help="V3: ghi lại file biên bản .md")
     nt.add_argument("token", nargs="?", default="")
     nt.set_defaults(fn=cmd_notes)

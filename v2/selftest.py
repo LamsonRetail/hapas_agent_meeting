@@ -4763,6 +4763,10 @@ def _main() -> int:
               "Chỉ chủ trì" in _deny and not _c_sent
               and confirm.get("mtCONF1")["state"] == "pending", _deny)
 
+        _ix = qa.viewers_index()
+        check("đang chờ chủ duyệt -> người dự HỎI BOT cũng chưa thấy (không đi vòng cổng)",
+              not qa._may_see("mtCONF1", {"union_id": "on_B", "open_id": "ou_B"}, _ix)
+              and qa._may_see("mtCONF1", _own, _ix))
         _ed = confirm.edit(_own, "mtCONF1", "gia la 100k")
         _row = confirm.get("mtCONF1")
         check("chủ sửa -> recap đổi, version 2, chưa phát cho ai",
@@ -4781,6 +4785,9 @@ def _main() -> int:
               and _row["state"] == "confirmed" and _row["released_version"] == 2,
               f"{[x[0] for x in _c_sent]} {_ap}")
         check("...và đo được mức chủ sửa (diff_chars > 0)", _row["diff_chars"] > 0)
+        check("...duyệt xong thì người dự hỏi bot thấy được",
+              qa._may_see("mtCONF1", {"union_id": "on_B", "open_id": "ou_B"},
+                          qa.viewers_index()))
         _c_sent.clear()
         confirm.approve(_own, "mtCONF1")
         check("duyệt lại khi nội dung không đổi -> KHÔNG gửi gì cho người dự",
@@ -5033,6 +5040,105 @@ def _main() -> int:
         with db.tx() as c:
             for t in ("org_edges", "note_grants", "drive_spaces", "note_files",
                       "confirmations"):
+                c.execute(f"DELETE FROM {t}")
+        wipe_jobs()
+
+    # =================================================================
+    part("V3-YC3. Tìm ngữ nghĩa qua LiteLLM — lọc quyền trước, rơi về từ khoá")
+    # =================================================================
+    from v2 import semantic, notes as _nt3, confirm as _cf3
+    _s_keep = (semantic.embed, config.LITELLM_API_KEY, semantic.MIN_SCORE)
+    _calls3: list[int] = []
+
+    def _fake_embed(texts, model=""):
+        # Embedder giả tất định: túi từ 64 chiều + ánh xạ đồng nghĩa. Đủ để kiểm
+        # ĐƯỜNG ỐNG (lọc quyền, xếp hạng, nhãn, rơi về) — không kiểm chất lượng model.
+        _calls3.append(len(texts))
+        out = []
+        for t in texts:
+            t = t.lower().replace("đơn giá", "giá").replace("pricing", "giá")
+            v = [0.0] * 64
+            import re as _re3
+            for w in _re3.findall(r"\w+", t):
+                v[sum(map(ord, w)) % 64] += 1.0
+            out.append(v)
+        return out
+
+    try:
+        semantic.embed = _fake_embed
+        config.LITELLM_API_KEY = "sk-test"
+        semantic.MIN_SCORE = 0.1          # ngưỡng 0.25 là cho model thật, không cho túi-từ giả
+        with db.tx() as c:
+            for t in ("embeddings", "query_log", "note_grants", "org_edges",
+                      "confirmations", "note_files"):
+                c.execute(f"DELETE FROM {t}")
+            c.executemany("INSERT INTO org_edges(open_id, union_id, name, leader_open_id)"
+                          " VALUES (?,?,?,?)",
+                          [("ou_C", "on_C", "C", "ou_E"), ("ou_E", "on_E", "E", "ou_D"),
+                           ("ou_D", "on_D", "D", "")])
+        wipe_jobs()
+
+        def _job3(tok, title, summary, atts, start):
+            m = meta(minute_token=tok, title=title, owner_open_id="ou_A", start=start,
+                     participants_source="calendar[verified]:x",
+                     attendees=[Attendee(open_id=o, union_id=o.replace("ou_", "on_"))
+                                for o in atts])
+            jobstore.create(m, status="held")
+            jobstore.set_status(tok, "held", recap_json=_cf3.recap_to_json(
+                Recap(summary=summary)))
+            _nt3.grant(tok, m)
+
+        _job3("mtSEM1", "Hop kinh doanh", "Chốt đơn giá sản phẩm 100k từ tháng 10",
+              ["ou_B", "ou_C"], 1790000000.0)
+        _job3("mtSEM2", "Hop nhan su", "Kế hoạch tuyển dụng quý 4", ["ou_B"], 1790100000.0)
+        _job3("mtSEM3", "Hop mat", "Chốt giá nội bộ bí mật", ["ou_Z"], 1790200000.0)
+        _stale = semantic.stale(10)
+        check("chưa index -> cả 3 cuộc đã có nội dung đều nằm trong hàng chờ index",
+              set(_stale) == {"mtSEM1", "mtSEM2", "mtSEM3"}, str(_stale))
+        check("index nền tôn trọng giới hạn mỗi vòng", semantic.backfill(limit=2) == 2)
+        semantic.backfill(limit=10)
+        check("...index xong thì không còn gì chờ", semantic.stale(10) == [])
+
+        _B = {"union_id": "on_B", "open_id": "ou_B", "name": "B"}
+        _r = semantic.search(_B, "tuần trước chốt gì về giá?")
+        check("hỏi 'giá' tìm ra cuộc ghi 'đơn giá' (từ khoá thuần sẽ trượt)",
+              "Hop kinh doanh" in _r and _r.index("Hop kinh doanh") < (
+                  _r.find("Hop nhan su") if "Hop nhan su" in _r else 10**9), _r[:300])
+        check("LỌC QUYỀN TRƯỚC: cuộc B không được xem KHÔNG lộ, dù khớp nhất",
+              "Hop mat" not in _r and "bí mật" not in _r)
+        check("...kèm nhãn nguồn quyền 'bạn dự'", "(bạn dự)" in _r)
+        _D = {"union_id": "on_D", "open_id": "ou_D", "name": "D"}
+        _rd = semantic.search(_D, "đơn giá")
+        check("quản lý D (không dự) tìm ra cuộc của nhánh, nhãn 'quyền quản lý, nhánh D>E>C'",
+              "Hop kinh doanh" in _rd and "quyền quản lý, nhánh D>E>C" in _rd, _rd[:300])
+        check("không xác định được người hỏi -> không trả gì",
+              semantic.search(None, "giá") == qa.NO_ASKER)
+
+        jobstore.set_status("mtSEM1", "held", recap_json=_cf3.recap_to_json(
+            Recap(summary="Chốt đơn giá 120k")))
+        check("recap đổi (chủ sửa / bản nguyên văn) -> tự vào lại hàng chờ index",
+              semantic.stale(10) == ["mtSEM1"])
+
+        def _boom(texts, model=""):
+            raise semantic.EmbedUnavailable("503")
+        semantic.embed = _boom
+        _fb = semantic.search(_B, "giá")
+        check("LiteLLM chết -> rơi về tìm TỪ KHOÁ, nói rõ, không vỡ",
+              "TỪ KHOÁ" in _fb, _fb[:200])
+        check("...và index nền chết êm, không làm hỏng vòng run", semantic.backfill() == 0)
+        config.LITELLM_API_KEY = ""
+        check("chưa có virtual key -> tắt ngữ nghĩa, vẫn tìm được theo từ khoá",
+              "TỪ KHOÁ" in semantic.search(_B, "giá"))
+        _ql = [dict(r) for r in db.conn().execute("SELECT * FROM query_log")]
+        check("mỗi lượt tìm ghi query_log (nguồn cho dashboard)",
+              len(_ql) >= 4 and any(q["n_hits"] > 0 for q in _ql)
+              and any(q["tool"].endswith("fallback") for q in _ql), str(len(_ql)))
+        check("MCP có semantic_search",
+              "semantic_search" in {t["name"] for t in mcp_server.public_tools()})
+    finally:
+        semantic.embed, config.LITELLM_API_KEY, semantic.MIN_SCORE = _s_keep
+        with db.tx() as c:
+            for t in ("embeddings", "query_log", "note_grants", "org_edges"):
                 c.execute(f"DELETE FROM {t}")
         wipe_jobs()
 

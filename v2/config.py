@@ -391,6 +391,17 @@ ORG_SYNC_HOURS = _get_int("ORG_SYNC_HOURS", 0)
 DRIVE_ENABLED = _get_bool("DRIVE_ENABLED", False)
 DRIVE_ROOT_FOLDER = _get("DRIVE_ROOT_FOLDER", "")   # trống = thư mục gốc của bot
 
+# LiteLLM của công ty (V3 YC3/YC4, chốt 16/09/2026): virtual key do thienlq cấp,
+# ngân sách đặt ngay trên LiteLLM. OpenAI-compatible -> đổi model = đổi env.
+# Trống key = tắt tìm ngữ nghĩa (bot rơi về tìm theo từ khoá như cũ).
+LITELLM_BASE_URL = _get("LITELLM_BASE_URL", "https://litellm.hapas-ai.tech/v1")
+LITELLM_API_KEY = _get("LITELLM_API_KEY", "")
+# Model rẻ nhất đủ dùng cho tiếng Việt; chốt lại bằng `v2 search --model …`
+# trên câu hỏi thật (docs/V3_SPECS.md §B3.1) — đừng đổi theo cảm giác.
+EMBED_MODEL = _get("EMBED_MODEL", "text-embedding-3-small")
+DIGEST_MODEL = _get("DIGEST_MODEL", "gpt-4o-mini")      # tóm tắt tuần/tháng (YC4)
+EMBED_PER_ROUND = _get_int("EMBED_PER_ROUND", 5)        # số cuộc index mỗi vòng run
+
 # LLM (recap) gọi không được liên tục ngần này phút thì báo. Cùng lý lẽ với
 # whisper, nhưng hậu quả KHÁC và tệ hơn: whisper chết thì job nằm chờ (không
 # mất gì), còn LLM chết quá RECAP_MAX_TRIES vòng thì biên bản PHÁT ĐI với tóm

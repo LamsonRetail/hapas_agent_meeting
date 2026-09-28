@@ -1528,6 +1528,13 @@ def run() -> None:
         except Exception as exc:         # noqa: BLE001
             print(f"[org] đồng bộ cây tổ chức hỏng (bỏ qua): {exc}")
 
+        # Index ngữ nghĩa (V3 YC3): vài cuộc mỗi vòng, LiteLLM chết thì vòng sau.
+        try:
+            from . import semantic
+            semantic.backfill()
+        except Exception as exc:         # noqa: BLE001
+            print(f"[semantic] index nền hỏng (bỏ qua): {exc}")
+
         # Xác nhận của chủ (V3 YC1): nhắc + tự phát khi quá hạn. Khối try RIÊNG,
         # cùng lý lẽ cảnh báo: hỏng ở đây không được làm chết vòng run.
         try:

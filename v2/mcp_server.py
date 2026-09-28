@@ -123,6 +123,15 @@ def _tool_create_task(a: dict[str, Any]) -> str:
         due=str(a.get("due") or ""), note=str(a.get("note") or ""))
 
 
+def _tool_semantic_search(a: dict[str, Any]) -> str:
+    """ĐỌC. Lọc quyền trước khi xếp hạng — ở `semantic.py`."""
+    from . import semantic
+    return semantic.search(_who(a), str(a.get("query") or ""),
+                           top_k=int(a.get("top_k") or 8),
+                           since=str(a.get("since") or ""),
+                           until=str(a.get("until") or ""))
+
+
 def _tool_confirm_meeting(a: dict[str, Any]) -> str:
     """GHI: chủ duyệt biên bản. Ràng buộc chủ-cuộc-họp nằm ở `confirm.py`."""
     from . import confirm
@@ -326,6 +335,28 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["asker_token", "minute_token", "summary"],
         },
         "_fn": _tool_create_task,
+    },
+    {
+        "name": "semantic_search",
+        "description": (
+            "TÌM THEO NGHĨA trong TẤT CẢ cuộc họp người hỏi được xem — kể cả cuộc "
+            "họ KHÔNG dự nhưng thấy được nhờ quyền quản lý nhánh. DÙNG ĐẦU TIÊN "
+            "cho mọi câu hỏi về NỘI DUNG ('tuần trước chốt gì về giá?', 'dự án X "
+            "tới đâu rồi', 'ai phụ trách Y'). Truyền nguyên câu hỏi vào `query`. "
+            "Đọc các đoạn khớp, trả lời đúng câu hỏi, nêu tên + ngày cuộc họp làm "
+            "nguồn. Cần chi tiết một cuộc thì gọi tiếp get_meeting."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+                "query": {"type": "string", "description": "câu hỏi / chủ đề"},
+                "top_k": {"type": "integer", "description": "số cuộc tối đa, mặc định 8"},
+                "since": {"type": "string", "description": "từ ngày YYYY-MM-DD"},
+                "until": {"type": "string", "description": "tới ngày YYYY-MM-DD"},
+            },
+            "required": ["asker_token", "query"],
+        },
+        "_fn": _tool_semantic_search,
     },
     {
         "name": "confirm_meeting",
