@@ -5232,6 +5232,164 @@ def _main() -> int:
         wipe_jobs()
 
     # =================================================================
+    part("V3-YC4. Dashboard — đăng nhập Lark, mọi khối lọc theo người xem")
+    # =================================================================
+    from v2 import dashboard as dsb, confirm as _cf4, notes as _nt4
+    from v2.models import ActionItem as _AI4
+    _d_keep = (config.DASHBOARD_SECRET, lark_api.exchange_code, lark_api.user_info,
+               config.LITELLM_API_KEY, dsb.httpx)
+    try:
+        config.DASHBOARD_SECRET = "test-secret-khong-dung-that"
+        _tok = dsb._sign({"k": "sess", "u": "on_X", "exp": int(time.time()) + 60})
+        check("phiên ký đúng -> đọc lại được", (dsb._verify(_tok) or {}).get("u") == "on_X")
+        _b, _m = _tok.rsplit(".", 1)
+        _forged = dsb._sign({"k": "sess", "u": "on_CEO", "exp": int(time.time()) + 60})
+        config.DASHBOARD_SECRET = "khoa-khac"
+        _other_key = dsb._verify(_forged)
+        config.DASHBOARD_SECRET = "test-secret-khong-dung-that"
+        check("phiên bị sửa / ký bằng khoá khác -> TỪ CHỐI",
+              dsb._verify(_b[:-2] + "xx." + _m) is None and _other_key is None)
+        check("phiên hết hạn -> từ chối",
+              dsb._verify(dsb._sign({"k": "sess", "u": "on_X", "exp": 1})) is None)
+
+        _st, _h, _ = dsb.app("GET", "/", {"Host": "meeting.lamsonretail.com"})
+        check("chưa đăng nhập -> chuyển sang Lark, redirect_uri đúng domain, KHÔNG xin scope",
+              _st == 302 and "authen/v1/authorize" in _h["Location"]
+              and "redirect_uri=https%3A%2F%2Fmeeting.lamsonretail.com%2Fauth%2Fcallback" in _h["Location"]
+              and "scope=" not in _h["Location"], _h.get("Location", "")[:160])
+        _st, _h, _ = dsb.app("GET", "/", {"Host": "meeting.hapas-ai.tech"})
+        check("domain thứ hai dùng redirect_uri của chính nó",
+              "meeting.hapas-ai.tech%2Fauth%2Fcallback" in _h["Location"])
+        _st, _h, _ = dsb.app("GET", "/", {"Host": "evil.example.com"})
+        check("Host lạ KHÔNG lái được redirect_uri sang chỗ khác",
+              "evil" not in _h["Location"] and "meeting.lamsonretail.com" in _h["Location"])
+        check("POST -> 405 (trang chỉ đọc)", dsb.app("POST", "/", {})[0] == 405)
+        check("state giả -> 400, không đổi code",
+              dsb.app("GET", "/auth/callback?code=c&state=abc.def", {"Host": "meeting.lamsonretail.com"})[0] == 400)
+
+        _seen4: dict = {}
+        lark_api.exchange_code = lambda code, redirect_uri=None: (
+            _seen4.update(code=code, ru=redirect_uri) or {"access_token": "u-tok"})
+        lark_api.user_info = lambda tok: {"union_id": "on_D", "open_id": "ou_D", "name": "Sep D"}
+        _state = dsb._sign({"k": "state", "r": "/?p=month", "exp": int(time.time()) + 60})
+        _st, _h, _ = dsb.app("GET", f"/auth/callback?code=CODE1&state={_state}",
+                             {"Host": "meeting.lamsonretail.com"})
+        check("callback: đổi code bằng ĐÚNG redirect_uri, đặt cookie HttpOnly+Secure, về trang cũ",
+              _st == 302 and _h["Location"] == "/?p=month" and _seen4.get("code") == "CODE1"
+              and _seen4.get("ru") == "https://meeting.lamsonretail.com/auth/callback"
+              and "HttpOnly" in _h["Set-Cookie"] and "Secure" in _h["Set-Cookie"], str(_h))
+        _cookie4 = _h["Set-Cookie"].split(";")[0]
+
+        # --- dữ liệu: A chủ, B dự; D quản lý (qua grant); F người ngoài
+        with db.tx() as c:
+            for t in ("confirmations", "note_grants", "org_edges", "query_log", "digests",
+                      "note_files", "meeting_links"):
+                c.execute(f"DELETE FROM {t}")
+            c.executemany("INSERT INTO org_edges(open_id, union_id, name, leader_open_id)"
+                          " VALUES (?,?,?,?)", [("ou_B", "on_B", "B", "ou_D"),
+                                                ("ou_D", "on_D", "Sep D", "")])
+        wipe_jobs()
+        _now4 = int(time.time() * 1000)
+
+        def _j4(tok, title, days_ago, recap, state=None, edits=0, diff=0, sent_h=0):
+            m = meta(minute_token=tok, title=title, owner_open_id="ou_A",
+                     start=(_now4 - days_ago * 86_400_000) / 1000,
+                     participants_source="calendar[verified]:x",
+                     attendees=[Attendee(open_id="ou_B", union_id="on_B", name="B")])
+            jobstore.create(m, status="held")
+            jobstore.set_status(tok, "held", recap_json=_cf4.recap_to_json(recap))
+            _nt4.grant(tok, m)
+            if state:
+                with db.tx() as c:
+                    c.execute("INSERT INTO confirmations(minute_token, owner_union_id, state,"
+                              " edits, diff_chars, sent_at, released_at) VALUES (?,?,?,?,?,?,?)",
+                              (tok, "on_A", state, edits, diff, _now4 - sent_h * 3_600_000, _now4))
+
+        _j4("mtD1", "Hop <script>x</script> gia", 2,
+            Recap(summary="s", decisions=["Chot gia 100k"],
+                  action_items=[_AI4(task="Gui bao gia", owner="Lan", due="2020-01-01"),
+                                _AI4(task="Viec khong ai nhan")]), "confirmed")
+        _j4("mtD2", "Hop sua nhieu", 3, Recap(summary="s", decisions=["QD2"]),
+            "confirmed", edits=2, diff=120)
+        _j4("mtD3", "Hop chua review", 4, Recap(summary="s", decisions=["QD3"]), "auto_published")
+        _j4("mtD4", "Hop cho duyet", 0, Recap(summary="s"), "pending", sent_h=5)
+        for i in range(3):
+            _j4(f"mtR{i}", f"Weekly Sale Buổi {i}", 20 - 7 * i, Recap(summary="ban luan"))
+        with db.tx() as c:
+            c.executemany("INSERT INTO query_log(ts, asker, tool, query, n_hits) VALUES (?,?,?,?,?)",
+                          [(_now4, "on_B", "semantic_search", "chot gia", 2),
+                           (_now4, "on_B", "semantic_search", "abc", 0),
+                           (_now4, "on_D", "semantic_search:fallback", "chot gia", -1)])
+
+        _A = {"union_id": "on_A", "open_id": "ou_A", "name": "A"}
+        _D = {"union_id": "on_D", "open_id": "ou_D", "name": "Sep D"}
+        _F = {"union_id": "on_F", "open_id": "ou_F", "name": "F"}
+        _dA, _dD, _dF = dsb.build(_A), dsb.build(_D), dsb.build(_F)
+        check("backlog 'chờ bạn duyệt': chủ thấy cuộc pending của mình, quá 4h tô cảnh báo",
+              [m["token"] for m in _dA["mine_pending"]] == ["mtD4"]
+              and _dA["mine_pending"][0]["overdue"])
+        check("...người khác KHÔNG thấy backlog của chủ", _dD["mine_pending"] == [])
+        _ttl = lambda d: {h["token"] for h in d["highlights"]}
+        check("quản lý D (không dự) thấy nội dung tuần của nhánh; cuộc đang chờ duyệt thì chưa",
+              {"mtD1", "mtD2", "mtD3"} <= _ttl(_dD) and "mtD4" not in _ttl(_dD), str(_ttl(_dD)))
+        check("người ngoài F: KHÔNG thấy cuộc nào, không lộ tên", _ttl(_dF) == set()
+              and "Hop" not in dsb.render(_dF))
+        _q = _dA["quality"]
+        check("chất lượng: 3 biên bản chốt -> 1/3 duyệt nguyên bản, 1/3 phải sửa, 1/3 chưa review",
+              _q["n"] == 3 and _q["approved_clean"] == 33 and _q["edited"] == 33
+              and _q["unreviewed"] == 33 and _q["avg_diff"] == 120, str(_q))
+        _kinds = {r["kind"] for r in _dA["risks"]}
+        check("rủi ro: việc quá hạn + việc không ai nhận + chưa review + chủ đề lặp không quyết định",
+              {"Việc đã tới hạn", "Việc chưa có người nhận", "Biên bản chưa được review",
+               "Chủ đề lặp chưa có quyết định"} <= _kinds, str(_kinds))
+        check("truy vấn: người thường chỉ thấy số lượt CỦA MÌNH",
+              _dD["queries"] == {"mine_7d": 1} and "Truy vấn biên bản" not in dsb.render(_dD))
+        _adm = dsb.build({"union_id": "on_ADMIN", "open_id": "ou_ADMIN", "name": "Admin"})
+        check("admin: thấy thống kê truy vấn toàn hệ thống (rỗng, rơi về từ khoá, câu hay gặp)",
+              _adm["queries"]["total_7d"] == 3 and _adm["queries"]["empty"] == 1
+              and _adm["queries"]["fallback"] == 1 and _adm["ops"]["pending"] == 1
+              and _adm["queries"]["top"][0] == ("chot gia", 2))
+        check("...nhưng admin KHÔNG vì thế thấy nội dung cuộc họp của người khác",
+              _ttl(_adm) == set())
+        _html = dsb.render(_dA)
+        check("HTML escape tên cuộc họp (không chèn được script)",
+              "<script>x</script>" not in _html and "&lt;script&gt;" in _html)
+        _st, _h, _body = dsb.app("GET", "/", {"Host": "meeting.lamsonretail.com",
+                                              "Cookie": _cookie4})
+        check("có cookie -> 200, trang của đúng người đăng nhập, có CSP chặn nhúng",
+              _st == 200 and "Sep D" in _body and "frame-ancestors 'none'" in
+              _h.get("Content-Security-Policy", ""))
+
+        config.LITELLM_API_KEY = ""
+        check("digest: chưa có key -> không gọi LLM, trang vẫn có danh sách quyết định",
+              dsb.digest(_dA) == "" and "Chot gia 100k" in _html)
+
+        class _FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"choices": [{"message": {"content": "- Chot gia [1]"}}]}
+
+        class _FakeHttpx:
+            HTTPError = Exception
+            n = 0
+
+            @classmethod
+            def post(cls, *a, **k):
+                cls.n += 1
+                return _FakeResp()
+        dsb.httpx = _FakeHttpx
+        config.LITELLM_API_KEY = "sk-test"
+        _g1, _g2 = dsb.digest(_dD), dsb.digest(_dD)
+        check("digest LLM có trích nguồn [n], CACHE: gọi đúng 1 lần cho cùng tập cuộc họp",
+              _g1 == _g2 == "- Chot gia [1]" and _FakeHttpx.n == 1)
+    finally:
+        (config.DASHBOARD_SECRET, lark_api.exchange_code, lark_api.user_info,
+         config.LITELLM_API_KEY, dsb.httpx) = _d_keep
+        with db.tx() as c:
+            for t in ("confirmations", "note_grants", "org_edges", "query_log", "digests"):
+                c.execute(f"DELETE FROM {t}")
+        wipe_jobs()
+
+    # =================================================================
     part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")
     # =================================================================
     # Nhiều nhóm ở trên lưu-rồi-trả-lại thuộc tính của `lark_api`. Một cái trả

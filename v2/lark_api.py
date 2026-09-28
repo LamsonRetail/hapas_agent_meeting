@@ -181,20 +181,27 @@ def tenant_token() -> str:
 #  AUTH — OAuth user token
 # =====================================================================
 
-def authorize_url(state: str) -> str:
-    """URL để người dùng bấm và Đồng ý. Trả code về redirect_uri."""
+def authorize_url(state: str, *, redirect_uri: str | None = None,
+                  scope: str | None = None) -> str:
+    """URL để người dùng bấm và Đồng ý. Trả code về redirect_uri.
+
+    `scope=""` = chỉ xin DANH TÍNH (đăng nhập dashboard V3): có phiên Lark là
+    Lark trả code về ngay, không hỏi lại."""
     from urllib.parse import urlencode
-    q = urlencode({
+    params = {
         "client_id": config.APP_ID,
-        "redirect_uri": config.OAUTH_REDIRECT_URI,
-        "scope": config.OAUTH_SCOPES,
+        "redirect_uri": redirect_uri or config.OAUTH_REDIRECT_URI,
+        "scope": config.OAUTH_SCOPES if scope is None else scope,
         "state": state,
         "response_type": "code",
-    })
+    }
+    if not params["scope"]:
+        params.pop("scope")
+    q = urlencode(params)
     return f"{config.base_url()}/open-apis/authen/v1/authorize?{q}"
 
 
-def exchange_code(code: str) -> dict[str, Any]:
+def exchange_code(code: str, *, redirect_uri: str | None = None) -> dict[str, Any]:
     """Đổi authorization code lấy user access + refresh token.
 
     Dùng endpoint OAuth 2.0 v2 (authen/v2/oauth/token) — trả cả
@@ -207,7 +214,7 @@ def exchange_code(code: str) -> dict[str, Any]:
             "client_id": config.APP_ID,
             "client_secret": config.APP_SECRET,
             "code": code,
-            "redirect_uri": config.OAUTH_REDIRECT_URI,
+            "redirect_uri": redirect_uri or config.OAUTH_REDIRECT_URI,
         },
     )
     return _check(resp, "oauth/token(code)")

@@ -324,6 +324,14 @@ CREATE TABLE IF NOT EXISTS meeting_links (
     PRIMARY KEY (token_a, token_b, reason)
 );
 
+-- Cache tóm tắt kỳ của dashboard (V3 YC4). Khoá = băm (kỳ + tập cuộc họp +
+-- quyết định) -> người cùng nhánh dùng chung MỘT lần gọi LLM.
+CREATE TABLE IF NOT EXISTS digests (
+    key        TEXT PRIMARY KEY,
+    text       TEXT,
+    created_at INTEGER
+);
+
 -- Nhật ký truy vấn (V3 YC4 dashboard): ai hỏi gì, ra mấy kết quả.
 CREATE TABLE IF NOT EXISTS query_log (
     ts        INTEGER,

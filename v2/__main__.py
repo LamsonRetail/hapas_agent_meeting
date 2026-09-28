@@ -524,6 +524,13 @@ def cmd_search(args) -> None:
     print(semantic.search(who, " ".join(args.query), model=args.model))
 
 
+def cmd_dashboard(_) -> None:
+    """V3 YC4: web dashboard trên 127.0.0.1:DASHBOARD_PORT (Cloudflare Tunnel trỏ vào)."""
+    _init()
+    from . import dashboard
+    dashboard.serve()
+
+
 def cmd_process(args) -> None:
     _init()
     orchestrator.process_queue(dry_run=not args.send)
@@ -905,6 +912,8 @@ def main() -> None:
     se.add_argument("--model", default="", help="thử model embedding khác")
     se.add_argument("--reindex", action="store_true", help="index trước khi tìm")
     se.set_defaults(fn=cmd_search)
+    sub.add_parser("dashboard", help="V3: chạy web dashboard (đăng nhập Lark)")\
+       .set_defaults(fn=cmd_dashboard)
     nt = sub.add_parser("notes", help="V3: ghi lại file biên bản .md")
     nt.add_argument("token", nargs="?", default="")
     nt.set_defaults(fn=cmd_notes)

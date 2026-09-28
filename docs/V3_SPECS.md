@@ -24,7 +24,7 @@
 | **YC2** kho `.md` + quyền quản lý + Drive | ✅ **XONG 28/09/2026** — selftest 742 PASS / 0 FAIL (+26 kiểm) | Console: bật scope **tenant** đọc danh bạ (có trường `leader_user_id`, phạm vi dữ liệu = toàn công ty) + `drive`; `v2 org-sync` → `--yes` → `ORG_SYNC_HOURS=24`; `v2 drive-provision` → duyệt danh sách → `--yes` → `DRIVE_ENABLED=1`; Base tự thêm 2 cột `Xác nhận`, `File biên bản` ở lần ghi đầu (external write — C.6) |
 | **YC3** semantic search | ✅ **XONG 28/09/2026** — selftest 758 PASS / 0 FAIL (+16 kiểm) | nhận virtual key từ **thienlq** → `LITELLM_API_KEY` trong `v2/.env` (đặt limit ngân sách trên LiteLLM); benchmark `v2 search --reindex --model <m> "câu hỏi thật"` cho 2–3 model rồi chốt `EMBED_MODEL`; chỉnh `semantic.MIN_SCORE` theo model đã chốt |
 | **YC5** liên kết cuộc họp | ✅ **XONG 28/09/2026** — selftest 770 PASS / 0 FAIL (+12 kiểm) | restart `v2 run` + plugin 1.4.0 (tool `related_meetings`); sau khi chốt model embedding, chỉnh `links.LINK_MIN_SCORE` bằng 1 cặp dương + 1 cặp âm thật |
-| YC4 dashboard | ⏳ | |
+| **YC4** dashboard | ✅ **XONG 28/09/2026** — selftest 792 PASS / 0 FAIL (+22 kiểm); đã xem giao diện thật (desktop + mobile, light + dark) | Cloudflare Tunnel: 2 hostname → `http://127.0.0.1:8765`; Lark Console thêm Redirect URL `https://meeting.lamsonretail.com/auth/callback` + `https://meeting.hapas-ai.tech/auth/callback`; `DASHBOARD_SECRET` (chuỗi ngẫu nhiên ≥32 ký tự) trong `v2/.env`; chạy `run-v2-dashboard.bat` (thêm vào tự khởi động) |
 
 ---
 
@@ -451,6 +451,34 @@ lại thiết kế cũ ở cuối mục làm ghi chú cho sau.)
   này; session dashboard là cookie ký bởi server, ánh xạ về union_id.
 - Digest tuần/tháng cũng gửi DM cho danh sách nhận (tận dụng `alerts.py`
   pattern, một lần/kỳ, chống spam bằng `alert_state`).
+
+### ✅ ĐÃ LÀM (28/09/2026) — khác spec ở kiến trúc, có lý do
+- **Không đặt ở Vercel/Worker mà V2 tự phục vụ** (`python -m v2 dashboard`,
+  stdlib `http.server`, chỉ nghe `127.0.0.1:8765`), hai domain trỏ vào qua
+  **Cloudflare Tunnel**. Lý do: nội dung họp không rời máy, và quyền xem lọc
+  bằng ĐÚNG `qa._may_see` — đặt ở edge thì phải copy dữ liệu ra ngoài và viết
+  lại luật quyền bằng JS (đúng thứ "hai luật song song, cái lỏng hơn thắng").
+  Tiến trình RIÊNG với `v2 run` (`run-v2-dashboard.bat` tự bật lại khi chết).
+- Đăng nhập: Lark OAuth **không xin scope** (chỉ danh tính) → có phiên Lark là
+  vào thẳng. Cookie phiên ký HMAC, HttpOnly + Secure + SameSite=Lax, hết hạn
+  `DASHBOARD_SESSION_HOURS=12`. `state` ký + hết hạn 10 phút; Host lạ không lái
+  được redirect_uri. CSP chặn script/nhúng; chỉ GET.
+- Người CHƯA enroll bot vẫn đăng nhập được — thấy đúng các cuộc có quyền (vd
+  CEO thấy nhánh dưới nhờ `note_grants`).
+- Khối **nội dung** (tên cuộc, quyết định, rủi ro) lọc theo người xem.
+  **Admin** chỉ thấy thêm SỐ LIỆU vận hành (đếm backlog, thống kê truy vấn,
+  câu hỏi hay gặp) — không vì là admin mà thấy nội dung cuộc của người khác
+  (giữ quyết định 04/08/2026 tách `admin` khỏi `see_all`).
+- "Nội dung chính": danh sách quyết định trong kỳ (tuần/tháng, không tốn LLM)
+  + đoạn tóm tắt LiteLLM (`DIGEST_MODEL`, có trích nguồn [n]) **cache theo tập
+  cuộc họp người xem thấy** — người cùng nhánh dùng chung một lần gọi.
+- "Rủi ro": việc đã tới hạn (theo hạn trong biên bản — hệ thống chưa biết việc
+  đã xong hay chưa, nên ghi "tới hạn" chứ không kết luận "trễ"), việc chưa có
+  người nhận, biên bản chưa review, chủ đề lặp ≥3 buổi mà 3 buổi cuối không
+  chốt gì. "Họp kém hiệu quả": HOÃN theo quyết định.
+- Giao diện theo gợi ý UI UX Pro Max: Minimalism/Swiss, mật độ cao, navy +
+  amber, Fira Sans, không emoji làm icon, tương phản ≥4.5:1, focus rõ, tự
+  theo light/dark của máy, không JS, không cuộn ngang ở 375px.
 
 ### Cách kiểm
 1. Tạo 2 job `awaiting_confirm` (1 quá SLA) → dashboard hiện đúng 2, đúng màu.

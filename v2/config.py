@@ -402,6 +402,16 @@ EMBED_MODEL = _get("EMBED_MODEL", "text-embedding-3-small")
 DIGEST_MODEL = _get("DIGEST_MODEL", "gpt-4o-mini")      # tóm tắt tuần/tháng (YC4)
 EMBED_PER_ROUND = _get_int("EMBED_PER_ROUND", 5)        # số cuộc index mỗi vòng run
 
+# Dashboard (V3 YC4, chốt 16/09/2026): `python -m v2 dashboard`, đăng nhập Lark.
+# Hai domain trỏ vào máy này (Cloudflare Tunnel) — cả hai phải có trong
+# "Redirect URL" của app trên Lark Console: https://<host>/auth/callback.
+DASHBOARD_PORT = _get_int("DASHBOARD_PORT", 8765)
+DASHBOARD_HOSTS = [h.strip() for h in _get(
+    "DASHBOARD_HOSTS", "meeting.lamsonretail.com,meeting.hapas-ai.tech").split(",")
+    if h.strip()]
+DASHBOARD_SECRET = _get("DASHBOARD_SECRET", "")        # ký cookie phiên; trống = không chạy
+DASHBOARD_SESSION_HOURS = _get_int("DASHBOARD_SESSION_HOURS", 12)
+
 # LLM (recap) gọi không được liên tục ngần này phút thì báo. Cùng lý lẽ với
 # whisper, nhưng hậu quả KHÁC và tệ hơn: whisper chết thì job nằm chờ (không
 # mất gì), còn LLM chết quá RECAP_MAX_TRIES vòng thì biên bản PHÁT ĐI với tóm
