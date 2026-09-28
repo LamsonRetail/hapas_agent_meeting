@@ -152,6 +152,11 @@ def publish(token: str) -> Path | None:
     row = confirm.get(token)
     reviewed = None if row is None else row["state"] == "confirmed"
     grant(token, meta)
+    try:
+        from . import links
+        links.update(token)                   # V3 YC5 — trước khi render mục Liên kết
+    except Exception as exc:                  # noqa: BLE001 — liên kết là phần phụ
+        print(f"[links] {token} tính liên kết hỏng (bỏ qua): {exc}")
     path = path_of(meta)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render(meta, recap, reviewed=reviewed,

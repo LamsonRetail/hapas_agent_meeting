@@ -132,6 +132,12 @@ def _tool_semantic_search(a: dict[str, Any]) -> str:
                            until=str(a.get("until") or ""))
 
 
+def _tool_related_meetings(a: dict[str, Any]) -> str:
+    """ĐỌC. Lọc quyền ở `links.py`."""
+    from . import links
+    return links.text_for(_who(a), str(a.get("minute_token") or ""))
+
+
 def _tool_confirm_meeting(a: dict[str, Any]) -> str:
     """GHI: chủ duyệt biên bản. Ràng buộc chủ-cuộc-họp nằm ở `confirm.py`."""
     from . import confirm
@@ -357,6 +363,24 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["asker_token", "query"],
         },
         "_fn": _tool_semantic_search,
+    },
+    {
+        "name": "related_meetings",
+        "description": (
+            "Các cuộc họp LIÊN QUAN tới một cuộc (cùng chuỗi họp định kỳ, cùng "
+            "người/thuật ngữ, cùng chủ đề). Dùng khi người dùng hỏi 'trước đó đã "
+            "bàn gì về việc này', 'các buổi trước', 'theo dõi xuyên suốt'. "
+            "`minute_token` nhận cả TÊN cuộc họp."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "asker_token": {"type": "string", "description": ASKER_DESC},
+                "minute_token": {"type": "string",
+                                 "description": "token hoặc tên cuộc họp gốc"},
+            },
+            "required": ["asker_token", "minute_token"],
+        },
+        "_fn": _tool_related_meetings,
     },
     {
         "name": "confirm_meeting",

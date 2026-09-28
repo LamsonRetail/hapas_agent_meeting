@@ -313,6 +313,17 @@ CREATE TABLE IF NOT EXISTS embeddings (
     PRIMARY KEY (minute_token, chunk_id)
 );
 
+-- Liên kết giữa các cuộc họp (V3 YC5). token_a < token_b. reason:
+-- series | entity | semantic. Hiện ra đâu cũng phải lọc theo quyền người xem.
+CREATE TABLE IF NOT EXISTS meeting_links (
+    token_a    TEXT NOT NULL,
+    token_b    TEXT NOT NULL,
+    score      REAL,
+    reason     TEXT NOT NULL,
+    created_at INTEGER,
+    PRIMARY KEY (token_a, token_b, reason)
+);
+
 -- Nhật ký truy vấn (V3 YC4 dashboard): ai hỏi gì, ra mấy kết quả.
 CREATE TABLE IF NOT EXISTS query_log (
     ts        INTEGER,

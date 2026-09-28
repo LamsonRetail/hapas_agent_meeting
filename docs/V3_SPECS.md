@@ -23,7 +23,7 @@
 | **YC1** xác nhận của chủ | ✅ **XONG 28/09/2026** — selftest 716 PASS / 0 FAIL (+21 kiểm) | restart `v2 run`; chép plugin `hermes/v2-enroll-gate` **1.4.0** + `hermes gateway restart` (tool MCP mới + policy duyệt) |
 | **YC2** kho `.md` + quyền quản lý + Drive | ✅ **XONG 28/09/2026** — selftest 742 PASS / 0 FAIL (+26 kiểm) | Console: bật scope **tenant** đọc danh bạ (có trường `leader_user_id`, phạm vi dữ liệu = toàn công ty) + `drive`; `v2 org-sync` → `--yes` → `ORG_SYNC_HOURS=24`; `v2 drive-provision` → duyệt danh sách → `--yes` → `DRIVE_ENABLED=1`; Base tự thêm 2 cột `Xác nhận`, `File biên bản` ở lần ghi đầu (external write — C.6) |
 | **YC3** semantic search | ✅ **XONG 28/09/2026** — selftest 758 PASS / 0 FAIL (+16 kiểm) | nhận virtual key từ **thienlq** → `LITELLM_API_KEY` trong `v2/.env` (đặt limit ngân sách trên LiteLLM); benchmark `v2 search --reindex --model <m> "câu hỏi thật"` cho 2–3 model rồi chốt `EMBED_MODEL`; chỉnh `semantic.MIN_SCORE` theo model đã chốt |
-| YC5 liên kết cuộc họp | ⏳ | |
+| **YC5** liên kết cuộc họp | ✅ **XONG 28/09/2026** — selftest 770 PASS / 0 FAIL (+12 kiểm) | restart `v2 run` + plugin 1.4.0 (tool `related_meetings`); sau khi chốt model embedding, chỉnh `links.LINK_MIN_SCORE` bằng 1 cặp dương + 1 cặp âm thật |
 | YC4 dashboard | ⏳ | |
 
 ---
@@ -486,6 +486,21 @@ thấy các cuộc liên quan; dashboard nhìn được chuỗi chủ đề ch�
   chỉ thấy "còn N cuộc liên quan bạn không có quyền xem", không thấy tên);
   (2) tool `related_meetings(minute_token)`; (3) dashboard: chuỗi chủ đề +
   phát hiện "chủ đề lặp N tuần chưa có quyết định" nuôi khối rủi ro YC4.
+
+### ✅ ĐÃ LÀM (28/09/2026)
+- `v2/links.py` + bảng `meeting_links`. Tính TĂNG DẦN mỗi khi một cuộc được
+  phát (`notes.publish`) hoặc index lại (`semantic.index`).
+- `series`: tên chuẩn hoá (bỏ ngày/số/"Buổi N") trùng + cách ≤ 45 ngày.
+  `entity`: ≥ 2 thực thể chung (người phụ trách việc cần làm, thuật ngữ đã
+  duyệt trong glossary) — chung 1 người thì không nối, tránh nối mọi cuộc có
+  cùng một sếp. `semantic`: vector tóm tắt ≥ `LINK_MIN_SCORE=0.75`.
+- Bề mặt: `get_meeting` thêm khối "Cuộc họp liên quan"; tool MCP
+  `related_meetings`; mục "Liên kết" trong file `.md`.
+- **Khác spec một điểm:** KHÔNG hiện "còn N cuộc liên quan bạn không có quyền
+  xem" — user đã bỏ đúng kiểu câu này ngày 04/08/2026 (`_hidden_note`: đếm
+  cuộc bị ẩn là đo hoạt động công ty). Người không đủ quyền chỉ không thấy gì.
+- File `.md` được nhiều người đọc → chỉ nêu cuộc liên quan mà MỌI người đọc
+  file đều xem được.
 
 ### Cách kiểm
 1. 3 cuộc "Weekly Ops" liên tiếp → link `series` nối đủ 3.

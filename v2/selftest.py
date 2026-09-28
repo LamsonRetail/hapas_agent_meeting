@@ -5143,6 +5143,95 @@ def _main() -> int:
         wipe_jobs()
 
     # =================================================================
+    part("V3-YC5. Liên kết giữa các cuộc họp — lọc theo quyền người xem")
+    # =================================================================
+    from v2 import links, semantic as _sm5, confirm as _cf5
+    from v2.models import ActionItem as _AI5
+    try:
+        with db.tx() as c:
+            for t in ("meeting_links", "embeddings", "note_grants", "confirmations",
+                      "glossary_candidates"):
+                c.execute(f"DELETE FROM {t}")
+        wipe_jobs()
+        _day = 86400.0
+
+        def _j5(tok, title, start, atts, recap):
+            m = meta(minute_token=tok, title=title, owner_open_id="ou_A", start=start,
+                     participants_source="calendar[verified]:x",
+                     attendees=[Attendee(open_id=o, union_id=o.replace("ou_", "on_"))
+                                for o in atts])
+            jobstore.create(m, status="held")
+            jobstore.set_status(tok, "held", recap_json=_cf5.recap_to_json(recap))
+
+        check("chuẩn hoá tên chuỗi họp bỏ ngày + 'Buổi N'",
+              links.series_key("07-23 | Workforce AI Weekly Meeting Buổi 3")
+              == links.series_key("08-06 | Workforce AI Weekly Meeting Buổi 5")
+              == "workforce ai weekly meeting")
+        _t0 = 1790000000.0
+        for i in range(3):
+            _j5(f"mtWK{i}", f"07-{1 + 7 * i:02d} | Weekly Ops Buổi {i + 1}", _t0 + i * 7 * _day,
+                ["ou_B"], Recap(summary=f"tuan {i}"))
+        _j5("mtWKOLD", "01-01 | Weekly Ops Buổi 0", _t0 - 120 * _day, ["ou_B"],
+            Recap(summary="cu"))
+        for i in range(3):
+            links.update(f"mtWK{i}")
+        _rel0 = {o["token"] for o in links.related("mtWK0")}
+        check("3 buổi 'Weekly Ops' liên tiếp nối đủ với nhau (series)",
+              {"mtWK1", "mtWK2"} <= _rel0 and "mtWK0" in {o["token"] for o in links.related("mtWK2")})
+        check("...buổi cách 4 tháng KHÔNG bị nối như cùng chuỗi", "mtWKOLD" not in _rel0)
+
+        _j5("mtEN1", "Hop du an X", _t0, ["ou_B"], Recap(summary="a", action_items=[
+            _AI5(task="t1", owner="Lan"), _AI5(task="t2", owner="Minh")]))
+        _j5("mtEN2", "Review san pham", _t0 + _day, ["ou_C"], Recap(summary="b", action_items=[
+            _AI5(task="t3", owner="lan"), _AI5(task="t4", owner="Minh")]))
+        _j5("mtEN3", "Hop khac", _t0 + 2 * _day, ["ou_C"], Recap(summary="c", action_items=[
+            _AI5(task="t5", owner="Lan")]))
+        links.update("mtEN1")
+        _r1 = {o["token"]: o["reasons"] for o in links.related("mtEN1")}
+        check("hai cuộc khác tên, chung >=2 người phụ trách -> nối (entity)",
+              "entity" in _r1.get("mtEN2", []), str(_r1))
+        check("...chung đúng 1 người thì KHÔNG nối (tránh nối mọi cuộc có cùng một sếp)",
+              "mtEN3" not in _r1)
+
+        _j5("mtSE1", "Hop gia", _t0, ["ou_B"], Recap(summary="gia"))
+        _j5("mtSE2", "Hop dinh gia", _t0 + _day, ["ou_B"], Recap(summary="dinh gia"))
+        _j5("mtSE3", "Hop tuyen dung", _t0 + _day, ["ou_B"], Recap(summary="tuyen"))
+        with db.tx() as c:
+            for tok, v in (("mtSE1", [1.0, 0.0, 0.1]), ("mtSE2", [0.95, 0.05, 0.1]),
+                           ("mtSE3", [0.0, 1.0, 0.0])):
+                c.execute("INSERT INTO embeddings(minute_token, chunk_id, kind, text, vec,"
+                          " model, created_at) VALUES (?,0,'recap','',?,'m#x',0)",
+                          (tok, _sm5._pack(v)))
+        links.update("mtSE1")
+        _r2 = {o["token"]: o["reasons"] for o in links.related("mtSE1")}
+        check("cặp DƯƠNG: vector tóm tắt gần nhau -> nối 'cùng chủ đề'",
+              "semantic" in _r2.get("mtSE2", []), str(_r2))
+        check("cặp ÂM: chủ đề khác hẳn -> không nối", "mtSE3" not in _r2)
+
+        # Quyền: B xem mtEN1 nhưng KHÔNG xem mtEN2 (chỉ C dự)
+        _Bw = {"union_id": "on_B", "open_id": "ou_B", "name": "B"}
+        _blk = links.block_for(_Bw, "mtEN1")
+        check("người chỉ xem được 1 trong 2 cuộc: mục liên quan KHÔNG lộ tên cuộc kia",
+              "Review san pham" not in _blk, _blk)
+        _Cw = {"union_id": "on_C", "open_id": "ou_C", "name": "C"}
+        _Aw = {"union_id": "on_A", "open_id": "ou_A", "name": "A"}
+        check("...chủ (xem được cả hai) thì thấy liên kết",
+              "Review san pham" in links.block_for(_Aw, "mtEN1"))
+        check("file .md chỉ nêu cuộc liên quan mà MỌI người đọc file đều xem được",
+              not any("Review san pham" in x for x in links.related_lines("mtEN1"))
+              and any("Weekly Ops" in x for x in links.related_lines("mtWK0")))
+        _txt5 = links.text_for(_Cw, "mtEN1")
+        check("tool related_meetings: không xem được cuộc gốc -> không trả gì về nó",
+              "Review" not in _txt5 and "Hop du an" not in _txt5, _txt5[:120])
+        check("MCP có related_meetings",
+              "related_meetings" in {t["name"] for t in mcp_server.public_tools()})
+    finally:
+        with db.tx() as c:
+            for t in ("meeting_links", "embeddings"):
+                c.execute(f"DELETE FROM {t}")
+        wipe_jobs()
+
+    # =================================================================
     part("34. Lưới chặn mạng còn nguyên sau cả lượt chạy")
     # =================================================================
     # Nhiều nhóm ở trên lưu-rồi-trả-lại thuộc tính của `lark_api`. Một cái trả

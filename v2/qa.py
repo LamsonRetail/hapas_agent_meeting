@@ -994,8 +994,9 @@ def get_meeting(who: dict[str, Any] | None, query: str) -> str:
     if exact:
         remember(who, _s(exact[0], bitable.F_TOKEN),
                  _title(_s(exact[0], bitable.F_TITLE)))
-        return append_agent_note(fmt_record(exact[0]),
-                                 _record_notes(exact[0]))
+        return append_agent_note(
+            fmt_record(exact[0]) + _related(who, _s(exact[0], bitable.F_TOKEN)),
+            _record_notes(exact[0]))
     hits = [r for r in rows if q in _s(r, bitable.F_TITLE).lower()]
     if not hits:
         if _blocked(all_rows):
@@ -1044,7 +1045,19 @@ def get_meeting(who: dict[str, Any] | None, query: str) -> str:
                 + "\n".join(fmt_record(r, full=False) for r in hits))
     remember(who, _s(hits[0], bitable.F_TOKEN),
              _title(_s(hits[0], bitable.F_TITLE)))
-    return append_agent_note(fmt_record(hits[0]), _record_notes(hits[0]))
+    return append_agent_note(
+        fmt_record(hits[0]) + _related(who, _s(hits[0], bitable.F_TOKEN)),
+        _record_notes(hits[0]))
+
+
+def _related(who: dict[str, Any] | None, token: str) -> str:
+    """Khối "Cuộc họp liên quan" (V3 YC5), đã lọc quyền. Hỏng thì bỏ qua."""
+    try:
+        from . import links
+        return links.block_for(who, token)
+    except Exception as exc:                   # noqa: BLE001 — phần phụ
+        print(f"[qa] không dựng được cuộc họp liên quan: {exc}")
+        return ""
 
 
 def search_meetings(who: dict[str, Any] | None, keyword: str,

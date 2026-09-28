@@ -127,6 +127,11 @@ def index(token: str, model: str = "") -> int:
             " created_at) VALUES (?,?,?,?,?,?,?)",
             [(token, i, k, t, _pack(v), f"{model}#{src}", now)
              for i, ((k, t), v) in enumerate(zip(parts, vecs))])
+    try:
+        from . import links
+        links.update(token)                   # V3 YC5: vector mới -> liên kết "cùng chủ đề"
+    except Exception as exc:                  # noqa: BLE001
+        print(f"[links] {token} tính liên kết hỏng (bỏ qua): {exc}")
     return len(parts)
 
 
