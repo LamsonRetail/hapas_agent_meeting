@@ -1293,13 +1293,17 @@ def _base_record_held(token: str, meta: MeetingMeta) -> None:
         bitable.write_draft(meta, recap, 0)
     except Exception as exc:              # noqa: BLE001 — ghi Base là việc phụ
         print(f"[base] {token} ghi record (held) hỏng (bỏ qua): {exc}")
-    # Đã phát rồi thì làm mới file biên bản bằng tóm tắt từ nguyên văn (V3 YC2).
+    # Biên bản .md + quyền (V3 YC2) bằng tóm tắt từ nguyên văn — cho MỌI cuộc
+    # không đang chờ chủ duyệt. Không chỉ "làm mới cuộc đã phát": cuộc backlog
+    # (nạp lúc enroll, `notify=False`) không bao giờ đi qua `_notify_minute`,
+    # nên thiếu dòng này là quản lý không bao giờ thấy chúng.
     try:
-        from . import notes
-        if notes.get_file(token):
+        from . import confirm
+        c = confirm.get(token)
+        if c is None or c["state"] != "pending":
             _publish_note(token)
     except Exception as exc:              # noqa: BLE001
-        print(f"[notes] {token} làm mới biên bản hỏng (bỏ qua): {exc}")
+        print(f"[notes] {token} ghi biên bản hỏng (bỏ qua): {exc}")
 
 
 def _collect_glossary(t, meta: MeetingMeta) -> None:

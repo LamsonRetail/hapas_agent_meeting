@@ -498,14 +498,21 @@ def cmd_grants_backfill(args) -> None:
 
 
 def cmd_notes(args) -> None:
-    """V3 YC2: ghi lại file biên bản .md cho một cuộc (hoặc mọi cuộc đã phát)."""
+    """V3 YC2: ghi biên bản .md + chụp quyền cho một cuộc, hoặc MỌI cuộc đã có
+    nội dung (held/delivered, không đang chờ duyệt). Chạy lại sau khi bật
+    `org-sync` để quản lý có quyền các cuộc CŨ. Bật DRIVE_ENABLED thì cũng đẩy
+    Drive (share im lặng) — nên chạy `drive-provision` trước."""
     _init()
-    from . import notes
-    from . import db as _db
-    toks = [args.token] if args.token else [
-        r["minute_token"] for r in _db.conn().execute("SELECT minute_token FROM note_files")]
+    from . import confirm, jobstore, notes
+    if args.token:
+        toks = [args.token]
+    else:
+        toks = [j["minute_token"] for j in jobstore.all_jobs()
+                if j.get("status") in ("held", "delivered")
+                and (confirm.get(j["minute_token"]) or {}).get("state") != "pending"]
     for t in toks:
         print(t, "->", notes.publish(t))
+    print(f"{len(toks)} cuộc họp.")
 
 
 def cmd_search(args) -> None:

@@ -854,6 +854,23 @@ additive, chạy ở mọi `db.init()`).
    `platform_hints.feishu.append`. Sao lưu trước. Bỏ qua cũng được: `_POLICY`
    của plugin chạy MỖI LƯỢT và đã mang đủ luật.
 
+## 11e. V3 — code XONG 28/09/2026, CHƯA áp lên hệ đang chạy
+
+Năm yêu cầu mới (chủ duyệt biên bản trước khi phát · kho `.md` + quyền theo
+chuỗi quản lý + Drive · tìm ngữ nghĩa qua LiteLLM · liên kết cuộc họp ·
+dashboard đăng nhập Lark) đã có code + selftest (**794 PASS / 0 FAIL**, chạy
+trên macOS). Đặc tả, quyết định của chủ hệ thống, trạng thái từng việc và
+**thứ tự áp** nằm ở [`V3_SPECS.md`](V3_SPECS.md) §0.
+
+Bất biến MỚI phải giữ (bổ sung §7):
+- Nguồn quyền mới DUY NHẤT: `note_grants` (chụp lúc phát từ người dự đã xác
+  minh + chuỗi `leader_user_id` của Lark Contact). Không thu hồi khi org đổi.
+  Vẫn đi qua `qa.viewers_index` — không dựng luật thứ hai ở đâu cả.
+- Cuộc đang chờ chủ duyệt (`confirmations.state='pending'`): chỉ chủ thấy.
+- `ORG_SYNC_HOURS`/`DRIVE_ENABLED` mặc định TẮT; bật = đổi quyền / ghi ra
+  ngoài → hỏi chủ hệ thống, chạy thử khô trước.
+- `.md`/Drive không chứa transcript nguyên văn (vẫn đi đường kéo).
+
 ## 12. Checklist cho chat/code agent mới
 
 Trước khi làm việc:

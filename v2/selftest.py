@@ -4972,6 +4972,32 @@ def _main() -> int:
         check("người dự ghép theo GIỜ (calendar[near]) KHÔNG được cấp quyền, kể cả sếp họ",
               {g["open_id"] for g in notes.grants_of("mtORG3")} == {"ou_A"})
 
+        # Cuộc backlog (không qua _notify_minute) vẫn phải có biên bản + quyền quản lý
+        _mBL = meta(minute_token="mtORGBL", owner_open_id="ou_A",
+                    participants_source="calendar[verified]:x",
+                    attendees=[Attendee(open_id="ou_C", union_id="on_C")])
+        jobstore.create(_mBL, status="held", priority=0)
+        _keep_sm, config.SEND_MODE = config.SEND_MODE, True
+        try:
+            orchestrator._base_record_held("mtORGBL", _mBL)
+        finally:
+            config.SEND_MODE = _keep_sm
+        check("cuộc BACKLOG (nạp lúc enroll, không báo ai) vẫn có .md + quyền cho sếp nhánh mới",
+              notes.get_file("mtORGBL") is not None
+              and "ou_F" in {g["open_id"] for g in notes.grants_of("mtORGBL")})
+        with db.tx() as c:
+            c.execute("INSERT INTO confirmations(minute_token, state) VALUES ('mtORGPD','pending')")
+        _mPD = meta(minute_token="mtORGPD", owner_open_id="ou_A",
+                    participants_source="calendar[verified]:x", attendees=[])
+        jobstore.create(_mPD, status="held")
+        _keep_sm, config.SEND_MODE = config.SEND_MODE, True
+        try:
+            orchestrator._base_record_held("mtORGPD", _mPD)
+        finally:
+            config.SEND_MODE = _keep_sm
+        check("...còn cuộc ĐANG CHỜ chủ duyệt thì chưa ghi biên bản / chưa cấp quyền",
+              notes.get_file("mtORGPD") is None and not notes.grants_of("mtORGPD"))
+
         # Nhãn duyệt trong .md + Base index
         with db.tx() as c:
             c.execute("INSERT INTO confirmations(minute_token, state) VALUES "

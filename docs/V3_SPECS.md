@@ -26,6 +26,17 @@
 | **YC5** liên kết cuộc họp | ✅ **XONG 28/09/2026** — selftest 770 PASS / 0 FAIL (+12 kiểm) | restart `v2 run` + plugin 1.4.0 (tool `related_meetings`); sau khi chốt model embedding, chỉnh `links.LINK_MIN_SCORE` bằng 1 cặp dương + 1 cặp âm thật |
 | **YC4** dashboard | ✅ **XONG 28/09/2026** — selftest 792 PASS / 0 FAIL (+22 kiểm); đã xem giao diện thật (desktop + mobile, light + dark) | Cloudflare Tunnel: 2 hostname → `http://127.0.0.1:8765`; Lark Console thêm Redirect URL `https://meeting.lamsonretail.com/auth/callback` + `https://meeting.hapas-ai.tech/auth/callback`; `DASHBOARD_SECRET` (chuỗi ngẫu nhiên ≥32 ký tự) trong `v2/.env`; chạy `run-v2-dashboard.bat` (thêm vào tự khởi động) |
 
+**Thứ tự áp lên máy vận hành** (chạy `python -m v2 selftest` trước và sau):
+1. `git pull` → restart `v2 run` (§16 sổ tay, luật 6 khi kill) → chép plugin
+   `hermes/v2-enroll-gate` **1.4.0** + `hermes gateway restart`. Từ đây YC1
+   (duyệt), YC5 và phần `.md`/quyền người dự của YC2 chạy ngay.
+2. `LITELLM_API_KEY` (thienlq) → YC3 tự index nền; chốt `EMBED_MODEL`.
+3. Console bật scope tenant danh bạ → `v2 org-sync` / `--yes` →
+   `ORG_SYNC_HOURS=24` → `v2 notes` (cấp quyền quản lý cho cả cuộc cũ).
+4. Console bật scope tenant Drive → `v2 drive-provision` / duyệt / `--yes` →
+   `DRIVE_ENABLED=1` → `v2 notes` (đẩy file cũ lên Drive, share im lặng).
+5. Tunnel + Redirect URL + `DASHBOARD_SECRET` → `run-v2-dashboard.bat`.
+
 ---
 
 ## A. Hiện trạng (nền để bổ sung, không viết lại)
@@ -548,7 +559,7 @@ thấy các cuộc liên quan; dashboard nhìn được chuỗi chủ đề ch�
 | C.3 | ~~Quyền quản lý khi org đổi? Nhánh loại trừ?~~ **ĐÃ CHỐT 16/09/2026:** đổi sếp thì quyền CŨ **vẫn giữ** (grant vật chất hoá lúc phát, không thu hồi — B2.4); **không có nhánh loại trừ**, CEO thấy tất. Folder Drive **tạo sẵn cho toàn bộ nhân sự**, share từng cá nhân, **không notify**, người mới tự tạo (B2.2b) | Còn một điểm phụ mặc định: sếp MỚI không tự có quyền cuộc cũ của đội mới — cấp lùi bằng `grants-backfill` tường minh. Nói nếu muốn khác |
 | C.4 | ~~Ai cấp virtual key?~~ **ĐÃ CHỐT 16/09/2026: thienlq cấp virtual key** trên `litellm.hapas-ai.tech`; ngân sách tháng chốt với thienlq lúc cấp key (đặt limit ngay trên LiteLLM) | Còn phải làm: benchmark 3 ứng viên §B3.1 trên tiếng Việt thật rồi chốt model theo số đo; key để trong `v2/.env`, không commit |
 | C.5 | ~~Dashboard: ai xem? Ngưỡng "họp kém hiệu quả"?~~ **ĐÃ CHỐT 16/09/2026:** chạy tại `meeting.lamsonretail.com` / `meeting.hapas-ai.tech`, đăng nhập **Lark SSO** (có phiên Lark → tự vào, không hỏi lại); nội dung lọc theo `may_see` của người xem. **"Họp kém hiệu quả": HOÃN, chưa cần làm** | Còn phải làm: trỏ DNS hai domain, thêm route OAuth dashboard vào Cloudflare Worker |
-| C.6 | Có ghi ngược trạng thái confirm lên Base không (external write)? | có, thêm cột `Xác nhận` — nhưng chờ duyệt external write như tiền lệ §1.9 |
+| C.6 | Có ghi ngược trạng thái confirm lên Base không (external write)? | **ĐÃ LÀM theo mặc định: có** — cột `Xác nhận` + `File biên bản` (YC2). Base tự thêm 2 cột ở lần ghi đầu sau khi áp code: đó là external write, chủ hệ thống duyệt lúc áp |
 
 ## D. Thứ tự triển khai & phụ thuộc
 
