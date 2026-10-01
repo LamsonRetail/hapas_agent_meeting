@@ -4803,9 +4803,9 @@ def _main() -> int:
         _c_sent.clear()
         _h = 3_600_000
         _update = confirm._update
-        _update("mtCONF2", sent_at=confirm._now_ms() - 5 * _h)
+        _update("mtCONF2", sent_at=confirm._now_ms() - 9 * _h)
         confirm.tick()
-        check("quá 4h chưa duyệt -> nhắc chủ đúng 1 lần",
+        check("quá 8h chưa duyệt -> nhắc chủ đúng 1 lần",
               [x[0] for x in _c_sent] == ["on_OWN"]
               and "Nhắc" in _c_sent[0][1]["header"]["title"]["content"])
         confirm.tick()
@@ -5338,7 +5338,7 @@ def _main() -> int:
         _j4("mtD2", "Hop sua nhieu", 3, Recap(summary="s", decisions=["QD2"]),
             "confirmed", edits=2, diff=120)
         _j4("mtD3", "Hop chua review", 4, Recap(summary="s", decisions=["QD3"]), "auto_published")
-        _j4("mtD4", "Hop cho duyet", 0, Recap(summary="s"), "pending", sent_h=5)
+        _j4("mtD4", "Hop cho duyet", 0, Recap(summary="s"), "pending", sent_h=9)
         for i in range(3):
             _j4(f"mtR{i}", f"Weekly Sale Buổi {i}", 20 - 7 * i, Recap(summary="ban luan"))
         with db.tx() as c:
@@ -5351,7 +5351,7 @@ def _main() -> int:
         _D = {"union_id": "on_D", "open_id": "ou_D", "name": "Sep D"}
         _F = {"union_id": "on_F", "open_id": "ou_F", "name": "F"}
         _dA, _dD, _dF = dsb.build(_A), dsb.build(_D), dsb.build(_F)
-        check("backlog 'chờ bạn duyệt': chủ thấy cuộc pending của mình, quá 4h tô cảnh báo",
+        check("backlog 'chờ bạn duyệt': chủ thấy cuộc pending của mình, quá 8h tô cảnh báo",
               [m["token"] for m in _dA["mine_pending"]] == ["mtD4"]
               and _dA["mine_pending"][0]["overdue"])
         check("...người khác KHÔNG thấy backlog của chủ", _dD["mine_pending"] == [])

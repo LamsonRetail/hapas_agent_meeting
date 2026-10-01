@@ -376,7 +376,7 @@ ALERT_WHISPER_AFTER_MIN = _get_int("ALERT_WHISPER_AFTER_MIN", 15)
 # duyệt xong mới báo người dự. Im lặng quá CONFIRM_TIMEOUT_HOURS -> tự phát kèm
 # nhãn "chưa được chủ trì review"; chủ vẫn duyệt/sửa được sau đó.
 CONFIRM_ENABLED = _get_bool("CONFIRM_ENABLED", True)
-CONFIRM_REMIND_HOURS = _get_int("CONFIRM_REMIND_HOURS", 4)
+CONFIRM_REMIND_HOURS = _get_int("CONFIRM_REMIND_HOURS", 8)   # chốt 01/10/2026
 CONFIRM_TIMEOUT_HOURS = _get_int("CONFIRM_TIMEOUT_HOURS", 24)
 
 # Kho biên bản .md + quyền theo cây quản lý (V3 YC2). HAI công tắc MẶC ĐỊNH TẮT

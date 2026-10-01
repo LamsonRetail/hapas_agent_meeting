@@ -22,7 +22,7 @@
 |---|---|---|
 | **YC1** xác nhận của chủ | ✅ **XONG 28/09/2026** — selftest 716 PASS / 0 FAIL (+21 kiểm) | restart `v2 run`; chép plugin `hermes/v2-enroll-gate` **1.4.0** + `hermes gateway restart` (tool MCP mới + policy duyệt) |
 | **YC2** kho `.md` + quyền quản lý + Drive | ✅ **XONG 28/09/2026** — selftest 742 PASS / 0 FAIL (+26 kiểm) | Console: bật scope **tenant** đọc danh bạ (có trường `leader_user_id`, phạm vi dữ liệu = toàn công ty) + `drive`; `v2 org-sync` → `--yes` → `ORG_SYNC_HOURS=24`; `v2 drive-provision` → duyệt danh sách → `--yes` → `DRIVE_ENABLED=1`; Base tự thêm 2 cột `Xác nhận`, `File biên bản` ở lần ghi đầu (external write — C.6) |
-| **YC3** semantic search | ✅ **XONG 28/09/2026** — selftest 758 PASS / 0 FAIL (+16 kiểm) | nhận virtual key từ **thienlq** → `LITELLM_API_KEY` trong `v2/.env` (đặt limit ngân sách trên LiteLLM); benchmark `v2 search --reindex --model <m> "câu hỏi thật"` cho 2–3 model rồi chốt `EMBED_MODEL`; chỉnh `semantic.MIN_SCORE` theo model đã chốt |
+| **YC3** semantic search | ✅ **XONG 28/09/2026** — selftest 758 PASS / 0 FAIL (+16 kiểm) | ⏸ **chờ thienlq** (xem mục "Việc giao thienlq" bên dưới) → `LITELLM_API_KEY` trong `v2/.env`; benchmark `v2 search --reindex --model <m> "câu hỏi thật"` cho 2–3 model rồi chốt `EMBED_MODEL`; chỉnh `semantic.MIN_SCORE` theo model đã chốt |
 | **YC5** liên kết cuộc họp | ✅ **XONG 28/09/2026** — selftest 770 PASS / 0 FAIL (+12 kiểm) | restart `v2 run` + plugin 1.4.0 (tool `related_meetings`); sau khi chốt model embedding, chỉnh `links.LINK_MIN_SCORE` bằng 1 cặp dương + 1 cặp âm thật |
 | **YC4** dashboard | ✅ **XONG 28/09/2026** — selftest 792 PASS / 0 FAIL (+22 kiểm); đã xem giao diện thật (desktop + mobile, light + dark) | Cloudflare Tunnel: 2 hostname → `http://127.0.0.1:8765`; Lark Console thêm Redirect URL `https://meeting.lamsonretail.com/auth/callback` + `https://meeting.hapas-ai.tech/auth/callback`; `DASHBOARD_SECRET` (chuỗi ngẫu nhiên ≥32 ký tự) trong `v2/.env`; chạy `run-v2-dashboard.bat` (thêm vào tự khởi động) |
 
@@ -30,12 +30,24 @@
 1. `git pull` → restart `v2 run` (§16 sổ tay, luật 6 khi kill) → chép plugin
    `hermes/v2-enroll-gate` **1.4.0** + `hermes gateway restart`. Từ đây YC1
    (duyệt), YC5 và phần `.md`/quyền người dự của YC2 chạy ngay.
-2. `LITELLM_API_KEY` (thienlq) → YC3 tự index nền; chốt `EMBED_MODEL`.
+2. ⏸ Chờ thienlq cấp key → `LITELLM_API_KEY` → YC3 tự index nền; chốt `EMBED_MODEL`.
 3. Console bật scope tenant danh bạ → `v2 org-sync` / `--yes` →
    `ORG_SYNC_HOURS=24` → `v2 notes` (cấp quyền quản lý cho cả cuộc cũ).
 4. Console bật scope tenant Drive → `v2 drive-provision` / duyệt / `--yes` →
    `DRIVE_ENABLED=1` → `v2 notes` (đẩy file cũ lên Drive, share im lặng).
 5. Tunnel + Redirect URL + `DASHBOARD_SECRET` → `run-v2-dashboard.bat`.
+
+**Việc giao thienlq** (Lê Quý Thiện — Technical & AI Automation Leader,
+`thienlq@hapas.vn`) — chốt 01/10/2026: gửi tin Lark để thienlq làm sau.
+Trạng thái: ⏸ chưa gửi tin.
+1. Cấp **virtual key** LiteLLM (`litellm.hapas-ai.tech`) cho MeetingxLark.
+2. Bật trên key đó: 1 model **embedding** (đề xuất `text-embedding-3-small`)
+   và 1 model **chat rẻ** cho digest dashboard (đề xuất `gpt-4o-mini`).
+3. Đặt **giới hạn ngân sách tháng** ngay trên key.
+4. Gửi key cho người vận hành qua kênh riêng (không dán vào chat nhóm/git).
+
+Thiếu key thì hệ thống VẪN chạy: tìm kiếm rơi về từ khoá, dashboard không có
+đoạn tóm tắt kỳ (vẫn có danh sách quyết định).
 
 ---
 
@@ -159,7 +171,7 @@ Code: `v2/confirm.py` (mới) · `orchestrator._notify_minute` gác `confirm.gat
 trước khi phát, tách `_broadcast_notice` · `confirm.tick()` mỗi vòng run (khối
 try riêng) · `pipeline.save_recap` khoá bản của chủ · `summarize.apply_edit` ·
 `cards.confirm_card` + nhãn `unreviewed`/`revised` · 2 tool MCP · config
-`CONFIRM_ENABLED=1`, `CONFIRM_REMIND_HOURS=4`, `CONFIRM_TIMEOUT_HOURS=24`.
+`CONFIRM_ENABLED=1`, `CONFIRM_REMIND_HOURS=8`, `CONFIRM_TIMEOUT_HOURS=24`.
 
 Bản whisper về khi chủ CHƯA đụng vào → chủ nhận "Bản cập nhật" để duyệt đúng
 cái sẽ phát; chủ đã sửa/duyệt → bản của chủ bị khoá, whisper không ghi đè.
@@ -554,10 +566,10 @@ thấy các cuộc liên quan; dashboard nhìn được chuỗi chủ đề ch�
 
 | # | Câu hỏi | Mặc định đề xuất |
 |---|---|---|
-| C.1 | ~~Owner im lặng?~~ **ĐÃ CHỐT 16/09/2026:** nhắc sau 4h; **tự phát sau 24h** kèm nhãn "chưa được chủ trì review"; owner **vẫn confirm/sửa được sau đó** → hệ thống cập nhật `.md`/Base, gỡ nhãn, báo người dự nếu nội dung đổi | — |
+| C.1 | ~~Owner im lặng?~~ **ĐÃ CHỐT 16/09/2026:** nhắc sau **8h** (đổi từ 4h ngày 01/10/2026); **tự phát sau 24h** kèm nhãn "chưa được chủ trì review"; owner **vẫn confirm/sửa được sau đó** → hệ thống cập nhật `.md`/Base, gỡ nhãn, báo người dự nếu nội dung đổi | — |
 | C.2 | ~~Kho `.md`: Drive hay kho ảo trong V2?~~ **ĐÃ CHỐT 16/09/2026 (chủ hệ thống):** file chi tiết nằm trên **Lark Drive** theo logic YC2; Base `OuQ1b3f3JaVpTSs33SVlbWHZgef` chỉ còn làm **index**. | Còn phải làm: xin scope `drive`+`contact` MỘT lần ngay bây giờ, trước người thứ ba enroll; local `.md` vẫn ghi trước, Drive đồng bộ theo (B2.2) |
 | C.3 | ~~Quyền quản lý khi org đổi? Nhánh loại trừ?~~ **ĐÃ CHỐT 16/09/2026:** đổi sếp thì quyền CŨ **vẫn giữ** (grant vật chất hoá lúc phát, không thu hồi — B2.4); **không có nhánh loại trừ**, CEO thấy tất. Folder Drive **tạo sẵn cho toàn bộ nhân sự**, share từng cá nhân, **không notify**, người mới tự tạo (B2.2b) | Còn một điểm phụ mặc định: sếp MỚI không tự có quyền cuộc cũ của đội mới — cấp lùi bằng `grants-backfill` tường minh. Nói nếu muốn khác |
-| C.4 | ~~Ai cấp virtual key?~~ **ĐÃ CHỐT 16/09/2026: thienlq cấp virtual key** trên `litellm.hapas-ai.tech`; ngân sách tháng chốt với thienlq lúc cấp key (đặt limit ngay trên LiteLLM) | Còn phải làm: benchmark 3 ứng viên §B3.1 trên tiếng Việt thật rồi chốt model theo số đo; key để trong `v2/.env`, không commit |
+| C.4 | ~~Ai cấp virtual key?~~ **ĐÃ CHỐT 16/09/2026: thienlq cấp virtual key** (01/10: gửi tin Lark để thienlq làm sau — xem §0) trên `litellm.hapas-ai.tech`; ngân sách tháng chốt với thienlq lúc cấp key (đặt limit ngay trên LiteLLM) | Còn phải làm: benchmark 3 ứng viên §B3.1 trên tiếng Việt thật rồi chốt model theo số đo; key để trong `v2/.env`, không commit |
 | C.5 | ~~Dashboard: ai xem? Ngưỡng "họp kém hiệu quả"?~~ **ĐÃ CHỐT 16/09/2026:** chạy tại `meeting.lamsonretail.com` / `meeting.hapas-ai.tech`, đăng nhập **Lark SSO** (có phiên Lark → tự vào, không hỏi lại); nội dung lọc theo `may_see` của người xem. **"Họp kém hiệu quả": HOÃN, chưa cần làm** | Còn phải làm: trỏ DNS hai domain, thêm route OAuth dashboard vào Cloudflare Worker |
 | C.6 | Có ghi ngược trạng thái confirm lên Base không (external write)? | **ĐÃ LÀM theo mặc định: có** — cột `Xác nhận` + `File biên bản` (YC2). Base tự thêm 2 cột ở lần ghi đầu sau khi áp code: đó là external write, chủ hệ thống duyệt lúc áp |
 
