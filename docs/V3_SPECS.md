@@ -37,6 +37,25 @@
    `DRIVE_ENABLED=1` → `v2 notes` (đẩy file cũ lên Drive, share im lặng).
 5. Tunnel + Redirect URL + `DASHBOARD_SECRET` → `run-v2-dashboard.bat`.
 
+**Hướng dẫn bật Drive (bước 3–4 ở trên, chi tiết):**
+1. Lark Developer Console → app `cli_aae288361ef89eed` → *Permissions &
+   Scopes* → thêm scope **`drive:drive`** ở danh tính **ứng dụng (tenant)**.
+   Muốn quản lý thấy nhánh mình thì thêm luôn các scope đọc danh bạ
+   (`contact:user.base:readonly`, `contact:department.base:readonly` + scope
+   cho trường quản lý trực tiếp) và đặt *phạm vi dữ liệu danh bạ* = toàn công
+   ty — gộp một đợt duyệt.
+2. *Version Management & Release* → tạo phiên bản mới → gửi duyệt → admin
+   tenant duyệt. Scope chưa có hiệu lực trước bước này. Không ai phải enroll lại.
+3. Kiểm (chỉ ĐỌC, không tạo gì) trên máy vận hành:
+   `python -c "from v2 import lark_api; print(lark_api.drive_root_folder())"`
+   — in ra một token là được; lỗi `99991672` thì Lark ghi thẳng tên scope thiếu.
+4. `python -m v2 org-sync` → `--yes` (danh sách người lấy từ đây — chưa sync
+   thì `drive-provision` không có ai để tạo).
+5. `python -m v2 drive-provision` (thử khô, in danh sách) → duyệt →
+   `python -m v2 drive-provision --yes` (tạo folder, share im lặng).
+6. `v2/.env`: `DRIVE_ENABLED=1`, **để trống `DRIVE_ROOT_FOLDER`** → restart
+   `v2 run` → `python -m v2 notes` (đẩy biên bản cũ lên Drive).
+
 **Việc giao thienlq** (Lê Quý Thiện — Technical & AI Automation Leader,
 `thienlq@hapas.vn`) — chốt 01/10/2026: gửi tin Lark để thienlq làm sau.
 Trạng thái: ⏸ chưa gửi tin.

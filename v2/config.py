@@ -389,7 +389,10 @@ CONFIRM_TIMEOUT_HOURS = _get_int("CONFIRM_TIMEOUT_HOURS", 24)
 NOTES_DIR = Path(_get("V2_NOTES_DIR", str(DATA_DIR / "notes")))
 ORG_SYNC_HOURS = _get_int("ORG_SYNC_HOURS", 0)
 DRIVE_ENABLED = _get_bool("DRIVE_ENABLED", False)
-DRIVE_ROOT_FOLDER = _get("DRIVE_ROOT_FOLDER", "")   # trống = thư mục gốc của bot
+# Trống = "My Space" của chính bot — NÊN để trống: Drive cho folder con thừa
+# hưởng quyền của folder cha, nên ai cộng tác trên DRIVE_ROOT_FOLDER sẽ thấy
+# biên bản của CẢ CÔNG TY, đi vòng qua `note_grants`.
+DRIVE_ROOT_FOLDER = _get("DRIVE_ROOT_FOLDER", "")
 
 # LiteLLM của công ty (V3 YC3/YC4, chốt 16/09/2026): virtual key do thienlq cấp,
 # ngân sách đặt ngay trên LiteLLM. OpenAI-compatible -> đổi model = đổi env.
