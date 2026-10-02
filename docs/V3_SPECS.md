@@ -44,7 +44,11 @@ Trạng thái: ⏸ chưa gửi tin.
 2. Bật trên key đó: 1 model **embedding** (đề xuất `text-embedding-3-small`)
    và 1 model **chat rẻ** cho digest dashboard (đề xuất `gpt-4o-mini`).
 3. Đặt **giới hạn ngân sách tháng** ngay trên key.
-4. Gửi key cho người vận hành qua kênh riêng (không dán vào chat nhóm/git).
+4. **Tự đưa key thẳng lên máy vận hành** (chốt 02/10/2026 — key KHÔNG đi qua
+   bot, chat hay git): mở `D:\MeetingxLark\v2\.env` (đã gitignore), thêm
+   `LITELLM_API_KEY=<key>`, rồi restart `v2 run` (`restart-v2.ps1`) và cửa sổ
+   `run-v2-dashboard.bat`. Kiểm: `python -m v2 search --reindex "họp"` ra kết
+   quả KHÔNG kèm dòng "tìm theo TỪ KHOÁ".
 
 Thiếu key thì hệ thống VẪN chạy: tìm kiếm rơi về từ khoá, dashboard không có
 đoạn tóm tắt kỳ (vẫn có danh sách quyết định).
