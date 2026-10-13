@@ -4,10 +4,10 @@
                     (bật DRIVE_ENABLED) đẩy lên folder Drive của CHỦ, share im
                     lặng cho người dự + chuỗi quản lý.
 
-Hai bản, CÙNG một tên file (chốt 13/10/2026):
+Hai bản, CÙNG cấu trúc và CÙNG tên file (chốt 13/10/2026):
   máy  : notes/<owner_open_id>/<năm-tháng>/<tên>.md
-  Drive: Meeting Notes - <tên chủ>/<tên>.md   (folder phẳng — không có tầng
-         tháng, nên tên file tự mang ngày giờ để sắp xếp/tra được)
+  Drive: Meeting Notes - <tên chủ>/<năm-tháng>/<tên>.md
+  Tên file mang ngày giờ ('2026-09-21 14h05 <tên cuộc họp>.md') để sắp xếp.
 Drive lỗi thì đánh dấu `drive_pending`, `retry_pending()` (mỗi vòng run) đẩy lại.
 
 Gọi ở đúng các điểm PHÁT: `orchestrator._broadcast_notice` (lần đầu / bản hiệu
@@ -58,9 +58,12 @@ def file_name(meta: MeetingMeta) -> str:
     return f"khong-ro-ngay {_slug(meta.title)} {meta.minute_token[:12]}.md"
 
 
+def month_of(meta: MeetingMeta) -> str:
+    return time.strftime("%Y-%m", time.localtime(meta.start)) if meta.start else "khong-ro"
+
+
 def path_of(meta: MeetingMeta) -> Path:
-    month = time.strftime("%Y-%m", time.localtime(meta.start)) if meta.start else "khong-ro"
-    return (config.NOTES_DIR / (meta.owner_open_id or "khong-ro-chu") / month
+    return (config.NOTES_DIR / (meta.owner_open_id or "khong-ro-chu") / month_of(meta)
             / file_name(meta))
 
 
@@ -231,10 +234,24 @@ def space_of(open_id: str, name: str = "", *, create: bool = True) -> str:
     return folder
 
 
+def month_folder(open_id: str, name: str, month: str) -> str:
+    """Folder <năm-tháng> trong space của một người; tạo nếu chưa có. Không
+    share riêng: thừa hưởng quyền của folder cha (chính người đó)."""
+    row = db.conn().execute("SELECT folder_token FROM drive_months WHERE open_id=?"
+                            " AND month=?", (open_id, month)).fetchone()
+    if row:
+        return row["folder_token"]
+    folder = lark_api.drive_folder_create(month, space_of(open_id, name))
+    with db.tx() as c:
+        c.execute("INSERT OR IGNORE INTO drive_months(open_id, month, folder_token)"
+                  " VALUES (?,?,?)", (open_id, month, folder))
+    return folder
+
+
 def _push_drive(token: str, meta: MeetingMeta, md: str) -> None:
     # ponytail: mỗi lần nội dung đổi là một file mới (link đổi, Base cập nhật
     # theo). Muốn link cố định thì import thành Lark Doc và sửa tại chỗ.
-    folder = space_of(meta.owner_open_id, meta.owner_name)
+    folder = month_folder(meta.owner_open_id, meta.owner_name, month_of(meta))
     new = lark_api.drive_upload(file_name(meta), md.encode("utf-8"), folder)
     old = (get_file(token) or {}).get("drive_token")
     if old and old != new:

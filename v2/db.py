@@ -289,6 +289,15 @@ CREATE TABLE IF NOT EXISTS drive_spaces (
     created_at   INTEGER
 );
 
+-- Folder tháng trong space của từng người trên Drive (13/10/2026): Drive có
+-- cùng cấu trúc với máy — Meeting Notes - <tên>/<năm-tháng>/<file>.
+CREATE TABLE IF NOT EXISTS drive_months (
+    open_id      TEXT NOT NULL,
+    month        TEXT NOT NULL,
+    folder_token TEXT,
+    PRIMARY KEY (open_id, month)
+);
+
 -- File biên bản .md của từng cuộc họp: bản trên máy (`local_path`, cấu trúc
 -- notes/<chủ>/<năm-tháng>/) + bản trên Lark Drive, CÙNG tên file (chốt
 -- 13/10/2026). `drive_pending=1` = nội dung mới chưa lên Drive, vòng run đẩy lại.

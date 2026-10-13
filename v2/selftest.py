@@ -5022,8 +5022,14 @@ def _main() -> int:
         # Drive: bật công tắc, mọi lời gọi là hàm giả
         config.SEND_MODE, config.DRIVE_ENABLED = True, True
         lark_api.drive_root_folder = lambda: "fld_ROOT"
-        lark_api.drive_folder_create = lambda name, parent: (
-            _drv["folder"].append((name, parent)) or f"fld_{len(_drv['folder'])}")
+        _fld_parent: dict[str, str] = {}
+
+        def _fake_folder(name, parent):
+            _drv["folder"].append((name, parent))
+            tok = f"fld_{len(_drv['folder'])}"
+            _fld_parent[tok] = parent
+            return tok
+        lark_api.drive_folder_create = _fake_folder
         _up_fail = {"on": False}
 
         def _fake_upload(name, data, folder):
@@ -5043,9 +5049,11 @@ def _main() -> int:
         check("Drive: tạo folder cho CHỦ, share cho chủ quyền sửa, IM LẶNG",
               _own_folder and ("fld_1", "folder", "ou_A", "edit", False) in _drv["member"],
               str(_drv["member"][:2]))
-        check("...file .md đẩy vào ĐÚNG folder của chủ",
-              _drv["upload"] and _drv["upload"][-1][1] == _own_folder
-              and _drv["upload"][-1][0].endswith(".md"))
+        _mon = notes.month_of(_mA)
+        check("...file .md đẩy vào folder THÁNG nằm trong folder của chủ (cấu trúc như trên máy)",
+              _drv["upload"] and _fld_parent.get(_drv["upload"][-1][1]) == _own_folder
+              and (_mon, _own_folder) in _drv["folder"]
+              and _drv["upload"][-1][0].endswith(".md"), str(_drv["folder"]))
         _file_shares = {m[2] for m in _drv["member"] if m[1] == "file"}
         check("...file share cho người dự + chuỗi quản lý (xem), KHÔNG thông báo",
               _file_shares == {"ou_B", "ou_C", "ou_E", "ou_D", "ou_F"}
@@ -5055,10 +5063,20 @@ def _main() -> int:
               _bt2._job_fields(jobstore.get("mtORG1")).get(_bt2.F_NOTE, "").endswith("file_1"))
         notes.publish("mtORG1")
         check("nội dung đổi -> đẩy bản mới, xoá bản cũ, không tạo thêm folder",
-              _drv["delete"] == ["file_1"] and len(_drv["folder"]) == 1)
+              _drv["delete"] == ["file_1"] and len(_drv["folder"]) == 2)
+        _mOct = meta(minute_token="mtORGMON", title="Hop thang sau", owner_open_id="ou_A",
+                     start=_mA.start + 40 * 86400, participants_source="calendar[verified]:x",
+                     attendees=[])
+        jobstore.create(_mOct, status="held")
+        notes.publish("mtORGMON")
+        check("cuộc của THÁNG KHÁC -> thêm đúng 1 folder tháng mới, cùng folder chủ",
+              len(_drv["folder"]) == 3
+              and _drv["folder"][-1] == (notes.month_of(_mOct), _own_folder)
+              and _fld_parent.get(_drv["upload"][-1][1]) == _own_folder, str(_drv["folder"]))
+        _upO = [u for u in _drv["upload"] if "Hop A" in u[0]][-1]
         check("...lên Drive CÙNG tên và CÙNG nội dung với bản trên máy",
-              _drv["upload"][-1][0] == Path(notes.get_file("mtORG1")["local_path"]).name
-              and _drv["upload"][-1][2].decode("utf-8")
+              _upO[0] == Path(notes.get_file("mtORG1")["local_path"]).name
+              and _upO[2].decode("utf-8")
               == Path(notes.get_file("mtORG1")["local_path"]).read_text(encoding="utf-8")
               and notes.get_file("mtORG1")["drive_pending"] == 0)
         _up_fail["on"] = True
