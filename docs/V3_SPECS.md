@@ -58,7 +58,7 @@
 
 **Việc giao thienlq** (Lê Quý Thiện — Technical & AI Automation Leader,
 `thienlq@hapas.vn`) — chốt 01/10/2026: gửi tin Lark để thienlq làm sau.
-Trạng thái: ⏸ chưa gửi tin.
+Trạng thái: ✉️ **đã gửi tin Lark 13/10/2026** (message `om_x100b63e91977513cffc262a6732ad6d`) — chờ thienlq làm.
 1. Cấp **virtual key** LiteLLM (`litellm.hapas-ai.tech`) cho MeetingxLark.
 2. Bật trên key đó: 1 model **embedding** (đề xuất `text-embedding-3-small`)
    và 1 model **chat rẻ** cho digest dashboard (đề xuất `gpt-4o-mini`).
