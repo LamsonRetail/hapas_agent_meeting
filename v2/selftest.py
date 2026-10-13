@@ -4933,10 +4933,14 @@ def _main() -> int:
               and qa._may_see("mtORG1", _W("ou_E"), _idx))
         check("F (nhánh khác) KHÔNG thấy", not qa._may_see("mtORG1", _W("ou_F"), _idx))
 
-        check(".md có tóm tắt/quyết định — và KHÔNG có file nào trên máy",
+        _lp = notes.get_file("mtORG1")["local_path"].replace("\\", "/")
+        check(".md có tóm tắt/quyết định, lưu trên máy ở notes/<chủ>/<năm-tháng>/",
               "Tom tat A" in _md0 and "- QD1" in _md0
-              and not notes.get_file("mtORG1")["local_path"]
-              and not list(config.DATA_DIR.rglob("*.md")))
+              and Path(_lp).read_text(encoding="utf-8") == _md0
+              and "/notes/ou_A/" + time.strftime("%Y-%m", time.localtime(_mA.start)) + "/" in _lp, _lp)
+        check("...tên file bắt đầu bằng ngày giờ họp (sắp được trong folder phẳng)",
+              Path(_lp).name == time.strftime("%Y-%m-%d %Hh%M", time.localtime(_mA.start))
+              + " Hop A.md", Path(_lp).name)
         check("...Drive chưa bật -> đánh dấu CHỜ ĐẨY, không mất",
               notes.get_file("mtORG1")["drive_pending"] == 1)
 
@@ -5052,8 +5056,10 @@ def _main() -> int:
         notes.publish("mtORG1")
         check("nội dung đổi -> đẩy bản mới, xoá bản cũ, không tạo thêm folder",
               _drv["delete"] == ["file_1"] and len(_drv["folder"]) == 1)
-        check("...nội dung upload là .md thật (UTF-8), đẩy thẳng từ bộ nhớ",
-              "Tom tat A" in _drv["upload"][-1][2].decode("utf-8")
+        check("...lên Drive CÙNG tên và CÙNG nội dung với bản trên máy",
+              _drv["upload"][-1][0] == Path(notes.get_file("mtORG1")["local_path"]).name
+              and _drv["upload"][-1][2].decode("utf-8")
+              == Path(notes.get_file("mtORG1")["local_path"]).read_text(encoding="utf-8")
               and notes.get_file("mtORG1")["drive_pending"] == 0)
         _up_fail["on"] = True
         notes.publish("mtORG1")

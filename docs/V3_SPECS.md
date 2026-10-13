@@ -253,8 +253,12 @@ verified". Yêu cầu này **cố ý nới** theo một nguồn mới: cây qu�
 ## Liên kết      (Link Minutes của Lark; các cuộc họp liên quan — YC5)
 ## Transcript    (link/tham chiếu file, KHÔNG nhúng nguyên văn vào .md)
 ```
-**Chỉ lưu trên Lark Drive, KHÔNG giữ bản trên máy** (chốt 13/10/2026). Nội
-dung dựng trong bộ nhớ từ `jobs.recap_json` (nguồn sự thật) rồi upload thẳng.
+**Lưu trên máy VÀ đẩy lên Lark Drive, cùng một tên file** (chốt 13/10/2026):
+- máy: `v2/data/notes/<owner_open_id>/<năm-tháng>/<tên>.md` (cấu trúc như cũ)
+- Drive: `Meeting Notes - <tên chủ>/<tên>.md` — folder phẳng, không có tầng
+  tháng, nên **tên file mang ngày giờ**: `2026-09-21 14h05 <tên cuộc họp>.md`
+  (sắp theo tên = sắp theo thời gian; giờ phân biệt hai cuộc trùng tên trong
+  ngày, giống cách đặt tên file `.docx`).
 
 **B2.2 Kho chia sẻ — ĐÃ CHỐT 16/09/2026: Lark Drive là nơi ở của file chi tiết, Base chỉ làm index.**
 - **Drive**: mỗi owner một folder ("space" của owner), file `.md` của từng cuộc
@@ -276,9 +280,9 @@ dung dựng trong bộ nhớ từ `jobs.recap_json` (nguồn sự thật) rồi 
   `jobs.recap_json` trong `state.db` (vốn là nguồn sự thật) + file `.md`.
   Vẫn MỘT luật quyền `may_see`; permission trên Drive chỉ là *chiếu* của nó —
   nguồn sự thật ACL không rời khỏi V2.
-- Drive lỗi / mất mạng: pipeline không chết; biên bản được đánh dấu
-  `drive_pending` và vòng run tự dựng lại + đẩy lại (cùng triết lý
-  `TranscribeUnavailable`). Không cần bản trên máy vì luôn dựng lại được.
+- Drive lỗi / mất mạng: pipeline không chết, bản trên máy vẫn có; biên bản
+  được đánh dấu `drive_pending` và vòng run tự đẩy lại (cùng triết lý
+  `TranscribeUnavailable`).
 
 **B2.2b Provisioning folder — ĐÃ CHỐT 16/09/2026: tạo sẵn cho TOÀN BỘ nhân sự,
 share im lặng, người mới tự có.**
@@ -343,10 +347,10 @@ may_see(user, meeting) := ∃ dòng note_grants(meeting, user)
 - Quyền vật chất hoá ở bảng `note_grants` (cột `source` = audit, vd
   `chain:D>E>C`); `qa.viewers_index` cộng bảng này — mọi đường đọc (hỏi đáp,
   gửi transcript, tạo task) tự áp luật mới.
-- **File chỉ nằm trên Drive** (đổi 13/10/2026, trước đó có bản trên máy):
-  dựng `.md` trong bộ nhớ → upload thẳng vào folder của chủ. Drive lỗi → cờ
-  `note_files.drive_pending=1`, `notes.retry_pending()` mỗi vòng run đẩy lại
-  (5 cuộc/vòng, dừng êm nếu Drive vẫn lỗi). Bật `DRIVE_ENABLED` lần đầu thì các
+- **Hai bản cùng tên** (13/10/2026): ghi `.md` trên máy theo cấu trúc
+  `notes/<chủ>/<năm-tháng>/`, rồi upload CÙNG tên vào folder của chủ trên
+  Drive. Drive lỗi → cờ `note_files.drive_pending=1`, `notes.retry_pending()`
+  mỗi vòng run đẩy lại (5 cuộc/vòng, dừng êm nếu Drive vẫn lỗi). Bật `DRIVE_ENABLED` lần đầu thì các
   biên bản đang chờ cũng tự lên dần. *ponytail:* nội dung đổi → file Drive mới
   (link đổi, Base cập nhật theo); muốn link cố định thì import thành Lark Doc.
 - **Hai công tắc MẶC ĐỊNH TẮT** (`ORG_SYNC_HOURS=0`, `DRIVE_ENABLED=0`) vì bật
@@ -592,7 +596,7 @@ thấy các cuộc liên quan; dashboard nhìn được chuỗi chủ đề ch�
 | # | Câu hỏi | Mặc định đề xuất |
 |---|---|---|
 | C.1 | ~~Owner im lặng?~~ **ĐÃ CHỐT 16/09/2026:** nhắc sau **8h** (đổi từ 4h ngày 01/10/2026); **tự phát sau 24h** kèm nhãn "chưa được chủ trì review"; owner **vẫn confirm/sửa được sau đó** → hệ thống cập nhật `.md`/Base, gỡ nhãn, báo người dự nếu nội dung đổi | — |
-| C.2 | ~~Kho `.md`: Drive hay kho ảo trong V2?~~ **ĐÃ CHỐT 16/09/2026 (chủ hệ thống):** file chi tiết nằm trên **Lark Drive** theo logic YC2; Base `OuQ1b3f3JaVpTSs33SVlbWHZgef` chỉ còn làm **index**. | Còn phải làm: xin scope `drive`+`contact` MỘT lần ngay bây giờ, trước người thứ ba enroll; file `.md` CHỈ nằm trên Drive, không giữ bản trên máy (13/10/2026) |
+| C.2 | ~~Kho `.md`: Drive hay kho ảo trong V2?~~ **ĐÃ CHỐT 16/09/2026 (chủ hệ thống):** file chi tiết nằm trên **Lark Drive** theo logic YC2; Base `OuQ1b3f3JaVpTSs33SVlbWHZgef` chỉ còn làm **index**. | Còn phải làm: xin scope `drive`+`contact` MỘT lần ngay bây giờ, trước người thứ ba enroll; file `.md` lưu trên máy (`notes/<chủ>/<năm-tháng>/`) và đẩy lên Drive cùng tên `YYYY-MM-DD HHhMM <tên>.md` (13/10/2026) |
 | C.3 | ~~Quyền quản lý khi org đổi? Nhánh loại trừ?~~ **ĐÃ CHỐT 16/09/2026:** đổi sếp thì quyền CŨ **vẫn giữ** (grant vật chất hoá lúc phát, không thu hồi — B2.4); **không có nhánh loại trừ**, CEO thấy tất. Folder Drive **tạo sẵn cho toàn bộ nhân sự**, share từng cá nhân, **không notify**, người mới tự tạo (B2.2b) | Còn một điểm phụ mặc định: sếp MỚI không tự có quyền cuộc cũ của đội mới — cấp lùi bằng `grants-backfill` tường minh. Nói nếu muốn khác |
 | C.4 | ~~Ai cấp virtual key?~~ **ĐÃ CHỐT 16/09/2026: thienlq cấp virtual key** (01/10: gửi tin Lark để thienlq làm sau — xem §0) trên `litellm.hapas-ai.tech`; ngân sách tháng chốt với thienlq lúc cấp key (đặt limit ngay trên LiteLLM) | Còn phải làm: benchmark 3 ứng viên §B3.1 trên tiếng Việt thật rồi chốt model theo số đo; key để trong `v2/.env`, không commit |
 | C.5 | ~~Dashboard: ai xem? Ngưỡng "họp kém hiệu quả"?~~ **ĐÃ CHỐT 16/09/2026:** chạy tại `meeting.lamsonretail.com` / `meeting.hapas-ai.tech`, đăng nhập **Lark SSO** (có phiên Lark → tự vào, không hỏi lại); nội dung lọc theo `may_see` của người xem. **"Họp kém hiệu quả": HOÃN, chưa cần làm** | Còn phải làm: trỏ DNS hai domain, thêm route OAuth dashboard vào Cloudflare Worker |

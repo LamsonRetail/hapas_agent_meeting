@@ -386,6 +386,7 @@ CONFIRM_TIMEOUT_HOURS = _get_int("CONFIRM_TIMEOUT_HOURS", 24)
 #                        của nhánh mình.
 #   DRIVE_ENABLED=1    : tạo folder cho mọi người + đẩy file .md lên Drive,
 #                        share im lặng cho người dự + chuỗi quản lý.
+NOTES_DIR = Path(_get("V2_NOTES_DIR", str(DATA_DIR / "notes")))   # bản trên máy
 ORG_SYNC_HOURS = _get_int("ORG_SYNC_HOURS", 0)
 DRIVE_ENABLED = _get_bool("DRIVE_ENABLED", False)
 # Trống = "My Space" của chính bot — NÊN để trống: Drive cho folder con thừa

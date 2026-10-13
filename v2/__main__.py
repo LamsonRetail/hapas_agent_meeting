@@ -498,7 +498,7 @@ def cmd_grants_backfill(args) -> None:
 
 
 def cmd_notes(args) -> None:
-    """V3 YC2: dựng biên bản .md + chụp quyền + đẩy Drive cho một cuộc, hoặc MỌI cuộc đã có
+    """V3 YC2: ghi biên bản .md (máy + Drive) + chụp quyền cho một cuộc, hoặc MỌI cuộc đã có
     nội dung (held/delivered, không đang chờ duyệt). Chạy lại sau khi bật
     `org-sync` để quản lý có quyền các cuộc CŨ. Bật DRIVE_ENABLED thì cũng đẩy
     Drive (share im lặng) — nên chạy `drive-provision` trước."""

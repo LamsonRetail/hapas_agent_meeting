@@ -1,12 +1,14 @@
 """Biên bản .md của từng cuộc họp + quyền vật chất hoá + Drive (V3 YC2).
 
-    publish(token): chốt ai được xem (note_grants) -> dựng .md TRONG BỘ NHỚ ->
-                    (bật DRIVE_ENABLED) đẩy thẳng lên folder Drive của CHỦ,
-                    share im lặng cho người dự + chuỗi quản lý.
+    publish(token): chốt ai được xem (note_grants) -> ghi .md trên máy ->
+                    (bật DRIVE_ENABLED) đẩy lên folder Drive của CHỦ, share im
+                    lặng cho người dự + chuỗi quản lý.
 
-KHÔNG giữ bản nào trên máy (chốt 13/10/2026): Drive là nơi lưu duy nhất. Nội
-dung luôn dựng lại được từ `jobs.recap_json`, nên Drive lỗi thì chỉ đánh dấu
-`drive_pending` và `retry_pending()` (mỗi vòng run) đẩy lại — không mất gì.
+Hai bản, CÙNG một tên file (chốt 13/10/2026):
+  máy  : notes/<owner_open_id>/<năm-tháng>/<tên>.md
+  Drive: Meeting Notes - <tên chủ>/<tên>.md   (folder phẳng — không có tầng
+         tháng, nên tên file tự mang ngày giờ để sắp xếp/tra được)
+Drive lỗi thì đánh dấu `drive_pending`, `retry_pending()` (mỗi vòng run) đẩy lại.
 
 Gọi ở đúng các điểm PHÁT: `orchestrator._broadcast_notice` (lần đầu / bản hiệu
 chỉnh), `confirm.approve`, và làm mới khi tóm tắt từ nguyên văn về
@@ -28,6 +30,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 from . import config, db, jobstore, lark_api, org, summarize
@@ -44,8 +47,21 @@ def _slug(text: str) -> str:
 
 
 def file_name(meta: MeetingMeta) -> str:
-    day = time.strftime("%Y-%m-%d", time.localtime(meta.start)) if meta.start else "khong-ro"
-    return f"{day} {_slug(meta.title)}-{meta.minute_token}.md"
+    """'2026-09-21 14h05 Họp giá bán Q4.md' — dùng CHUNG cho máy và Drive.
+
+    Ngày giờ đứng đầu: folder Drive phẳng nên sắp theo tên = sắp theo thời
+    gian. Giờ phân biệt hai cuộc cùng tên trong ngày (như `pipeline.doc_path`);
+    không có giờ họp thì thêm token cho khỏi đụng tên."""
+    if meta.start:
+        stamp = time.strftime("%Y-%m-%d %Hh%M", time.localtime(meta.start))
+        return f"{stamp} {_slug(meta.title)}.md"
+    return f"khong-ro-ngay {_slug(meta.title)} {meta.minute_token[:12]}.md"
+
+
+def path_of(meta: MeetingMeta) -> Path:
+    month = time.strftime("%Y-%m", time.localtime(meta.start)) if meta.start else "khong-ro"
+    return (config.NOTES_DIR / (meta.owner_open_id or "khong-ro-chu") / month
+            / file_name(meta))
 
 
 # ------------------------------------------------------------------ quyền
@@ -161,17 +177,20 @@ def publish(token: str) -> str | None:
     except Exception as exc:                  # noqa: BLE001 — liên kết là phần phụ
         print(f"[links] {token} tính liên kết hỏng (bỏ qua): {exc}")
     md = render(meta, recap, reviewed=reviewed, related=_related_lines(token))
+    path = path_of(meta)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(md, encoding="utf-8")
     with db.tx() as c:
         c.execute("INSERT INTO note_files(minute_token, local_path, drive_pending,"
-                  " updated_at) VALUES (?, '', 1, ?) ON CONFLICT(minute_token) DO"
-                  " UPDATE SET drive_pending=1, updated_at=excluded.updated_at",
-                  (token, _now_ms()))
+                  " updated_at) VALUES (?, ?, 1, ?) ON CONFLICT(minute_token) DO"
+                  " UPDATE SET local_path=excluded.local_path, drive_pending=1,"
+                  " updated_at=excluded.updated_at", (token, str(path), _now_ms()))
     if config.DRIVE_ENABLED and config.SEND_MODE:
         try:
             _push_drive(token, meta, md)
         except lark_api.LarkError as exc:
-            # Drive hỏng không làm hỏng việc phát: còn cờ drive_pending,
-            # `retry_pending()` ở vòng run sau dựng lại và đẩy lại.
+            # Drive hỏng không làm hỏng việc phát: bản trên máy vẫn có, còn
+            # cờ drive_pending, `retry_pending()` ở vòng run sau đẩy lại.
             print(f"[notes] {token} đẩy Drive hỏng, vòng sau thử lại: {exc}")
     return md
 
