@@ -1532,6 +1532,13 @@ def run() -> None:
         except Exception as exc:         # noqa: BLE001
             print(f"[org] đồng bộ cây tổ chức hỏng (bỏ qua): {exc}")
 
+        # Biên bản chưa lên được Drive (V3 YC2): đẩy lại vài cuộc mỗi vòng.
+        try:
+            from . import notes
+            notes.retry_pending()
+        except Exception as exc:         # noqa: BLE001
+            print(f"[notes] đẩy lại Drive hỏng (bỏ qua): {exc}")
+
         # Index ngữ nghĩa (V3 YC3): vài cuộc mỗi vòng, LiteLLM chết thì vòng sau.
         try:
             from . import semantic

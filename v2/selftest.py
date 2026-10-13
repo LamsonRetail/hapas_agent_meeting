@@ -4919,7 +4919,7 @@ def _main() -> int:
         jobstore.create(_mA, status="held")
         jobstore.set_status("mtORG1", "held", recap_json=_cf2.recap_to_json(
             Recap(summary="Tom tat A", decisions=["QD1"])))
-        notes.publish("mtORG1")
+        _md0 = notes.publish("mtORG1")
         _src = {g["open_id"]: g["source"] for g in notes.grants_of("mtORG1")}
         check("ví dụ chuẩn: A chủ, B C dự, E quản lý C, D quản lý E -> cả 5 có quyền",
               set(_src) == {"ou_A", "ou_B", "ou_C", "ou_E", "ou_D"}, str(_src))
@@ -4933,10 +4933,12 @@ def _main() -> int:
               and qa._may_see("mtORG1", _W("ou_E"), _idx))
         check("F (nhánh khác) KHÔNG thấy", not qa._may_see("mtORG1", _W("ou_F"), _idx))
 
-        _md = Path(notes.get_file("mtORG1")["local_path"]).read_text(encoding="utf-8")
-        check("file .md có tóm tắt/quyết định, nằm trong space của CHỦ",
-              "Tom tat A" in _md and "- QD1" in _md
-              and "/ou_A/" in notes.get_file("mtORG1")["local_path"].replace("\\", "/"))
+        check(".md có tóm tắt/quyết định — và KHÔNG có file nào trên máy",
+              "Tom tat A" in _md0 and "- QD1" in _md0
+              and not notes.get_file("mtORG1")["local_path"]
+              and not list(config.DATA_DIR.rglob("*.md")))
+        check("...Drive chưa bật -> đánh dấu CHỜ ĐẨY, không mất",
+              notes.get_file("mtORG1")["drive_pending"] == 1)
 
         # Đổi sếp: C chuyển sang F. Quyền CŨ giữ; cuộc MỚI theo nhánh mới.
         with db.tx() as c:
@@ -5002,13 +5004,11 @@ def _main() -> int:
         with db.tx() as c:
             c.execute("INSERT INTO confirmations(minute_token, state) VALUES "
                       "('mtORG1','auto_published')")
-        notes.publish("mtORG1")
-        _md = Path(notes.get_file("mtORG1")["local_path"]).read_text(encoding="utf-8")
+        _md = notes.publish("mtORG1")
         check(".md mang nhãn 'Chưa được chủ trì review' khi tự phát",
               "Chưa được chủ trì review" in _md)
         _cf2._update("mtORG1", state="confirmed")
-        notes.publish("mtORG1")
-        _md = Path(notes.get_file("mtORG1")["local_path"]).read_text(encoding="utf-8")
+        _md = notes.publish("mtORG1")
         check("...và 'Chủ trì đã duyệt' sau khi chủ duyệt", "Chủ trì đã duyệt" in _md)
         from v2 import bitable as _bt2
         check("Base (index) có cột Xác nhận lấy từ SQLite",
@@ -5020,8 +5020,14 @@ def _main() -> int:
         lark_api.drive_root_folder = lambda: "fld_ROOT"
         lark_api.drive_folder_create = lambda name, parent: (
             _drv["folder"].append((name, parent)) or f"fld_{len(_drv['folder'])}")
-        lark_api.drive_upload = lambda path, folder: (
-            _drv["upload"].append((path.name, folder)) or f"file_{len(_drv['upload'])}")
+        _up_fail = {"on": False}
+
+        def _fake_upload(name, data, folder):
+            if _up_fail["on"]:
+                raise lark_api.LarkError(500, "drive chet", "drive_upload")
+            _drv["upload"].append((name, folder, data))
+            return f"file_{len(_drv['upload'])}"
+        lark_api.drive_upload = _fake_upload
         lark_api.drive_file_delete = lambda t: _drv["delete"].append(t)
         lark_api.drive_file_url = lambda t: f"https://x.larksuite.com/file/{t}"
         lark_api.drive_member_add = (lambda token, doc_type, member_id, perm="full_access",
@@ -5046,11 +5052,26 @@ def _main() -> int:
         notes.publish("mtORG1")
         check("nội dung đổi -> đẩy bản mới, xoá bản cũ, không tạo thêm folder",
               _drv["delete"] == ["file_1"] and len(_drv["folder"]) == 1)
+        check("...nội dung upload là .md thật (UTF-8), đẩy thẳng từ bộ nhớ",
+              "Tom tat A" in _drv["upload"][-1][2].decode("utf-8")
+              and notes.get_file("mtORG1")["drive_pending"] == 0)
+        _up_fail["on"] = True
+        notes.publish("mtORG1")
+        check("Drive lỗi lúc phát -> không vỡ, còn cờ CHỜ ĐẨY",
+              notes.get_file("mtORG1")["drive_pending"] == 1)
+        notes.retry_pending()
+        check("...Drive vẫn lỗi -> vòng run thử, dừng êm, cờ còn nguyên",
+              notes.get_file("mtORG1")["drive_pending"] == 1)
+        _up_fail["on"] = False
+        check("...Drive sống lại -> vòng run tự đẩy lên, hết chờ",
+              notes.retry_pending() >= 1 and notes.get_file("mtORG1")["drive_pending"] == 0)
         _drv["member"].clear()
+        _nf = len(_drv["folder"])
         _made = notes.provision(dry_run=True)
+        # A, C đã có folder: là CHỦ của cuộc vừa được đẩy lên Drive.
         check("drive-provision THỬ KHÔ: liệt kê người chưa có folder, chưa tạo gì",
-              set(_made) >= {"B", "C", "D", "E", "F"} and "A" not in _made
-              and len(_drv["folder"]) == 1, str(_made))
+              set(_made) >= {"B", "D", "E", "F"} and not {"A", "C"} & set(_made)
+              and len(_drv["folder"]) == _nf, str(_made))
         notes.provision(dry_run=False)
         check("drive-provision --yes: mỗi người MỘT folder, share im lặng",
               len({m[2] for m in _drv["member"]}) == len(_made)

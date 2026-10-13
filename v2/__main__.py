@@ -498,7 +498,7 @@ def cmd_grants_backfill(args) -> None:
 
 
 def cmd_notes(args) -> None:
-    """V3 YC2: ghi biên bản .md + chụp quyền cho một cuộc, hoặc MỌI cuộc đã có
+    """V3 YC2: dựng biên bản .md + chụp quyền + đẩy Drive cho một cuộc, hoặc MỌI cuộc đã có
     nội dung (held/delivered, không đang chờ duyệt). Chạy lại sau khi bật
     `org-sync` để quản lý có quyền các cuộc CŨ. Bật DRIVE_ENABLED thì cũng đẩy
     Drive (share im lặng) — nên chạy `drive-provision` trước."""
@@ -511,7 +511,9 @@ def cmd_notes(args) -> None:
                 if j.get("status") in ("held", "delivered")
                 and (confirm.get(j["minute_token"]) or {}).get("state") != "pending"]
     for t in toks:
-        print(t, "->", notes.publish(t))
+        notes.publish(t)
+        f = notes.get_file(t) or {}
+        print(t, "->", f.get("drive_url") or "(chưa lên Drive — chờ đẩy)")
     print(f"{len(toks)} cuộc họp.")
 
 

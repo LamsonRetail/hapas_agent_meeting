@@ -1,8 +1,12 @@
 """Biên bản .md của từng cuộc họp + quyền vật chất hoá + Drive (V3 YC2).
 
-    publish(token): chốt ai được xem (note_grants) -> ghi .md local -> (bật
-                    DRIVE_ENABLED) đẩy lên folder Drive của CHỦ, share im lặng
-                    cho người dự + chuỗi quản lý.
+    publish(token): chốt ai được xem (note_grants) -> dựng .md TRONG BỘ NHỚ ->
+                    (bật DRIVE_ENABLED) đẩy thẳng lên folder Drive của CHỦ,
+                    share im lặng cho người dự + chuỗi quản lý.
+
+KHÔNG giữ bản nào trên máy (chốt 13/10/2026): Drive là nơi lưu duy nhất. Nội
+dung luôn dựng lại được từ `jobs.recap_json`, nên Drive lỗi thì chỉ đánh dấu
+`drive_pending` và `retry_pending()` (mỗi vòng run) đẩy lại — không mất gì.
 
 Gọi ở đúng các điểm PHÁT: `orchestrator._broadcast_notice` (lần đầu / bản hiệu
 chỉnh), `confirm.approve`, và làm mới khi tóm tắt từ nguyên văn về
@@ -24,7 +28,6 @@ from __future__ import annotations
 import json
 import re
 import time
-from pathlib import Path
 from typing import Any
 
 from . import config, db, jobstore, lark_api, org, summarize
@@ -40,10 +43,9 @@ def _slug(text: str) -> str:
     return re.sub(r"\s+", " ", s)[:60] or "Cuoc hop"
 
 
-def path_of(meta: MeetingMeta) -> Path:
-    month = time.strftime("%Y-%m", time.localtime(meta.start)) if meta.start else "khong-ro"
-    return (config.NOTES_DIR / (meta.owner_open_id or "khong-ro-chu") / month
-            / f"{_slug(meta.title)}-{meta.minute_token}.md")
+def file_name(meta: MeetingMeta) -> str:
+    day = time.strftime("%Y-%m-%d", time.localtime(meta.start)) if meta.start else "khong-ro"
+    return f"{day} {_slug(meta.title)}-{meta.minute_token}.md"
 
 
 # ------------------------------------------------------------------ quyền
@@ -141,8 +143,9 @@ def get_file(token: str) -> dict[str, Any] | None:
     return dict(r) if r else None
 
 
-def publish(token: str) -> Path | None:
-    """Chụp quyền + ghi .md + (tuỳ công tắc) đẩy Drive. Không ném ra ngoài phần Drive."""
+def publish(token: str) -> str | None:
+    """Chụp quyền + dựng .md + (tuỳ công tắc) đẩy Drive. Trả nội dung .md.
+    Không ném ra ngoài phần Drive."""
     from . import confirm
     job = jobstore.get(token)
     if not job:
@@ -157,23 +160,36 @@ def publish(token: str) -> Path | None:
         links.update(token)                   # V3 YC5 — trước khi render mục Liên kết
     except Exception as exc:                  # noqa: BLE001 — liên kết là phần phụ
         print(f"[links] {token} tính liên kết hỏng (bỏ qua): {exc}")
-    path = path_of(meta)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render(meta, recap, reviewed=reviewed,
-                           related=_related_lines(token)), encoding="utf-8")
+    md = render(meta, recap, reviewed=reviewed, related=_related_lines(token))
     with db.tx() as c:
-        c.execute("INSERT INTO note_files(minute_token, local_path, updated_at)"
-                  " VALUES (?,?,?) ON CONFLICT(minute_token) DO UPDATE SET"
-                  " local_path=excluded.local_path, updated_at=excluded.updated_at",
-                  (token, str(path), _now_ms()))
+        c.execute("INSERT INTO note_files(minute_token, local_path, drive_pending,"
+                  " updated_at) VALUES (?, '', 1, ?) ON CONFLICT(minute_token) DO"
+                  " UPDATE SET drive_pending=1, updated_at=excluded.updated_at",
+                  (token, _now_ms()))
     if config.DRIVE_ENABLED and config.SEND_MODE:
         try:
-            _push_drive(token, meta, path)
+            _push_drive(token, meta, md)
         except lark_api.LarkError as exc:
-            # Drive hỏng không làm hỏng việc phát: bản local vẫn là nguồn, lần
-            # publish sau (hoặc `v2 notes-sync`) đẩy lại.
-            print(f"[notes] {token} đẩy Drive hỏng (bản local vẫn có): {exc}")
-    return path
+            # Drive hỏng không làm hỏng việc phát: còn cờ drive_pending,
+            # `retry_pending()` ở vòng run sau dựng lại và đẩy lại.
+            print(f"[notes] {token} đẩy Drive hỏng, vòng sau thử lại: {exc}")
+    return md
+
+
+def retry_pending(limit: int = 5) -> int:
+    """Đẩy lại các biên bản chưa lên được Drive. Gọi mỗi vòng run."""
+    if not (config.DRIVE_ENABLED and config.SEND_MODE):
+        return 0
+    done = 0
+    for r in db.conn().execute("SELECT minute_token FROM note_files WHERE"
+                               " drive_pending=1 ORDER BY updated_at DESC LIMIT ?",
+                               (limit,)).fetchall():
+        publish(r["minute_token"])
+        if not (get_file(r["minute_token"]) or {}).get("drive_pending"):
+            done += 1
+        else:
+            break                              # Drive vẫn lỗi: thôi lượt này
+    return done
 
 
 # ------------------------------------------------------------------ Drive
@@ -196,11 +212,11 @@ def space_of(open_id: str, name: str = "", *, create: bool = True) -> str:
     return folder
 
 
-def _push_drive(token: str, meta: MeetingMeta, path: Path) -> None:
+def _push_drive(token: str, meta: MeetingMeta, md: str) -> None:
     # ponytail: mỗi lần nội dung đổi là một file mới (link đổi, Base cập nhật
     # theo). Muốn link cố định thì import thành Lark Doc và sửa tại chỗ.
     folder = space_of(meta.owner_open_id, meta.owner_name)
-    new = lark_api.drive_upload(path, folder)
+    new = lark_api.drive_upload(file_name(meta), md.encode("utf-8"), folder)
     old = (get_file(token) or {}).get("drive_token")
     if old and old != new:
         try:
@@ -220,7 +236,7 @@ def _push_drive(token: str, meta: MeetingMeta, path: Path) -> None:
     url = lark_api.drive_file_url(new)
     with db.tx() as c:
         c.execute("UPDATE note_files SET drive_token=?, drive_url=?, shared=?,"
-                  " updated_at=? WHERE minute_token=?",
+                  " drive_pending=0, updated_at=? WHERE minute_token=?",
                   (new, url, json.dumps(shared), _now_ms(), token))
 
 

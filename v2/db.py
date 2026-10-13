@@ -289,11 +289,14 @@ CREATE TABLE IF NOT EXISTS drive_spaces (
     created_at   INTEGER
 );
 
--- File biên bản .md của từng cuộc họp: bản local (nguồn) + bản trên Drive.
--- `shared` = open_id đã được share trên Drive (JSON list) — để chỉ share phần MỚI.
+-- File biên bản .md của từng cuộc họp — CHỈ nằm trên Lark Drive (chốt
+-- 13/10/2026: không giữ bản trên máy). `drive_pending=1` = nội dung mới chưa
+-- đẩy được (Drive lỗi / chưa bật), vòng run tự đẩy lại. `local_path` di sản, luôn rỗng.
+-- `shared` = open_id đã được share trên Drive (JSON list).
 CREATE TABLE IF NOT EXISTS note_files (
     minute_token TEXT PRIMARY KEY,
     local_path   TEXT,
+    drive_pending INTEGER DEFAULT 1,
     drive_token  TEXT,
     drive_url    TEXT,
     shared       TEXT DEFAULT '[]',

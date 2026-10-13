@@ -1192,12 +1192,12 @@ def drive_folder_create(name: str, parent: str) -> str:
     return _check(resp, "drive_folder_create").get("data", {}).get("token", "")
 
 
-def drive_upload(path: Path, folder: str) -> str:
-    """Upload một file vào folder Drive. Trả file_token."""
-    data = path.read_bytes()
-    files = {"file_name": (None, path.name), "parent_type": (None, "explorer"),
+def drive_upload(name: str, data: bytes, folder: str) -> str:
+    """Upload nội dung (bytes) thành một file trong folder Drive. Trả file_token.
+    Nhận bytes chứ không nhận đường dẫn: biên bản không được nằm trên máy (V3)."""
+    files = {"file_name": (None, name), "parent_type": (None, "explorer"),
              "parent_node": (None, folder), "size": (None, str(len(data))),
-             "file": (path.name, data, "text/markdown")}
+             "file": (name, data, "text/markdown")}
     resp = _http().post("/open-apis/drive/v1/files/upload_all",
                         headers={"Authorization": f"Bearer {tenant_token()}"},
                         files=files, timeout=120.0)
